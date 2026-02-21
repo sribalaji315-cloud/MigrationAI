@@ -78,5 +78,34 @@ alembic -c backend/alembic.ini upgrade head
 
 For quick local development the default SQLite DB is sufficient.
 
+## Quick restart commands
+
+From the project root `/home/.../erp-data-migrator-pro--without-classification-with-backend`:
+
+- Restart backend (FastAPI):
+
+	```bash
+	# stop existing uvicorn with Ctrl+C in its terminal
+	cd backend
+	source ../.venv/bin/activate   # if not already active
+	uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+	```
+
+- Restart frontend (Vite dev server):
+
+	```bash
+	# stop existing dev server with Ctrl+C in its terminal
+	cd /home/sribalaji315/Downloads/erp-data-migrator-pro--without-classification-with-backend
+	npm run dev
+	```
+
+- If using Docker Compose for backend + Postgres:
+
+	```bash
+	cd /home/sribalaji315/Downloads/erp-data-migrator-pro--without-classification-with-backend
+	docker compose down   # stop containers
+	docker compose up -d  # start containers again
+	```
+
 ---
 If you want, I can add a Docker Compose setup to run Postgres + backend + frontend. 

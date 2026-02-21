@@ -22,6 +22,7 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
   const [localClassification, setLocalClassification] = useState<NewClassification[]>([]);
   const [localBom, setLocalBom] = useState<LegacyItem[]>([]);
   const [localUsers, setLocalUsers] = useState<User[]>([]);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   useEffect(() => {
     setLocalMapping(JSON.parse(JSON.stringify(data.mapping)));
@@ -36,6 +37,155 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
     values: 'Attribute Value Lists',
     bom: 'Master BOM Items',
     users: 'User Identity Registry'
+  };
+
+  // --- Lightweight CSV helpers (template + parsing) ---
+
+  const buildCsv = (rows: string[][]): string => {
+    return rows.map(r => r.map(cell => cell.replace(/"/g, '""')).join(',')).join('\n');
+  };
+
+  const parseCsv = (text: string): { [key: string]: string }[] => {
+    const lines = text.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+    if (!lines.length) return [];
+    const headers = lines[0].split(',').map(h => h.trim());
+    const rows: { [key: string]: string }[] = [];
+    for (let i = 1; i < lines.length; i++) {
+      const cols = lines[i].split(',');
+      if (!cols.some(c => c.trim())) continue;
+      const row: { [key: string]: string } = {};
+      headers.forEach((h, idx) => {
+        row[h] = (cols[idx] ?? '').trim();
+      });
+      rows.push(row);
+    }
+    return rows;
+  };
+
+  const handleDownloadTemplate = () => {
+    if (category === 'users') return;
+    if ((category === 'classification' || category === 'values') && currentUser.role !== 'admin') {
+      alert('Only administrators may download classification templates when using a shared SQL backend.');
+      return;
+    }
+
+    let rows: string[][] = [];
+
+    if (category === 'mapping') {
+      rows = [
+        ['legacyFeatureIds', 'newAttributeId', 'valuePairs'],
+        ['FRM_MAT|FRAME_SPEC', 'MAT_COMP', 'RED:RED_MAT|BLUE:BLUE_MAT'],
+      ];
+    } else if (category === 'classification' || category === 'values') {
+      rows = [
+        ['classId', 'className', 'attributeId', 'attributeDescription', 'allowedValues'],
+        ['TABLE', 'TABLE', 'WIDTH', 'WIDTH', '1200|600'],
+      ];
+    } else if (category === 'bom') {
+      rows = [
+        ['itemId', 'description', 'featureId', 'featureDescription', 'values'],
+        ['ITEM1', 'Sample Item', 'MMW', 'WIDTH', '1200|600'],
+      ];
+    }
+
+    if (!rows.length) return;
+    const csv = buildCsv(rows);
+    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `${category}-template.csv`;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
+  };
+
+  const handleCsvUpload: React.ChangeEventHandler<HTMLInputElement> = async (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    e.target.value = '';
+
+    if ((category === 'classification' || category === 'values') && currentUser.role !== 'admin') {
+      alert('Only administrators may import classification records via CSV when using a shared SQL backend.');
+      return;
+    }
+
+    try {
+      const text = await file.text();
+      const rows = parseCsv(text);
+      if (!rows.length) {
+        alert('CSV file is empty or has no data rows.');
+        return;
+      }
+
+      if (category === 'mapping') {
+        const next: GlobalMapping[] = rows.map(r => {
+          const legacyFeatureIds = (r['legacyFeatureIds'] || '')
+            .split('|')
+            .map(s => s.trim())
+            .filter(Boolean);
+          const newAttributeId = r['newAttributeId'] || '';
+          const valuePairs = (r['valuePairs'] || '').split('|').map(s => s.trim()).filter(Boolean);
+          const valueMappings: Record<string, string> = {};
+          valuePairs.forEach(p => {
+            const [from, to] = p.split(':');
+            if (from && to) valueMappings[from.trim()] = to.trim();
+          });
+          return { legacyFeatureIds, newAttributeId, valueMappings };
+        });
+        setLocalMapping(next);
+      } else if (category === 'classification' || category === 'values') {
+        const byClass: Record<string, NewClassification> = {};
+        rows.forEach(r => {
+          const classId = r['classId'] || '';
+          const className = r['className'] || classId || 'New Classification';
+          if (!classId) return;
+          if (!byClass[classId]) {
+            byClass[classId] = { classId, className, attributes: [] };
+          }
+          const attributeId = r['attributeId'] || '';
+          if (attributeId) {
+            const allowedValues = (r['allowedValues'] || '')
+              .split('|')
+              .map(s => s.trim())
+              .filter(Boolean);
+            byClass[classId].attributes.push({
+              attributeId,
+              description: r['attributeDescription'] || attributeId,
+              allowedValues,
+            });
+          }
+        });
+        setLocalClassification(Object.values(byClass));
+      } else if (category === 'bom') {
+        const byItem: Record<string, LegacyItem> = {};
+        rows.forEach(r => {
+          const itemId = r['itemId'] || '';
+          if (!itemId) return;
+          const description = r['description'] || '';
+          if (!byItem[itemId]) {
+            byItem[itemId] = { itemId, description, features: [] };
+          }
+          const featureId = r['featureId'] || '';
+          if (featureId) {
+            const values = (r['values'] || '')
+              .split('|')
+              .map(s => s.trim())
+              .filter(Boolean);
+            byItem[itemId].features.push({
+              featureId,
+              description: r['featureDescription'] || featureId,
+              values,
+            });
+          }
+        });
+        setLocalBom(Object.values(byItem));
+      }
+    } catch (err) {
+      console.error('CSV import failed', err);
+      alert('Failed to parse CSV file. Please verify the format matches the template.');
+    }
   };
 
   const handleSave = () => {
@@ -124,7 +274,7 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
 
         {/* Content Area */}
         <div className="flex-1 overflow-y-auto p-6 bg-slate-50/20">
-          <div className="mb-4 flex items-center justify-between">
+          <div className="mb-4 flex items-center justify-between gap-3 flex-wrap">
             <button
               type="button"
               onClick={addRootRow}
@@ -133,6 +283,32 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
               <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={3} d="M12 6v6m0 0v6m0-6h6m-6 0H6" /></svg>
               Add Record
             </button>
+
+            {category !== 'users' && (
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={handleDownloadTemplate}
+                  className="px-3 py-1.5 border border-slate-200 bg-white rounded-lg text-[9px] font-black text-slate-600 hover:bg-slate-50 transition-all uppercase tracking-widest"
+                >
+                  Download CSV Template
+                </button>
+                <button
+                  type="button"
+                  onClick={() => fileInputRef.current?.click()}
+                  className="px-3 py-1.5 border border-indigo-200 bg-indigo-50 rounded-lg text-[9px] font-black text-indigo-700 hover:bg-indigo-100 transition-all uppercase tracking-widest"
+                >
+                  Upload CSV
+                </button>
+                <input
+                  ref={fileInputRef}
+                  type="file"
+                  accept=".csv,text/csv"
+                  className="hidden"
+                  onChange={handleCsvUpload}
+                />
+              </div>
+            )}
           </div>
 
           <div className="bg-white rounded-xl border border-slate-200 overflow-hidden shadow-sm">
