@@ -15,32 +15,39 @@ depends_on = None
 
 
 def upgrade():
+    conn = op.get_bind()
+    inspector = sa.inspect(conn)
+    tables = inspector.get_table_names()
+
     # BOM items
-    op.create_table(
-        "bom_items",
-        sa.Column("id", sa.Integer(), primary_key=True),
-        sa.Column("item_id", sa.String(), nullable=False, unique=True),
-        sa.Column("description", sa.String(), nullable=True),
-    )
+    if "bom_items" not in tables:
+        op.create_table(
+            "bom_items",
+            sa.Column("id", sa.Integer(), primary_key=True),
+            sa.Column("item_id", sa.String(), nullable=False, unique=True),
+            sa.Column("description", sa.String(), nullable=True),
+        )
 
     # BOM features (one-to-many with bom_items)
-    op.create_table(
-        "bom_features",
-        sa.Column("id", sa.Integer(), primary_key=True),
-        sa.Column("item_id", sa.Integer(), sa.ForeignKey("bom_items.id", ondelete="CASCADE"), nullable=False),
-        sa.Column("feature_id", sa.String(), nullable=False),
-        sa.Column("description", sa.String(), nullable=True),
-        sa.Column("values_json", sa.JSON(), nullable=True),
-    )
+    if "bom_features" not in tables:
+        op.create_table(
+            "bom_features",
+            sa.Column("id", sa.Integer(), primary_key=True),
+            sa.Column("item_id", sa.Integer(), sa.ForeignKey("bom_items.id", ondelete="CASCADE"), nullable=False),
+            sa.Column("feature_id", sa.String(), nullable=False),
+            sa.Column("description", sa.String(), nullable=True),
+            sa.Column("values_json", sa.JSON(), nullable=True),
+        )
 
     # Global mappings
-    op.create_table(
-        "global_mappings",
-        sa.Column("id", sa.Integer(), primary_key=True),
-        sa.Column("legacy_feature_ids", sa.JSON(), nullable=False),
-        sa.Column("new_attribute_id", sa.String(), nullable=False),
-        sa.Column("value_mappings", sa.JSON(), nullable=True),
-    )
+    if "global_mappings" not in tables:
+        op.create_table(
+            "global_mappings",
+            sa.Column("id", sa.Integer(), primary_key=True),
+            sa.Column("legacy_feature_ids", sa.JSON(), nullable=False),
+            sa.Column("new_attribute_id", sa.String(), nullable=False),
+            sa.Column("value_mappings", sa.JSON(), nullable=True),
+        )
 
     # Attempt a best-effort migration of existing BOM and mappings
     # data from the app_state JSON blob into the new tables so that
