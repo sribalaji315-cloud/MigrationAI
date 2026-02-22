@@ -95,7 +95,7 @@ def upgrade():
                         "item_id": bom_pk,
                         "feature_id": feat.get("featureId"),
                         "description": feat.get("description") or "",
-                        "values_json": feat.get("values") or [],
+                        "values_json": json.dumps(feat.get("values") or []),
                     },
                 )
 
@@ -109,9 +109,9 @@ def upgrade():
                     """
                 ),
                 {
-                    "legacy_feature_ids": m.get("legacyFeatureIds") or [],
+                    "legacy_feature_ids": json.dumps(m.get("legacyFeatureIds") or []),
                     "new_attribute_id": m.get("newAttributeId") or "",
-                    "value_mappings": m.get("valueMappings") or {},
+                    "value_mappings": json.dumps(m.get("valueMappings") or {}),
                 },
             )
 
