@@ -1,10 +1,6 @@
 
 import { GlobalMapping, DatabaseState, User, ConnectionMode } from '../types';
 
-const DB_KEYS = {
-  STATE: 'erp_migrator_shared_state',
-};
-
 // Backend API endpoint: in production use Vite env `VITE_SQL_API_ENDPOINT`,
 // otherwise fall back to local FastAPI for development.
 const SQL_ENDPOINT = import.meta.env.VITE_SQL_API_ENDPOINT || 'http://localhost:8000';
@@ -74,171 +70,152 @@ export const dbService = {
     const mode = await this.getConnectionMode();
     
     if (mode === 'REMOTE_SQL' && SQL_ENDPOINT) {
+      const response = await fetch(`${SQL_ENDPOINT}/state`, { headers: this._authHeaders() });
+      if (!response.ok) {
+        throw new Error(`Failed to fetch state from database: ${response.status}`);
+      }
+      
+      const state = await response.json();
+      
+      // classifications are now stored in a dedicated table
       try {
-        const response = await fetch(`${SQL_ENDPOINT}/state`, { headers: this._authHeaders() });
-        if (response.ok) {
-          const state = await response.json();
-          // classifications are now stored in a dedicated table
-          try {
-            const clsResp = await fetch(`${SQL_ENDPOINT}/classifications`, { headers: this._authHeaders() });
-            if (clsResp.ok) {
-              state.classifications = await clsResp.json();
-            }
-          } catch {}
-          return { state, mode: 'REMOTE_SQL' };
+        const clsResp = await fetch(`${SQL_ENDPOINT}/classifications`, { headers: this._authHeaders() });
+        if (clsResp.ok) {
+          state.classifications = await clsResp.json();
         }
       } catch (e) {
-        console.warn("SQL Fetch failed, falling back to local storage", e);
+        console.warn("Failed to fetch classifications, using empty array", e);
       }
+      
+      return { state, mode: 'REMOTE_SQL' };
     }
 
-    // Fallback logic (Local/Mock)
-    const raw = localStorage.getItem(DB_KEYS.STATE);
-    if (!raw) {
-      const initialState: DatabaseState = {
-        bom: [],
-        mappings: [],
-        classifications: [],
-        localMappings: {},
-        itemClassifications: {},
-        locks: {},
-        users: [DEFAULT_ADMIN]
-      };
-      localStorage.setItem(DB_KEYS.STATE, JSON.stringify(initialState));
-      return { state: initialState, mode: 'LOCAL_MOCK' };
-    }
-    
-    const state = JSON.parse(raw);
-    if (!state.users) state.users = [DEFAULT_ADMIN];
-    return { state, mode: 'LOCAL_MOCK' };
+    throw new Error('Database connection not available. Please ensure backend is running.');
   },
 
   async saveAll(data: DatabaseState): Promise<ConnectionMode> {
     const mode = await this.getConnectionMode();
     
-    if (mode === 'REMOTE_SQL' && SQL_ENDPOINT) {
-      try {
-        const response = await fetch(`${SQL_ENDPOINT}/sync`, {
-          method: 'POST',
-          headers: { ...this._authHeaders(), 'Content-Type': 'application/json' },
-          // backend expects a wrapper { state: { ... } }
-          body: JSON.stringify({ state: data })
-        });
-        // after syncing the generic state, push classification list separately
-        if (response.ok) {
-          try {
-            console.log('Sending classifications to bulk endpoint:', data.classifications);
-            const clsResp = await fetch(`${SQL_ENDPOINT}/classifications/bulk`, {
-              method: 'POST',
-              headers: { ...this._authHeaders(), 'Content-Type': 'application/json' },
-              body: JSON.stringify(data.classifications || [])
-            });
-            if (clsResp.status === 403) {
-              alert('Only administrators are allowed to modify shared classifications.');
-              return 'REMOTE_SQL';
-            }
-            if (!clsResp.ok) {
-              const errText = await clsResp.text();
-              console.error('Classifications bulk endpoint error:', clsResp.status, errText);
-              alert(`Failed to save classifications: ${errText}`);
-              return 'REMOTE_SQL';
-            }
-            console.log('Classifications saved successfully');
-          } catch (err) {
-            console.error('failed to sync classifications', err);
-            alert(`Error saving classifications: ${err}`);
-          }
-          return 'REMOTE_SQL';
-        } else {
-          const errText = await response.text();
-          console.error("SQL Sync failed:", response.status, errText);
-          alert(`Sync failed: ${errText}`);
-        }
-      } catch (e) {
-        console.error("SQL Sync failed", e);
-        alert(`Network error: ${e}`);
-      }
+    if (mode !== 'REMOTE_SQL' || !SQL_ENDPOINT) {
+      throw new Error('Database connection not available. Cannot save data.');
     }
 
-    // Always save locally as a backup/primary storage for Mock mode
-    localStorage.setItem(DB_KEYS.STATE, JSON.stringify(data));
-    return 'LOCAL_MOCK';
+    const response = await fetch(`${SQL_ENDPOINT}/sync`, {
+      method: 'POST',
+      headers: { ...this._authHeaders(), 'Content-Type': 'application/json' },
+      // backend expects a wrapper { state: { ... } }
+      body: JSON.stringify({ state: data })
+    });
+    
+    if (!response.ok) {
+      const errText = await response.text();
+      console.error("SQL Sync failed:", response.status, errText);
+      throw new Error(`Failed to save to database: ${errText}`);
+    }
+
+    // After syncing the generic state, push classification list separately
+    try {
+      console.log('Sending classifications to bulk endpoint:', data.classifications);
+      const clsResp = await fetch(`${SQL_ENDPOINT}/classifications/bulk`, {
+        method: 'POST',
+        headers: { ...this._authHeaders(), 'Content-Type': 'application/json' },
+        body: JSON.stringify(data.classifications || [])
+      });
+      
+      if (clsResp.status === 403) {
+        alert('Only administrators are allowed to modify shared classifications.');
+        return 'REMOTE_SQL';
+      }
+      
+      if (!clsResp.ok) {
+        const errText = await clsResp.text();
+        console.error('Classifications bulk endpoint error:', clsResp.status, errText);
+        alert(`Failed to save classifications: ${errText}`);
+      } else {
+        console.log('Classifications saved successfully');
+      }
+    } catch (err) {
+      console.error('failed to sync classifications', err);
+      alert(`Error saving classifications: ${err}`);
+    }
+    
+    return 'REMOTE_SQL';
   },
 
   async acquireLock(itemId: string, userId: string, userName: string): Promise<boolean> {
-    const { state, mode } = await this.fetchAll();
-    
-    if (mode === 'REMOTE_SQL' && SQL_ENDPOINT) {
-      try {
-        const response = await fetch(`${SQL_ENDPOINT}/lock`, {
-          method: 'POST',
-          headers: { ...this._authHeaders(), 'Content-Type': 'application/json' },
-          body: JSON.stringify({ itemId, userId, userName, action: 'acquire' })
-        });
-        if (response.ok) return true;
-      } catch (e) {
-        console.warn("SQL Lock failed, using local locking logic", e);
-      }
+    if (!SQL_ENDPOINT) {
+      throw new Error('Database connection not available');
     }
 
-    // Local locking logic
-    const existingLock = state.locks[itemId];
-    if (existingLock && Date.now() - existingLock.timestamp > 1800000) {
-      delete state.locks[itemId];
+    try {
+      const response = await fetch(`${SQL_ENDPOINT}/lock`, {
+        method: 'POST',
+        headers: { ...this._authHeaders(), 'Content-Type': 'application/json' },
+        body: JSON.stringify({ itemId, userId, userName, action: 'acquire' })
+      });
+      return response.ok;
+    } catch (e) {
+      console.error("Failed to acquire lock", e);
+      return false;
     }
-
-    if (!state.locks[itemId] || state.locks[itemId].userId === userId) {
-      state.locks[itemId] = { itemId, userId, userName, timestamp: Date.now() };
-      await this.saveAll(state);
-      return true;
-    }
-    return false;
   },
 
   async releaseLock(itemId: string, userId: string) {
-    const { state, mode } = await this.fetchAll();
-
-    if (mode === 'REMOTE_SQL' && SQL_ENDPOINT) {
-      try {
-        await fetch(`${SQL_ENDPOINT}/lock`, {
-          method: 'POST',
-          headers: { ...this._authHeaders(), 'Content-Type': 'application/json' },
-          body: JSON.stringify({ itemId, userId, action: 'release' })
-        });
-      } catch (e) {
-        console.error("SQL Lock release failed", e);
-      }
+    if (!SQL_ENDPOINT) {
+      throw new Error('Database connection not available');
     }
 
-    if (state.locks[itemId]?.userId === userId) {
-      delete state.locks[itemId];
-      await this.saveAll(state);
+    try {
+      const response = await fetch(`${SQL_ENDPOINT}/lock`, {
+        method: 'POST',
+        headers: { ...this._authHeaders(), 'Content-Type': 'application/json' },
+        body: JSON.stringify({ itemId, userId, action: 'release' })
+      });
+      
+      if (!response.ok) {
+        const errText = await response.text();
+        console.error("Failed to release lock:", response.status, errText);
+      } else {
+        console.log("Lock released successfully for", itemId);
+      }
+    } catch (e) {
+      console.error("Failed to release lock", e);
     }
   },
 
   async forceReleaseLock(itemId: string) {
-    const { state, mode } = await this.fetchAll();
-    
-    if (mode === 'REMOTE_SQL' && SQL_ENDPOINT) {
-      try {
-        await fetch(`${SQL_ENDPOINT}/lock`, {
-          method: 'POST',
-          headers: { ...this._authHeaders(), 'Content-Type': 'application/json' },
-          body: JSON.stringify({ itemId, action: 'force-release' })
-        });
-      } catch {}
+    if (!SQL_ENDPOINT) {
+      throw new Error('Database connection not available');
     }
 
-    delete state.locks[itemId];
-    await this.saveAll(state);
+    try {
+      const response = await fetch(`${SQL_ENDPOINT}/lock`, {
+        method: 'POST',
+        headers: { ...this._authHeaders(), 'Content-Type': 'application/json' },
+        body: JSON.stringify({ itemId, userId: 'force', action: 'force-release' })
+      });
+      
+      if (!response.ok) {
+        const errText = await response.text();
+        console.error("Failed to force release lock:", response.status, errText);
+      } else {
+        console.log("Lock force-released successfully for", itemId);
+      }
+    } catch (e) {
+      console.error("Failed to force release lock", e);
+    }
   },
 
-  async resetToDefaults() {
-    localStorage.removeItem(DB_KEYS.STATE);
-    // In SQL mode, typically a reset would be a specific admin endpoint
-     if (SQL_ENDPOINT) {
-       try { await fetch(`${SQL_ENDPOINT}/reset`, { method: 'POST', headers: this._authHeaders() }); } catch {}
-     }
+  async resetToDefaults(): Promise<DatabaseState> {
+    if (!SQL_ENDPOINT) {
+      throw new Error('Database connection not available');
+    }
+
+    await fetch(`${SQL_ENDPOINT}/reset`, { 
+      method: 'POST', 
+      headers: this._authHeaders() 
+    });
+    
     return (await this.fetchAll()).state;
   }
 };

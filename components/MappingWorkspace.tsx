@@ -1,6 +1,72 @@
 
 import React, { useState, useEffect, useMemo, useRef } from 'react';
-import { LegacyItem, NewClassification, GlobalMapping, LocalItemMappings, NewAttribute, ItemLock } from '../types';
+import { LegacyItem, NewClassification, GlobalMapping, LocalItemMappings, NewAttribute, ItemLock, User } from '../types';
+
+const SearchableSelect = ({ value, options, onChange }: { value: string, options: string[], onChange: (val: string) => void }) => {
+  const [isOpen, setIsOpen] = useState(false);
+  const [search, setSearch] = useState('');
+  const wrapperRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const handleClickOutside = (event: MouseEvent) => {
+      if (wrapperRef.current && !wrapperRef.current.contains(event.target as Node)) {
+        setIsOpen(false);
+      }
+    };
+    document.addEventListener('mousedown', handleClickOutside);
+    return () => document.removeEventListener('mousedown', handleClickOutside);
+  }, []);
+
+  const filteredOptions = options.filter(opt => opt.toLowerCase().includes(search.toLowerCase()));
+
+  return (
+    <div ref={wrapperRef} className="relative mb-2">
+      <div 
+        className="w-full px-3 py-2 pr-8 bg-white border-2 border-emerald-300 rounded-lg text-[10px] font-black text-emerald-800 uppercase tracking-tight cursor-pointer hover:bg-emerald-50 transition-colors outline-none focus:ring-2 focus:ring-emerald-400 flex items-center justify-between"
+        onClick={() => { setIsOpen(!isOpen); setSearch(''); }}
+      >
+        <span className="truncate">{value}</span>
+        <div className="absolute right-2 top-1/2 -translate-y-1/2 pointer-events-none text-emerald-600">
+          <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={3} d="M19 9l-7 7-7-7" />
+          </svg>
+        </div>
+      </div>
+      
+      {isOpen && (
+        <div className="absolute z-50 w-full mt-1 bg-white border-2 border-emerald-300 rounded-lg shadow-lg max-h-48 flex flex-col overflow-hidden" style={{ minWidth: '100%' }}>
+          <div className="p-2 border-b border-emerald-100 bg-slate-50">
+            <input
+              type="text"
+              className="w-full px-2 py-1.5 text-[10px] font-bold text-slate-700 bg-white border border-slate-200 rounded outline-none focus:border-emerald-400 focus:ring-1 focus:ring-emerald-400"
+              placeholder="Search attributes..."
+              value={search}
+              onChange={(e) => setSearch(e.target.value)}
+              onClick={(e) => e.stopPropagation()}
+              autoFocus
+            />
+          </div>
+          <div className="overflow-y-auto flex-1">
+            {filteredOptions.length > 0 ? filteredOptions.map((opt, idx) => (
+              <div
+                key={idx}
+                className={`px-3 py-2 text-[10px] font-black uppercase tracking-tight cursor-pointer hover:bg-emerald-100 ${opt === value ? 'bg-emerald-50 text-emerald-800' : 'text-slate-700'}`}
+                onClick={() => {
+                  onChange(opt);
+                  setIsOpen(false);
+                }}
+              >
+                {opt}
+              </div>
+            )) : (
+              <div className="px-3 py-3 text-[10px] font-bold text-slate-400 text-center">No results found</div>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
 
 interface MappingWorkspaceProps {
   item: LegacyItem | null;
@@ -10,9 +76,11 @@ interface MappingWorkspaceProps {
   assignedClassId?: string | null;
   isLockedByMe: boolean;
   lockOwner: ItemLock | null;
-  onSignOn: () => void;
-  onSignOff: () => void;
-  onSaveChanges: (updates: any) => void;
+  currentUser: User;
+  onSignOn: () => Promise<void>;
+  onSignOff: () => Promise<void>;
+  onSaveChanges: (updates: any) => Promise<void>;
+  onSyncFromDB: () => void;
 }
 
 const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({ 
@@ -23,34 +91,32 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
   assignedClassId,
   isLockedByMe,
   lockOwner,
+  currentUser,
   onSignOn,
   onSignOff,
-  onSaveChanges
+  onSaveChanges,
+  onSyncFromDB
 }) => {
   const [manualInputs, setManualInputs] = useState<Record<string, string>>({});
   const [stagedLocalMappings, setStagedLocalMappings] = useState<GlobalMapping[]>([]);
   const [stagedClassId, setStagedClassId] = useState<string | null>(null);
   const isEditingRef = useRef(false);
-  const prevItemIdRef = useRef<string | null>(null);
 
   // Initialize workspace when item changes
   useEffect(() => {
     if (item) {
-      const isNewItem = prevItemIdRef.current !== item.itemId;
-      if (isNewItem) {
-        isEditingRef.current = false;
-        prevItemIdRef.current = item.itemId;
-      }
-
-      if (!isEditingRef.current || !isLockedByMe) {
-        setStagedClassId(assignedClassId || 'UNCLASSIFIED');
-        setStagedLocalMappings(JSON.parse(JSON.stringify(localItemMappings[item.itemId] || [])));
-        setManualInputs({});
-      }
+      // Always re-initialize view state when the selected item or backing data changes.
+      isEditingRef.current = false;
+      setStagedClassId(assignedClassId || 'UNCLASSIFIED');
+      setStagedLocalMappings(JSON.parse(JSON.stringify(localItemMappings[item.itemId] || [])));
+      setManualInputs({});
     } else {
-      prevItemIdRef.current = null;
+      isEditingRef.current = false;
+      setStagedClassId(null);
+      setStagedLocalMappings([]);
+      setManualInputs({});
     }
-  }, [item, assignedClassId, localItemMappings, isLockedByMe]);
+  }, [item, assignedClassId, localItemMappings]);
 
   const handleManualInputChange = (key: string, value: string) => {
     if (!isLockedByMe) return;
@@ -58,13 +124,23 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
     setManualInputs(prev => ({ ...prev, [key]: value }));
   };
 
-  const commitToSystem = () => {
+  const commitToSystem = async () => {
     if (!item) return;
-    onSaveChanges({
+    await onSaveChanges({
       localMappings: { [item.itemId]: stagedLocalMappings },
       itemClassifications: { [item.itemId]: stagedClassId || 'UNCLASSIFIED' }
     });
     isEditingRef.current = false;
+  };
+
+  const handleExitSession = async () => {
+    if (!item) return;
+    // Save any pending changes before exiting
+    if (isEditingRef.current) {
+      await commitToSystem();
+    }
+    // Then sign off (this is async and should complete the lock release)
+    await onSignOff();
   };
 
   const handleDiscardSessionChanges = () => {
@@ -105,25 +181,8 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
       attrs = selectedClass ? [...selectedClass.attributes] : [];
     }
 
-    // Ensure global mappings are available in the dropdown
-    const attrIds = new Set(attrs.map(a => a.attributeId));
-    globalMappings.forEach(m => {
-      if (m.newAttributeId && !attrIds.has(m.newAttributeId)) {
-        attrs.push({ attributeId: m.newAttributeId, description: 'Global Mapping' });
-        attrIds.add(m.newAttributeId);
-      }
-    });
-
-    // Ensure local mappings are available in the dropdown
-    stagedLocalMappings.forEach(m => {
-      if (m.newAttributeId && !attrIds.has(m.newAttributeId)) {
-        attrs.push({ attributeId: m.newAttributeId, description: 'Local Mapping' });
-        attrIds.add(m.newAttributeId);
-      }
-    });
-
     return attrs;
-  }, [stagedClassId, classes, allSystemAttributes, globalMappings, stagedLocalMappings]);
+  }, [stagedClassId, classes, allSystemAttributes]);
 
   const handleUpdateLinkage = (featureId: string, attrId: string) => {
     if (!isLockedByMe) return;
@@ -131,6 +190,11 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
     setStagedLocalMappings(prev => {
       const filtered = prev.filter(m => !m.legacyFeatureIds.includes(featureId));
       const globalRef = globalMappings.find(m => m.legacyFeatureIds.includes(featureId));
+      
+      if (attrId === 'UNMAPPED' && !globalRef) {
+        return filtered;
+      }
+      
       return [
         ...filtered,
         {
@@ -218,14 +282,38 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
              </div>
           </div>
           
-          <div className="flex gap-2">
+          <div className="flex items-center gap-3">
+             {/* PLM Domain selector moved next to Active Session banner */}
+             <div className="hidden sm:flex flex-col items-end mr-1">
+               <span className="text-[8px] font-black uppercase tracking-widest mb-0.5">
+                 PLM Domain
+               </span>
+               <div className="relative">
+                 <select
+                   disabled={isReadOnly}
+                   value={stagedClassId || ""}
+                   onChange={(e) => { isEditingRef.current = true; setStagedClassId(e.target.value); }}
+                   className={`w-40 h-8 pl-2 pr-6 rounded-lg text-[9px] font-black transition-all appearance-none outline-none border ${
+                     isReadOnly ? 'bg-slate-50 border-transparent text-slate-700' : 'bg-white border-indigo-400 text-indigo-900'
+                   }`}
+                 >
+                   <option value="UNCLASSIFIED">Universal Schema</option>
+                   {classes.map(c => <option key={c.classId} value={c.classId}>{c.className}</option>)}
+                 </select>
+                 <div className="absolute right-1.5 top-1.5 pointer-events-none text-slate-400">
+                   <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={3} d="M19 9l-7 7-7-7" /></svg>
+                 </div>
+               </div>
+             </div>
+
+             <div className="flex gap-2">
              {!isLockedByMe && !lockOwner && (
-                <button type="button" onClick={onSignOn} className="px-4 py-1.5 bg-indigo-600 text-white text-[9px] font-black rounded-lg hover:bg-indigo-700 transition-all uppercase tracking-widest shadow-lg shadow-indigo-300/30">
+                <button type="button" onClick={() => onSignOn().catch(e => console.error("Sign on failed:", e))} className="px-4 py-1.5 bg-indigo-600 text-white text-[9px] font-black rounded-lg hover:bg-indigo-700 transition-all uppercase tracking-widest shadow-lg shadow-indigo-300/30">
                   Sign On
                 </button>
              )}
-             {lockOwner && !isLockedByMe && (
-               <button type="button" onClick={onSignOff} className="px-4 py-1.5 bg-white/10 text-white text-[9px] font-black rounded-lg hover:bg-white/20 transition-all border border-white/20 uppercase tracking-widest flex items-center gap-1.5">
+             {lockOwner && !isLockedByMe && currentUser.role === 'admin' && (
+               <button type="button" onClick={() => onSignOff().catch(e => console.error("Force release failed:", e))} className="px-4 py-1.5 bg-white/10 text-white text-[9px] font-black rounded-lg hover:bg-white/20 transition-all border border-white/20 uppercase tracking-widest flex items-center gap-1.5">
                  <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" /></svg>
                  Admin Force
                </button>
@@ -235,151 +323,142 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
                   <button type="button" onClick={handleDiscardSessionChanges} disabled={!isDirty} className={`px-3 py-1.5 text-[9px] font-black rounded-lg transition-all uppercase tracking-widest ${isDirty ? 'bg-white/10 border border-white/20 text-white hover:bg-white/20' : 'bg-white/5 text-white/30 cursor-not-allowed'}`}>
                     Reset
                   </button>
-                  <button type="button" onClick={commitToSystem} className="px-4 py-1.5 bg-white text-indigo-700 text-[9px] font-black rounded-lg hover:bg-indigo-50 transition-all shadow-md uppercase tracking-widest">
+                  <button type="button" onClick={() => commitToSystem().catch(e => console.error("Save failed:", e))} className="px-4 py-1.5 bg-white text-indigo-700 text-[9px] font-black rounded-lg hover:bg-indigo-50 transition-all shadow-md uppercase tracking-widest">
                     Save
                   </button>
-                  <button type="button" onClick={onSignOff} className="px-4 py-1.5 bg-indigo-800 text-white text-[9px] font-black rounded-lg hover:bg-indigo-900 transition-all border border-indigo-400 uppercase tracking-widest">
+                  <button type="button" onClick={() => handleExitSession().catch(e => console.error("Exit failed:", e))} className="px-4 py-1.5 bg-indigo-800 text-white text-[9px] font-black rounded-lg hover:bg-indigo-900 transition-all border border-indigo-400 uppercase tracking-widest">
                     Exit
                   </button>
                 </>
              )}
-          </div>
+               </div>
+            </div>
         </div>
-
-        {/* Compact Summary Header */}
-        <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
-          <div className="md:col-span-3 bg-white rounded-xl shadow-sm border border-slate-200 p-4 flex items-center gap-4">
-            <div className="w-12 h-12 bg-slate-900 text-white rounded-lg flex items-center justify-center shrink-0">
-              <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M20 7l-8-4-8 4m16 0l-8 4m8-4v10l-8 4m0-10L4 7m8 4v10M4 7v10l8 4" />
-              </svg>
-            </div>
-            <div className="min-w-0">
-              <h2 className="text-xl font-black text-slate-900 leading-none tracking-tight truncate">{item.itemId}</h2>
-              <p className="text-slate-400 text-[10px] mt-1 font-bold uppercase tracking-wider truncate">{item.description}</p>
-            </div>
-          </div>
-
-          <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-4 flex flex-col justify-center">
-            <h3 className="text-[9px] font-black text-slate-400 uppercase tracking-widest mb-1.5">PLM Domain</h3>
-            <div className="relative">
-              <select
-                disabled={isReadOnly}
-                value={stagedClassId || ""}
-                onChange={(e) => { isEditingRef.current = true; setStagedClassId(e.target.value); }}
-                className={`w-full h-9 px-3 rounded-lg text-[10px] font-black transition-all appearance-none outline-none border ${isReadOnly ? 'bg-slate-50 border-transparent text-slate-700' : 'bg-white border-indigo-400 text-indigo-900'}`}
-              >
-                <option value="UNCLASSIFIED">Universal Schema</option>
-                {classes.map(c => <option key={c.classId} value={c.classId}>{c.className}</option>)}
-              </select>
-              <div className="absolute right-2.5 top-2.5 pointer-events-none text-slate-400">
-                <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={3} d="M19 9l-7 7-7-7" /></svg>
-              </div>
-            </div>
-          </div>
-        </div>
-
-        {/* Feature-wise Sleek Cards */}
+          {/* Feature list (view-only for now) */}
         <div className="space-y-3">
-          <div className="flex px-6 text-[9px] font-black text-slate-400 uppercase tracking-widest">
-            <div className="w-1/4">Source Attribute</div>
-            <div className="w-1/4">Structural Map</div>
-            <div className="flex-1">Value Logic</div>
+          <div className="grid grid-cols-[1fr_auto_1fr] gap-4 px-6 text-[9px] font-black text-slate-400 uppercase tracking-widest">
+              <div>Source Attribute</div>
+              <div className="text-center">→</div>
+              <div>Target Mapping</div>
           </div>
 
-          {item.features.map(f => {
-            const localMap = stagedLocalMappings.find(m => m.legacyFeatureIds.includes(f.featureId));
-            const globalMap = globalMappings.find(m => m.legacyFeatureIds.includes(f.featureId));
-            const isLocal = !!localMap;
-            const effectiveMapping = localMap || globalMap;
+          {item.features.map((f, idx) => {
+            // Find global mapping for this feature
+            const globalMapping = globalMappings.find(m => m.legacyFeatureIds.includes(f.featureId));
+            const localOverride = stagedLocalMappings.find(m => m.legacyFeatureIds.includes(f.featureId));
+            const effectiveMapping = localOverride || globalMapping;
             
-            return (
-              <div key={f.featureId} className="flex bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden relative transition-all duration-300 hover:shadow-md hover:border-slate-300">
-                <div className={`w-1.5 shrink-0 transition-colors ${isLocal ? 'bg-indigo-500' : 'bg-emerald-400'}`}></div>
+            // The base target attribute comes from global mapping if it exists
+            const baseTargetAttributeId = globalMapping?.newAttributeId || 'UNMAPPED';
+            
+            // Parse semicolon-separated attributes from the GLOBAL mapping to preserve the options
+            let attributeOptions = baseTargetAttributeId.split(';').map(a => a.trim()).filter(a => a && a !== 'UNMAPPED');
+            
+            // The default selected attribute if there is no local override
+            const defaultGlobalAttribute = attributeOptions.length > 0 ? attributeOptions[0] : 'UNMAPPED';
+            
+            // If there are no options (unmapped), we should provide ALL attributes from the classification table
+            const isUnmapped = attributeOptions.length === 0;
+            if (isUnmapped) {
+              attributeOptions = ['UNMAPPED', ...targetAttributes.map(a => a.attributeId)];
+            }
+            
+            // Ensure local override is in the options if it exists
+            if (localOverride && localOverride.newAttributeId !== 'UNMAPPED' && !attributeOptions.includes(localOverride.newAttributeId)) {
+              attributeOptions.push(localOverride.newAttributeId);
+            }
+            
+            // If there is a local override that is 'UNMAPPED', we need to ensure 'UNMAPPED' is in the options
+            // so the user can switch back to the global mapping
+            if (localOverride && localOverride.newAttributeId === 'UNMAPPED' && !attributeOptions.includes('UNMAPPED')) {
+              attributeOptions = ['UNMAPPED', ...attributeOptions];
+            }
+            
+            // It has multiple options if it's unmapped (all attributes) OR if the global mapping had multiple options OR if there's a local override
+            const hasMultipleOptions = isUnmapped || attributeOptions.length > 1 || !!localOverride;
 
-                {/* Column 1: Feature Source */}
-                <div className="w-1/4 p-5 flex flex-col justify-center border-r border-slate-100 bg-slate-50/20">
+            if (hasMultipleOptions && !attributeOptions.includes('UNMAPPED')) {
+              attributeOptions = ['UNMAPPED', ...attributeOptions];
+            }
+            
+            // The currently selected attribute is the local override, OR the default global attribute
+            const selectedAttribute = localOverride?.newAttributeId || defaultGlobalAttribute;
+            
+            // It has a mapping if the selected attribute is not 'UNMAPPED'
+            const hasMapping = selectedAttribute !== 'UNMAPPED';
+
+            return (
+                <div key={`${item.itemId}-${f.featureId}-${idx}`} className={`grid grid-cols-[1fr_auto_1fr] gap-4 bg-white rounded-xl shadow-sm border relative transition-all duration-300 hover:shadow-md ${hasMapping ? 'border-emerald-200' : 'border-slate-200'}`}>
+                  <div className={`w-1.5 shrink-0 absolute left-0 top-0 bottom-0 rounded-l-xl ${hasMapping ? 'bg-emerald-400' : 'bg-slate-300'}`}></div>
+
+                  {/* Source Feature column */}
+                  <div className="p-5 pl-8 flex flex-col justify-center bg-slate-50/20 rounded-l-xl">
                     <p className="text-sm font-black text-slate-900 leading-tight">{f.featureId}</p>
                     <p className="text-[9px] text-slate-400 font-bold uppercase tracking-wider mt-0.5">{f.description}</p>
-                    {isLocal && (
-                        <div className="mt-2 flex items-center gap-1.5">
-                           <span className="w-1 h-1 rounded-full bg-indigo-500 animate-pulse"></span>
-                           <span className="text-[8px] font-black text-indigo-500 uppercase">Override</span>
-                        </div>
-                    )}
-                </div>
-
-                {/* Column 2: Structural Bridge */}
-                <div className="w-1/4 p-5 flex flex-col justify-center gap-2">
-                  <div className="flex items-center justify-between">
-                    <span className={`text-[8px] font-black uppercase tracking-widest ${isLocal ? 'text-indigo-600' : 'text-emerald-600'}`}>
-                      {isLocal ? 'Session' : 'System'}
-                    </span>
-                    {isLocal && !isReadOnly && (
-                      <button type="button" onClick={() => handleResetToGlobal(f.featureId)} className="text-[8px] font-black text-slate-400 hover:text-red-500 uppercase transition-colors">
-                        Restore
-                      </button>
-                    )}
-                  </div>
-
-                  <div className="relative">
-                    <select 
-                      disabled={isReadOnly}
-                      value={effectiveMapping?.newAttributeId || ""}
-                      onChange={(e) => handleUpdateLinkage(f.featureId, e.target.value)}
-                      className={`w-full h-9 px-2 text-[10px] font-black rounded-lg outline-none transition-all ${
-                        isLocal 
-                          ? 'bg-white border border-indigo-300 text-indigo-900 ring-2 ring-indigo-50' 
-                          : 'bg-emerald-50/30 border border-emerald-100 text-emerald-900'
-                      } disabled:appearance-none`}
-                    >
-                      <option value="">( Unmapped )</option>
-                      {targetAttributes.map(a => <option key={a.attributeId} value={a.attributeId}>{a.attributeId}</option>)}
-                    </select>
-                  </div>
-                </div>
-
-                {/* Column 3: Transformation Logic */}
-                <div className="flex-1 p-5 flex flex-wrap gap-3 items-center bg-slate-50/10">
-                  {f.values.map(v => {
-                    const mappedVal = effectiveMapping?.valueMappings[v];
-                    const isValLocal = localMap && localMap.valueMappings && localMap.valueMappings[v] !== undefined;
-                    const hasValidMapping = !!mappedVal;
                     
-                    return (
-                      <div key={v} className={`flex-1 min-w-[240px] p-3.5 rounded-xl border transition-all ${isValLocal ? 'bg-white border-indigo-200 shadow-sm' : hasValidMapping ? 'bg-white/60 border-emerald-100' : 'bg-orange-50/30 border-orange-200 border-dashed'}`}>
-                        <div className="flex items-center gap-3 mb-2.5">
-                            <div className="px-2.5 py-1.5 bg-slate-900 text-white rounded-lg text-[9px] font-black uppercase tracking-tight flex-1 text-center truncate">
-                              {v}
-                            </div>
-                            <svg className={`w-3.5 h-3.5 shrink-0 ${isValLocal ? 'text-indigo-400' : hasValidMapping ? 'text-emerald-400' : 'text-orange-300'}`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={3} d="M14 5l7 7m0 0l-7 7m7-7H3" />
-                            </svg>
-                            <div className={`px-2.5 py-1.5 rounded-lg text-[9px] font-black uppercase flex-1 text-center truncate transition-all ${isValLocal ? 'bg-indigo-600 text-white' : hasValidMapping ? 'bg-emerald-600 text-white' : 'bg-orange-500 text-white'}`}>
-                              {mappedVal || 'REQUIRES INPUT'}
-                            </div>
+                    {/* Source Values */}
+                    <div className="mt-3 space-y-2">
+                      {f.values.map((v, vidx) => (
+                        <div key={`${item.itemId}-${f.featureId}-source-${vidx}`} className="px-3 py-2 bg-slate-900 text-white rounded-lg text-[9px] font-black uppercase tracking-tight truncate">
+                          {v}
                         </div>
+                      ))}
+                    </div>
+                  </div>
 
-                        {!isReadOnly && (
-                          <div className="relative">
-                            <input 
-                              type="text"
-                              placeholder="Assign Target Value..."
-                              value={manualInputs[`${f.featureId}-${v}`] ?? mappedVal ?? ''}
-                              onChange={(e) => handleManualInputChange(`${f.featureId}-${v}`, e.target.value)}
-                              onBlur={() => handleUpdateValue(f.featureId, v, manualInputs[`${f.featureId}-${v}`] || mappedVal || '')}
-                              className={`w-full text-[10px] h-8 px-2.5 rounded-lg border transition-all font-bold focus:outline-none ${isValLocal ? 'bg-white border-indigo-400 ring-2 ring-indigo-50 text-indigo-900' : 'bg-slate-50 border-slate-200 focus:bg-white focus:border-indigo-400 text-slate-900'}`}
-                            />
-                            <div className="absolute right-2.5 top-2 text-slate-300">
-                                <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M15.232 5.232l3.536 3.536m-2.036-5.036a2.5 2.5 0 113.536 3.536L6.5 21.036H3v-3.572L16.732 3.732z" /></svg>
-                            </div>
+                  {/* Arrow column */}
+                  <div className="flex items-center justify-center py-5 text-2xl font-black text-slate-300">
+                    →
+                  </div>
+
+                  {/* Target Mapping column */}
+                  <div className="p-5 flex flex-col justify-center border-l border-slate-100 rounded-r-xl">
+                    <div className="flex items-center gap-2 mb-2">
+                      {localOverride && (
+                        <span className="px-2 py-0.5 bg-purple-100 text-purple-700 text-[7px] font-black rounded-full uppercase tracking-wider">
+                          Local
+                        </span>
+                      )}
+                      {globalMapping && !localOverride && (
+                        <span className="px-2 py-0.5 bg-blue-100 text-blue-700 text-[7px] font-black rounded-full uppercase tracking-wider">
+                          Global
+                        </span>
+                      )}
+                      {hasMultipleOptions && !isLockedByMe && (
+                        <span className="px-2 py-0.5 bg-amber-100 text-amber-700 text-[7px] font-black rounded-full uppercase tracking-wider">
+                          Multiple Options
+                        </span>
+                      )}
+                    </div>
+                    
+                    {/* Target Attribute Selector/Display */}
+                    {hasMultipleOptions && isLockedByMe ? (
+                      <SearchableSelect
+                        value={selectedAttribute}
+                        options={attributeOptions}
+                        onChange={(val) => handleUpdateLinkage(f.featureId, val)}
+                      />
+                    ) : (
+                      <p className={`text-sm font-black leading-tight mb-2 ${hasMapping ? 'text-emerald-700' : 'text-slate-400'}`}>
+                        {selectedAttribute}
+                      </p>
+                    )}
+                    
+                    {/* Mapped Values */}
+                    <div className="mt-1 space-y-2">
+                      {f.values.map((v, vidx) => {
+                        const mappedValue = effectiveMapping?.valueMappings?.[v] || v;
+                        const isValueMapped = effectiveMapping?.valueMappings?.[v] !== undefined;
+                        
+                        return (
+                          <div key={`${item.itemId}-${f.featureId}-target-${vidx}`} className={`px-3 py-2 rounded-lg text-[9px] font-black uppercase tracking-tight truncate ${isValueMapped ? 'bg-emerald-600 text-white' : 'bg-slate-100 text-slate-500'}`}>
+                            {mappedValue}
                           </div>
-                        )}
-                      </div>
-                    );
-                  })}
+                        );
+                      })}
+                    </div>
+                  </div>
                 </div>
-              </div>
             );
           })}
         </div>

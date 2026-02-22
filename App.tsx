@@ -18,37 +18,21 @@ const App: React.FC = () => {
   const [dbState, setDbState] = useState<DatabaseState | null>(null);
   const [activeInspector, setActiveInspector] = useState<DataCategory | null>(null);
   
-  const pollingRef = useRef<number | null>(null);
-
-  // when the inspector is open we temporarily pause background polling
+  // Initial load only; further refreshes are explicit via header/controls.
   useEffect(() => {
     handleFetchFromDB();
-    // clear existing interval if any
-    if (pollingRef.current) {
-      clearInterval(pollingRef.current);
-      pollingRef.current = null;
-    }
-
-    pollingRef.current = window.setInterval(() => {
-      // skip fetching while someone is editing management console
-      if (!activeInspector) {
-        handleFetchFromDB();
-      }
-    }, 5000); // Polling SQL is heavier, slowed down to 5s
-
-    return () => {
-      if (pollingRef.current) clearInterval(pollingRef.current);
-    };
-  }, [activeInspector]);
+  }, []);
 
   const handleFetchFromDB = async () => {
     try {
       const { state, mode } = await dbService.fetchAll();
       setDbState(state);
       setConnectionMode(mode);
-    } catch (error) {
+    } catch (error: any) {
       console.error("Database sync failed", error);
+      alert(`Failed to connect to database: ${error?.message || 'Unknown error'}. Please ensure the backend server is running on port 8000.`);
       setConnectionMode('LOCAL_MOCK');
+      setDbState(null);
     }
   };
 
@@ -118,6 +102,13 @@ const App: React.FC = () => {
     setTimeout(() => setShowSuccess(false), 3000);
   };
 
+  const handleClearCache = async () => {
+    if (confirm('Clear auth token and reload from database?')) {
+      localStorage.removeItem('erp_migrator_token');
+      window.location.reload();
+    }
+  };
+
   const handleSaveInspectorData = async (category: DataCategory, updatedData: any) => {
     if (!dbState) return;
     let nextState = { ...dbState };
@@ -159,6 +150,7 @@ const App: React.FC = () => {
         onCommit={handleCommit}
         currentUser={currentUser}
         onLogout={handleLogout}
+        onClearCache={handleClearCache}
       />
       
       <main className="flex flex-1 overflow-hidden relative">
@@ -191,9 +183,11 @@ const App: React.FC = () => {
           assignedClassId={selectedItemId ? dbState.itemClassifications[selectedItemId] : null}
           isLockedByMe={isLockedByMe}
           lockOwner={currentLock}
-          onSignOn={() => selectedItemId && handleSignOn(selectedItemId)}
-          onSignOff={() => selectedItemId && handleSignOff(selectedItemId)}
+          currentUser={currentUser}
+          onSignOn={async () => selectedItemId && (await handleSignOn(selectedItemId))}
+          onSignOff={async () => selectedItemId && (await handleSignOff(selectedItemId))}
           onSaveChanges={handleSaveWorkspaceChanges}
+          onSyncFromDB={handleFetchFromDB}
         />
 
         {activeInspector && (
