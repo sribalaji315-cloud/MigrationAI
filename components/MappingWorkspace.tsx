@@ -31,15 +31,24 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
   const [stagedLocalMappings, setStagedLocalMappings] = useState<GlobalMapping[]>([]);
   const [stagedClassId, setStagedClassId] = useState<string | null>(null);
   const isEditingRef = useRef(false);
+  const prevItemIdRef = useRef<string | null>(null);
 
   // Initialize workspace when item changes
   useEffect(() => {
     if (item) {
+      const isNewItem = prevItemIdRef.current !== item.itemId;
+      if (isNewItem) {
+        isEditingRef.current = false;
+        prevItemIdRef.current = item.itemId;
+      }
+
       if (!isEditingRef.current || !isLockedByMe) {
         setStagedClassId(assignedClassId || 'UNCLASSIFIED');
         setStagedLocalMappings(JSON.parse(JSON.stringify(localItemMappings[item.itemId] || [])));
         setManualInputs({});
       }
+    } else {
+      prevItemIdRef.current = null;
     }
   }, [item, assignedClassId, localItemMappings, isLockedByMe]);
 
@@ -88,10 +97,33 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
 
   const targetAttributes = useMemo(() => {
     const classId = stagedClassId || 'UNCLASSIFIED';
-    if (classId === 'UNCLASSIFIED') return allSystemAttributes;
-    const selectedClass = classes.find(c => c.classId === classId);
-    return selectedClass ? selectedClass.attributes : [];
-  }, [stagedClassId, classes, allSystemAttributes]);
+    let attrs: NewAttribute[] = [];
+    if (classId === 'UNCLASSIFIED') {
+      attrs = [...allSystemAttributes];
+    } else {
+      const selectedClass = classes.find(c => c.classId === classId);
+      attrs = selectedClass ? [...selectedClass.attributes] : [];
+    }
+
+    // Ensure global mappings are available in the dropdown
+    const attrIds = new Set(attrs.map(a => a.attributeId));
+    globalMappings.forEach(m => {
+      if (m.newAttributeId && !attrIds.has(m.newAttributeId)) {
+        attrs.push({ attributeId: m.newAttributeId, description: 'Global Mapping' });
+        attrIds.add(m.newAttributeId);
+      }
+    });
+
+    // Ensure local mappings are available in the dropdown
+    stagedLocalMappings.forEach(m => {
+      if (m.newAttributeId && !attrIds.has(m.newAttributeId)) {
+        attrs.push({ attributeId: m.newAttributeId, description: 'Local Mapping' });
+        attrIds.add(m.newAttributeId);
+      }
+    });
+
+    return attrs;
+  }, [stagedClassId, classes, allSystemAttributes, globalMappings, stagedLocalMappings]);
 
   const handleUpdateLinkage = (featureId: string, attrId: string) => {
     if (!isLockedByMe) return;
