@@ -10,6 +10,9 @@ config = context.config
 # Interpret the config file for Python logging.
 fileConfig(config.config_file_name)
 
+import sys
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
+
 # add your model's MetaData object here
 # for 'autogenerate' support
 from app.db.session import Base
