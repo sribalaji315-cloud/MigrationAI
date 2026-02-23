@@ -1,4 +1,4 @@
-import React, { useMemo } from 'react';
+import React, { useMemo, useState } from 'react';
 import { LegacyItem, GlobalMapping, LocalItemMappings } from '../types';
 
 interface MappingDashboardProps {
@@ -66,6 +66,8 @@ const DonutStat: React.FC<DonutStatProps> = ({ label, value, primaryColor, secon
 };
 
 const MappingDashboard: React.FC<MappingDashboardProps> = ({ bom, mappings, localMappings, onClose, onRecompute }) => {
+  const [itemFilter, setItemFilter] = useState('');
+
   const metrics = useMemo(() => {
     const globalByFeature: Record<string, GlobalMapping> = {};
     mappings.forEach(m => {
@@ -82,6 +84,17 @@ const MappingDashboard: React.FC<MappingDashboardProps> = ({ bom, mappings, loca
     let mappedValues = 0;
     const totalItems = bom.length;
     let itemsFullyMapped = 0;
+
+    interface ItemStat {
+      itemId: string;
+      description: string;
+      totalFeatures: number;
+      mappedFeatures: number;
+      totalValues: number;
+      mappedValues: number;
+      fullyMapped: boolean;
+    }
+    const perItem: ItemStat[] = [];
 
     bom.forEach(item => {
       const localForItem = localMappings[item.itemId] || [];
@@ -121,15 +134,26 @@ const MappingDashboard: React.FC<MappingDashboardProps> = ({ bom, mappings, loca
         });
       });
 
+      // An item with no values (but with attribute-mapped features) is considered fully mapped.
+      // An item with values must have all values mapped too.
       const itemFullyMapped =
         itemFeatures > 0 &&
-        itemValues > 0 &&
         itemFeatures === itemMappedFeatures &&
-        itemValues === itemMappedValues;
+        (itemValues === 0 || itemValues === itemMappedValues);
 
       if (itemFullyMapped) {
         itemsFullyMapped += 1;
       }
+
+      perItem.push({
+        itemId: item.itemId,
+        description: item.description || '',
+        totalFeatures: itemFeatures,
+        mappedFeatures: itemMappedFeatures,
+        totalValues: itemValues,
+        mappedValues: itemMappedValues,
+        fullyMapped: itemFullyMapped,
+      });
     });
 
     const attributeCoverage = totalFeatures > 0 ? mappedFeatures / totalFeatures : 0;
@@ -146,8 +170,17 @@ const MappingDashboard: React.FC<MappingDashboardProps> = ({ bom, mappings, loca
       attributeCoverage,
       valueCoverage,
       itemCoverage,
+      perItem,
     };
   }, [bom, mappings, localMappings]);
+
+  const filteredItems = useMemo(() => {
+    const q = itemFilter.trim().toLowerCase();
+    if (!q) return metrics.perItem;
+    return metrics.perItem.filter(
+      it => it.itemId.toLowerCase().includes(q) || it.description.toLowerCase().includes(q)
+    );
+  }, [metrics.perItem, itemFilter]);
 
   return (
     <div className="fixed inset-0 z-[110] flex items-center justify-center p-4 bg-slate-900/50 backdrop-blur-sm">
@@ -216,6 +249,77 @@ const MappingDashboard: React.FC<MappingDashboardProps> = ({ bom, mappings, loca
               <p className="font-black text-slate-900 text-sm">{metrics.totalItems.toLocaleString()} items</p>
               <p className="mt-0.5 text-[10px] text-slate-500">Used to compute fully mapped completion percentage.</p>
             </div>
+          </div>
+
+          {/* Per-item breakdown */}
+          <div className="rounded-2xl bg-white border border-slate-100 shadow-sm overflow-hidden">
+            <div className="px-4 py-3 border-b border-slate-100 flex items-center justify-between gap-3">
+              <p className="text-[9px] font-black text-slate-400 uppercase tracking-widest">BOM Item Breakdown</p>
+              <input
+                type="text"
+                value={itemFilter}
+                onChange={e => setItemFilter(e.target.value)}
+                placeholder="Filter by item ID or description…"
+                className="text-xs px-3 py-1.5 rounded-lg border border-slate-200 bg-slate-50 text-slate-700 focus:outline-none focus:ring-2 focus:ring-indigo-400 w-64"
+              />
+            </div>
+            <div className="overflow-x-auto max-h-72 overflow-y-auto">
+              <table className="min-w-full text-[11px]">
+                <thead className="sticky top-0 bg-slate-50 border-b border-slate-100 z-10">
+                  <tr>
+                    <th className="px-4 py-2 text-left font-black text-slate-500 uppercase tracking-widest text-[9px] w-40">Item ID</th>
+                    <th className="px-4 py-2 text-left font-black text-slate-500 uppercase tracking-widest text-[9px]">Description</th>
+                    <th className="px-4 py-2 text-center font-black text-slate-500 uppercase tracking-widest text-[9px]">Attrs</th>
+                    <th className="px-4 py-2 text-center font-black text-slate-500 uppercase tracking-widest text-[9px]">Values</th>
+                    <th className="px-4 py-2 text-center font-black text-slate-500 uppercase tracking-widest text-[9px]">Status</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {filteredItems.length === 0 ? (
+                    <tr>
+                      <td colSpan={5} className="px-4 py-6 text-center text-slate-400 text-xs">No items match your filter.</td>
+                    </tr>
+                  ) : filteredItems.map(it => {
+                    const attrPct = it.totalFeatures > 0 ? Math.round((it.mappedFeatures / it.totalFeatures) * 100) : 100;
+                    const valPct = it.totalValues > 0 ? Math.round((it.mappedValues / it.totalValues) * 100) : 100;
+                    return (
+                      <tr key={it.itemId} className="border-b border-slate-50 hover:bg-slate-50 transition-colors">
+                        <td className="px-4 py-2 font-mono text-slate-700 font-semibold whitespace-nowrap">{it.itemId}</td>
+                        <td className="px-4 py-2 text-slate-600 max-w-xs truncate" title={it.description}>{it.description || '—'}</td>
+                        <td className="px-4 py-2 text-center">
+                          <span className={`font-bold ${attrPct === 100 ? 'text-green-600' : attrPct >= 50 ? 'text-amber-500' : 'text-red-500'}`}>
+                            {it.mappedFeatures}/{it.totalFeatures}
+                          </span>
+                        </td>
+                        <td className="px-4 py-2 text-center">
+                          <span className={`font-bold ${valPct === 100 ? 'text-green-600' : valPct >= 50 ? 'text-amber-500' : 'text-red-500'}`}>
+                            {it.totalValues === 0 ? <span className="text-slate-400">—</span> : `${it.mappedValues}/${it.totalValues}`}
+                          </span>
+                        </td>
+                        <td className="px-4 py-2 text-center">
+                          {it.fullyMapped ? (
+                            <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-green-100 text-green-700 font-black text-[9px] uppercase tracking-widest">
+                              <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M5 13l4 4L19 7" /></svg>
+                              Complete
+                            </span>
+                          ) : (
+                            <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-amber-100 text-amber-700 font-black text-[9px] uppercase tracking-widest">
+                              <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M12 9v4m0 4h.01" /></svg>
+                              Incomplete
+                            </span>
+                          )}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+            {itemFilter && (
+              <p className="px-4 py-2 text-[10px] text-slate-400 border-t border-slate-50">
+                Showing {filteredItems.length} of {metrics.totalItems} items
+              </p>
+            )}
           </div>
         </div>
 
