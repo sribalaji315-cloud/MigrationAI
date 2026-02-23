@@ -21,9 +21,10 @@ interface LegacyValueSelectorProps {
   value: string;
   options: string[];
   onChange: (next: string) => void;
+  placeholder?: string;
 }
 
-const LegacyValueSelector: React.FC<LegacyValueSelectorProps> = ({ value, options, onChange }) => {
+const LegacyValueSelector: React.FC<LegacyValueSelectorProps> = ({ value, options, onChange, placeholder = 'Filter...' }) => {
   const [open, setOpen] = useState(false);
   const [search, setSearch] = useState('');
   const containerRef = useRef<HTMLDivElement | null>(null);
@@ -64,7 +65,7 @@ const LegacyValueSelector: React.FC<LegacyValueSelectorProps> = ({ value, option
           value={value}
           onChange={(e) => onChange(e.target.value)}
           onFocus={() => setOpen(true)}
-          placeholder="Filter legacy values..."
+          placeholder={placeholder}
           className="w-full text-[9px] font-black text-slate-900 bg-white px-1.5 py-1 rounded-md border border-slate-200 outline-none focus:border-indigo-400 focus:ring-1 focus:ring-indigo-300"
         />
         {options.length > 0 && (
@@ -119,6 +120,7 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
   const [bomSearch, setBomSearch] = useState('');
   const [selectedBomItemId, setSelectedBomItemId] = useState<string | null>(null);
   const [legacyValueFilter, setLegacyValueFilter] = useState('');
+  const [featureFilter, setFeatureFilter] = useState('');
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   useEffect(() => {
@@ -131,6 +133,7 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
     setBomSearch('');
     setSelectedBomItemId(null);
     setLegacyValueFilter('');
+    setFeatureFilter('');
   }, [data, category]);
 
   const titles = {
@@ -224,6 +227,11 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
     if (!selectedBomItemId) return null;
     return localBom.find(item => item.itemId === selectedBomItemId) || null;
   }, [localBom, selectedBomItemId]);
+
+  const featureCandidates = useMemo(() => {
+    if (!selectedBomItem) return [] as string[];
+    return selectedBomItem.features.map(f => f.featureId).filter(Boolean).sort((a, b) => a.localeCompare(b));
+  }, [selectedBomItem]);
 
   // --- Lightweight CSV helpers (template + parsing) ---
 
@@ -688,7 +696,7 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
                       </thead>
                       <tbody className="divide-y divide-slate-100">
                         {pagedMapping.map((m, idxOnPage) => {
-                          const globalIdx = filteredMapping.indexOf(m);
+                          const globalIdx = localMapping.indexOf(m);
                           const isSelected = selectedMappingIndex === globalIdx;
                           const legacyLabel = (m.legacyFeatureIds || []).join(' | ') || '—';
                           const targetLabel = m.newAttributeId || 'UNMAPPED';
@@ -1081,6 +1089,7 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
                         value={legacyValueFilter}
                         options={legacyValueCandidates}
                         onChange={(val) => setLegacyValueFilter(val)}
+                        placeholder="Filter legacy values..."
                       />
                     </div>
                     {legacyValueFilter && (
@@ -1222,28 +1231,54 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
               <div>
                 <div className="flex items-center justify-between mb-2">
                   <p className="text-[9px] font-black text-slate-400 uppercase tracking-widest">Legacy Features & Values</p>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      const idx = localBom.findIndex(i => i.itemId === selectedBomItem.itemId);
-                      if (idx === -1) return;
-                      const next = [...localBom];
-                      next[idx].features.push({ featureId: 'NEW_FEAT', description: 'New Feature', values: [] });
-                      setLocalBom(next);
-                    }}
-                    className="px-2 py-1 border border-dashed border-slate-300 rounded-md text-[8px] font-black text-slate-500 hover:text-slate-700 hover:border-slate-400 uppercase tracking-widest flex items-center gap-1"
-                  >
-                    <svg className="w-2.5 h-2.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={3} d="M12 6v6m0 0v6m0-6h6m-6 0H6" />
-                    </svg>
-                    Add Specification
-                  </button>
+                  <div className="flex items-center gap-2">
+                    <div className="w-48">
+                      <LegacyValueSelector
+                        value={featureFilter}
+                        options={featureCandidates}
+                        onChange={(val) => setFeatureFilter(val)}
+                        placeholder="Filter features..."
+                      />
+                    </div>
+                    {featureFilter && (
+                      <button
+                        type="button"
+                        onClick={() => setFeatureFilter('')}
+                        className="px-2 py-1 rounded-md text-[8px] font-black text-slate-400 hover:text-slate-600 hover:bg-slate-100 uppercase tracking-widest transition-all"
+                        title="Clear filter"
+                      >
+                        Clear
+                      </button>
+                    )}
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const idx = localBom.findIndex(i => i.itemId === selectedBomItem.itemId);
+                        if (idx === -1) return;
+                        const next = [...localBom];
+                        next[idx].features.push({ featureId: 'NEW_FEAT', description: 'New Feature', values: [] });
+                        setLocalBom(next);
+                      }}
+                      className="px-2 py-1 border border-dashed border-slate-300 rounded-md text-[8px] font-black text-slate-500 hover:text-slate-700 hover:border-slate-400 uppercase tracking-widest flex items-center gap-1 shrink-0"
+                    >
+                      <svg className="w-2.5 h-2.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={3} d="M12 6v6m0 0v6m0-6h6m-6 0H6" />
+                      </svg>
+                      Add
+                    </button>
+                  </div>
                 </div>
 
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 max-h-64 overflow-y-auto pr-1">
                   {selectedBomItem.features.map((feat, fIdx) => {
                     const parentIdx = localBom.findIndex(i => i.itemId === selectedBomItem.itemId);
                     if (parentIdx === -1) return null;
+                    
+                    // Apply filter
+                    if (featureFilter.trim() && !feat.featureId.toLowerCase().includes(featureFilter.toLowerCase())) {
+                      return null;
+                    }
+                    
                     return (
                       <div
                         key={`${feat.featureId}-${fIdx}`}
