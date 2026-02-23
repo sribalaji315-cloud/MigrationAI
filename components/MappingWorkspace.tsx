@@ -68,6 +68,109 @@ const SearchableSelect = ({ value, options, onChange }: { value: string, options
   );
 };
 
+const ValueSelector = ({
+  value,
+  options,
+  disabled,
+  onChange,
+}: {
+  value: string;
+  options: string[];
+  disabled?: boolean;
+  onChange: (val: string) => void;
+}) => {
+  const [isOpen, setIsOpen] = useState(false);
+  const [search, setSearch] = useState('');
+  const wrapperRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    const handleClickOutside = (event: MouseEvent) => {
+      if (wrapperRef.current && !wrapperRef.current.contains(event.target as Node)) {
+        setIsOpen(false);
+      }
+    };
+    document.addEventListener('mousedown', handleClickOutside);
+    return () => document.removeEventListener('mousedown', handleClickOutside);
+  }, []);
+
+  const filteredOptions = useMemo(() => {
+    const q = search.toLowerCase();
+    return options
+      .filter(opt => opt.toLowerCase().includes(q))
+      .slice(0, 20);
+  }, [options, search]);
+
+  return (
+    <div ref={wrapperRef} className="relative">
+      <div className="flex items-center gap-1">
+        <input
+          type="text"
+          disabled={disabled}
+          value={value}
+          onChange={(e) => !disabled && onChange(e.target.value)}
+          className={`flex-1 px-3 py-1.5 rounded-lg border text-[9px] font-black uppercase tracking-tight outline-none transition-all ${
+            disabled
+              ? 'bg-slate-100 border-slate-200 text-slate-400 cursor-not-allowed'
+              : 'bg-white border-emerald-300 text-emerald-800 focus:ring-1 focus:ring-emerald-400'
+          }`}
+        />
+        <button
+          type="button"
+          disabled={disabled || options.length === 0}
+          onClick={() => {
+            if (disabled || options.length === 0) return;
+            setIsOpen(o => !o);
+            setSearch('');
+          }}
+          className={`w-7 h-7 flex items-center justify-center rounded-md border text-emerald-700 bg-white shadow-sm text-[10px] ${
+            disabled || options.length === 0
+              ? 'opacity-40 cursor-not-allowed border-slate-200'
+              : 'border-emerald-200 hover:bg-emerald-50'
+          }`}
+        >
+          <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M19 9l-7 7-7-7" />
+          </svg>
+        </button>
+      </div>
+
+      {isOpen && !disabled && (
+        <div className="absolute z-40 mt-1 w-full bg-white border border-emerald-200 rounded-lg shadow-lg max-h-56 overflow-hidden">
+          <div className="p-2 border-b border-slate-100 bg-slate-50">
+            <input
+              type="text"
+              value={search}
+              onChange={(e) => setSearch(e.target.value)}
+              className="w-full px-2 py-1.5 text-[9px] font-bold text-slate-700 bg-white border border-slate-200 rounded outline-none focus:border-emerald-400 focus:ring-1 focus:ring-emerald-400"
+              placeholder="Search target values..."
+            />
+          </div>
+          <div className="max-h-40 overflow-y-auto">
+            {filteredOptions.length > 0 ? (
+              filteredOptions.map((opt, idx) => (
+                <div
+                  key={idx}
+                  className={`px-3 py-1.5 text-[9px] font-black uppercase tracking-tight cursor-pointer hover:bg-emerald-50 ${
+                    opt === value ? 'bg-emerald-50 text-emerald-800' : 'text-slate-700'
+                  }`}
+                  onClick={() => {
+                    onChange(opt);
+                    setIsOpen(false);
+                  }}
+                >
+                  {opt}
+                </div>
+              ))
+            ) : (
+              <div className="px-3 py-2 text-[9px] font-bold text-slate-400 text-center">No matches</div>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
+
 interface MappingWorkspaceProps {
   item: LegacyItem | null;
   classes: NewClassification[];
@@ -183,6 +286,34 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
 
     return attrs;
   }, [stagedClassId, classes, allSystemAttributes]);
+
+  const attributeCandidateValues = useMemo(() => {
+    const byAttr: Record<string, string[]> = {};
+
+    // Collect values from global mappings (target-side values)
+    globalMappings.forEach(m => {
+      const attrId = m.newAttributeId;
+      if (!attrId) return;
+      if (!byAttr[attrId]) byAttr[attrId] = [];
+      Object.values(m.valueMappings || {}).forEach(val => {
+        if (!val) return;
+        if (!byAttr[attrId].includes(val)) byAttr[attrId].push(val);
+      });
+    });
+
+    // Merge in classification allowedValues, if present
+    classes.forEach(cls => {
+      cls.attributes.forEach(attr => {
+        if (!attr.allowedValues || attr.allowedValues.length === 0) return;
+        const list = (byAttr[attr.attributeId] = byAttr[attr.attributeId] || []);
+        attr.allowedValues.forEach(v => {
+          if (!list.includes(v)) list.push(v);
+        });
+      });
+    });
+
+    return byAttr;
+  }, [globalMappings, classes]);
 
   const handleUpdateLinkage = (featureId: string, attrId: string) => {
     if (!isLockedByMe) return;
@@ -447,13 +578,32 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
                     {/* Mapped Values */}
                     <div className="mt-1 space-y-2">
                       {f.values.map((v, vidx) => {
-                        const mappedValue = effectiveMapping?.valueMappings?.[v] || v;
+                        const mappedValue = effectiveMapping?.valueMappings?.[v] ?? v;
                         const isValueMapped = effectiveMapping?.valueMappings?.[v] !== undefined;
-                        
+
+                        if (isReadOnly) {
+                          return (
+                            <div
+                              key={`${item.itemId}-${f.featureId}-target-${vidx}`}
+                              className={`px-3 py-2 rounded-lg text-[9px] font-black uppercase tracking-tight truncate ${
+                                isValueMapped ? 'bg-emerald-600 text-white' : 'bg-slate-100 text-slate-500'
+                              }`}
+                            >
+                              {mappedValue}
+                            </div>
+                          );
+                        }
+
+                        const candidateValues = attributeCandidateValues[selectedAttribute] || [];
+
                         return (
-                          <div key={`${item.itemId}-${f.featureId}-target-${vidx}`} className={`px-3 py-2 rounded-lg text-[9px] font-black uppercase tracking-tight truncate ${isValueMapped ? 'bg-emerald-600 text-white' : 'bg-slate-100 text-slate-500'}`}>
-                            {mappedValue}
-                          </div>
+                          <ValueSelector
+                            key={`${item.itemId}-${f.featureId}-target-${vidx}`}
+                            value={mappedValue}
+                            options={candidateValues}
+                            disabled={isReadOnly}
+                            onChange={(newVal) => handleUpdateValue(f.featureId, v, newVal)}
+                          />
                         );
                       })}
                     </div>
