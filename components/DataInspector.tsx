@@ -17,6 +17,98 @@ interface DataInspectorProps {
   currentUser: User; // used to determine admin privileges
 }
 
+interface LegacyValueSelectorProps {
+  value: string;
+  options: string[];
+  onChange: (next: string) => void;
+}
+
+const LegacyValueSelector: React.FC<LegacyValueSelectorProps> = ({ value, options, onChange }) => {
+  const [open, setOpen] = useState(false);
+  const [search, setSearch] = useState('');
+  const containerRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    const handleClickOutside = (event: MouseEvent) => {
+      if (!containerRef.current) return;
+      if (!containerRef.current.contains(event.target as Node)) {
+        setOpen(false);
+      }
+    };
+
+    document.addEventListener('mousedown', handleClickOutside);
+    return () => {
+      document.removeEventListener('mousedown', handleClickOutside);
+    };
+  }, []);
+
+  const filteredOptions = useMemo(() => {
+    const base = options || [];
+    const q = search.trim().toLowerCase();
+    const filtered = q
+      ? base.filter(o => o.toLowerCase().includes(q))
+      : base;
+    return filtered.slice(0, 20);
+  }, [options, search]);
+
+  const handleSelect = (opt: string) => {
+    onChange(opt);
+    setOpen(false);
+    setSearch('');
+  };
+
+  return (
+    <div ref={containerRef} className="relative w-full">
+      <div className="flex items-center gap-1">
+        <input
+          value={value}
+          onChange={(e) => onChange(e.target.value)}
+          onFocus={() => setOpen(true)}
+          placeholder="Filter legacy values..."
+          className="w-full text-[9px] font-black text-slate-900 bg-white px-1.5 py-1 rounded-md border border-slate-200 outline-none focus:border-indigo-400 focus:ring-1 focus:ring-indigo-300"
+        />
+        {options.length > 0 && (
+          <button
+            type="button"
+            onClick={() => setOpen(o => !o)}
+            className="shrink-0 p-1 rounded-md border border-slate-200 bg-slate-50 text-slate-400 hover:text-slate-600 hover:bg-slate-100"
+            title="Choose legacy value"
+          >
+            <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
+            </svg>
+          </button>
+        )}
+      </div>
+      {open && filteredOptions.length > 0 && (
+        <div className="absolute z-20 mt-1 w-full bg-white border border-slate-200 rounded-md shadow-lg max-h-56 overflow-y-auto">
+          <div className="p-1 border-b border-slate-100">
+            <input
+              value={search}
+              onChange={(e) => setSearch(e.target.value)}
+              placeholder="Filter values..."
+              className="w-full px-2 py-1 text-[9px] rounded-md border border-slate-200 outline-none focus:border-indigo-400"
+            />
+          </div>
+          <ul className="py-1 text-[9px]">
+            {filteredOptions.map(opt => (
+              <li key={opt}>
+                <button
+                  type="button"
+                  onClick={() => handleSelect(opt)}
+                  className="w-full text-left px-2 py-1 hover:bg-indigo-50 text-slate-700"
+                >
+                  {opt}
+                </button>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+    </div>
+  );
+};
+
 const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, onSave, onSwitchUser, currentUser }) => {
   const [localMapping, setLocalMapping] = useState<GlobalMapping[]>([]);
   const [localClassification, setLocalClassification] = useState<NewClassification[]>([]);
@@ -26,6 +118,7 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
   const [mappingSearch, setMappingSearch] = useState('');
   const [bomSearch, setBomSearch] = useState('');
   const [selectedBomItemId, setSelectedBomItemId] = useState<string | null>(null);
+  const [legacyValueFilter, setLegacyValueFilter] = useState('');
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   useEffect(() => {
@@ -37,6 +130,7 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
     setMappingSearch('');
     setBomSearch('');
     setSelectedBomItemId(null);
+    setLegacyValueFilter('');
   }, [data, category]);
 
   const titles = {
@@ -85,6 +179,32 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
     if (selectedMappingIndex < 0 || selectedMappingIndex >= localMapping.length) return null;
     return localMapping[selectedMappingIndex];
   }, [localMapping, selectedMappingIndex]);
+
+  const legacyValueCandidates = useMemo(() => {
+    if (!selectedMapping) return [] as string[];
+    const featureIds = selectedMapping.legacyFeatureIds || [];
+    const valuesSet = new Set<string>();
+
+    if (featureIds.length) {
+      localBom.forEach(item => {
+        item.features.forEach(feat => {
+          if (featureIds.includes(feat.featureId)) {
+            feat.values.forEach(v => {
+              const val = v.trim();
+              if (val) valuesSet.add(val);
+            });
+          }
+        });
+      });
+    }
+
+    Object.keys(selectedMapping.valueMappings || {}).forEach(k => {
+      const val = k.trim();
+      if (val) valuesSet.add(val);
+    });
+
+    return Array.from(valuesSet).sort((a, b) => a.localeCompare(b));
+  }, [selectedMapping, localBom]);
 
   const filteredBom = useMemo(() => {
     const q = bomSearch.trim().toLowerCase();
@@ -894,6 +1014,16 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
                     {(selectedMapping.legacyFeatureIds || []).join(' | ') || 'New Mapping'}
                   </p>
                 </div>
+                <button
+                  type="button"
+                  onClick={() => setSelectedMappingIndex(null)}
+                  className="p-1.5 rounded-md text-slate-300 hover:text-slate-600 hover:bg-slate-50 transition-all"
+                  title="Close mapping detail"
+                >
+                  <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                  </svg>
+                </button>
               </div>
 
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4">
@@ -945,22 +1075,47 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
                   <p className="text-[9px] font-black text-slate-400 uppercase tracking-widest">
                     Legacy → Target Value Bridge
                   </p>
-                  {selectedMappingIndex != null && (
-                    <button
-                      type="button"
-                      onClick={() => addValueMappingPair(selectedMappingIndex)}
-                      className="px-2 py-1 border border-dashed border-slate-300 rounded-md text-[8px] font-black text-slate-500 hover:text-indigo-600 hover:border-indigo-300 uppercase tracking-widest flex items-center gap-1"
-                    >
-                      <svg className="w-2.5 h-2.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={3} d="M12 6v6m0 0v6m0-6h6m-6 0H6" />
-                      </svg>
-                      Define Value Bridge
-                    </button>
-                  )}
+                  <div className="flex items-center gap-2">
+                    <div className="w-48">
+                      <LegacyValueSelector
+                        value={legacyValueFilter}
+                        options={legacyValueCandidates}
+                        onChange={(val) => setLegacyValueFilter(val)}
+                      />
+                    </div>
+                    {legacyValueFilter && (
+                      <button
+                        type="button"
+                        onClick={() => setLegacyValueFilter('')}
+                        className="px-2 py-1 rounded-md text-[8px] font-black text-slate-400 hover:text-slate-600 hover:bg-slate-100 uppercase tracking-widest transition-all"
+                        title="Clear filter"
+                      >
+                        Clear
+                      </button>
+                    )}
+                    {selectedMappingIndex != null && (
+                      <button
+                        type="button"
+                        onClick={() => addValueMappingPair(selectedMappingIndex)}
+                        className="px-2 py-1 border border-dashed border-slate-300 rounded-md text-[8px] font-black text-slate-500 hover:text-indigo-600 hover:border-indigo-300 uppercase tracking-widest flex items-center gap-1 shrink-0"
+                        title="Add custom legacy value"
+                      >
+                        <svg className="w-2.5 h-2.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={3} d="M12 6v6m0 0v6m0-6h6m-6 0H6" />
+                        </svg>
+                        Add Pair
+                      </button>
+                    )}
+                  </div>
                 </div>
 
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 max-h-64 overflow-y-auto pr-1">
-                  {Object.entries(selectedMapping.valueMappings || {}).map(([k, v]) => (
+                  {Object.entries(selectedMapping.valueMappings || {})
+                    .filter(([k]) => {
+                      if (!legacyValueFilter.trim()) return true;
+                      return k.toLowerCase().includes(legacyValueFilter.toLowerCase());
+                    })
+                    .map(([k, v]) => (
                     <div
                       key={k}
                       className="flex items-center gap-2 p-2 bg-slate-50 rounded-lg border border-slate-200 group/pair relative"
