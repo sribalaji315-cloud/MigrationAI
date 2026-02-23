@@ -68,6 +68,92 @@ const SearchableSelect = ({ value, options, onChange }: { value: string, options
   );
 };
 
+const LegacyFilterDropdown = ({
+  value,
+  options,
+  onChange,
+}: {
+  value: string;
+  options: string[];
+  onChange: (val: string) => void;
+}) => {
+  const [isOpen, setIsOpen] = useState(false);
+  const [search, setSearch] = useState('');
+  const wrapperRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    const handleClickOutside = (event: MouseEvent) => {
+      if (wrapperRef.current && !wrapperRef.current.contains(event.target as Node)) {
+        setIsOpen(false);
+      }
+    };
+    document.addEventListener('mousedown', handleClickOutside);
+    return () => document.removeEventListener('mousedown', handleClickOutside);
+  }, []);
+
+  const filteredOptions = useMemo(() => {
+    const q = search.toLowerCase();
+    return options
+      .filter(opt => opt.toLowerCase().includes(q))
+      .slice(0, 20);
+  }, [options, search]);
+
+  return (
+    <div ref={wrapperRef} className="relative">
+      <button
+        type="button"
+        onClick={() => {
+          setIsOpen(o => !o);
+          setSearch('');
+        }}
+        className="w-44 h-7 px-2 pr-6 rounded-lg border border-slate-200 bg-white text-[9px] font-black text-slate-600 uppercase tracking-widest flex items-center justify-between shadow-sm hover:bg-slate-50"
+      >
+        <span className="truncate">
+          {value.trim() ? value : 'Filter legacy...'}
+        </span>
+        <span className="absolute right-1.5 top-1/2 -translate-y-1/2 text-slate-400">
+          <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M19 9l-7 7-7-7" />
+          </svg>
+        </span>
+      </button>
+
+      {isOpen && options.length > 0 && (
+        <div className="absolute z-40 mt-1 w-56 bg-white border border-slate-200 rounded-lg shadow-lg max-h-64 overflow-hidden">
+          <div className="p-2 border-b border-slate-100 bg-slate-50">
+            <input
+              type="text"
+              value={search}
+              onChange={(e) => setSearch(e.target.value)}
+              className="w-full px-2 py-1.5 text-[9px] font-bold text-slate-700 bg-white border border-slate-200 rounded outline-none focus:border-indigo-400 focus:ring-1 focus:ring-indigo-400"
+              placeholder="Search features & values..."
+            />
+          </div>
+          <div className="max-h-52 overflow-y-auto">
+            {filteredOptions.length > 0 ? (
+              filteredOptions.map((opt) => (
+                <button
+                  key={opt}
+                  type="button"
+                  onClick={() => {
+                    onChange(opt);
+                    setIsOpen(false);
+                  }}
+                  className="w-full text-left px-3 py-1.5 text-[9px] font-black uppercase tracking-tight hover:bg-indigo-50 text-slate-700 truncate"
+                >
+                  {opt}
+                </button>
+              ))
+            ) : (
+              <div className="px-3 py-2 text-[9px] font-bold text-slate-400 text-center">No matches</div>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
+
 const ValueSelector = ({
   value,
   options,
@@ -203,6 +289,7 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
   const [manualInputs, setManualInputs] = useState<Record<string, string>>({});
   const [stagedLocalMappings, setStagedLocalMappings] = useState<GlobalMapping[]>([]);
   const [stagedClassId, setStagedClassId] = useState<string | null>(null);
+  const [legacyFilter, setLegacyFilter] = useState('');
   const isEditingRef = useRef(false);
 
   // Initialize workspace when item changes
@@ -213,11 +300,13 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
       setStagedClassId(assignedClassId || 'UNCLASSIFIED');
       setStagedLocalMappings(JSON.parse(JSON.stringify(localItemMappings[item.itemId] || [])));
       setManualInputs({});
+      setLegacyFilter('');
     } else {
       isEditingRef.current = false;
       setStagedClassId(null);
       setStagedLocalMappings([]);
       setManualInputs({});
+      setLegacyFilter('');
     }
   }, [item, assignedClassId, localItemMappings]);
 
@@ -314,6 +403,17 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
 
     return byAttr;
   }, [globalMappings, classes]);
+
+  const legacyFilterOptions = useMemo(() => {
+    if (!item) return [] as string[];
+    const set = new Set<string>();
+    item.features.forEach(f => {
+      if (f.featureId) set.add(f.featureId);
+      if (f.description) set.add(f.description);
+      f.values.forEach(v => set.add(v));
+    });
+    return Array.from(set).sort((a, b) => a.localeCompare(b));
+  }, [item]);
 
   const handleUpdateLinkage = (featureId: string, attrId: string) => {
     if (!isLockedByMe) return;
@@ -467,10 +567,30 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
         </div>
           {/* Feature list (view-only for now) */}
         <div className="space-y-3">
-          <div className="grid grid-cols-[1fr_auto_1fr] gap-4 px-6 text-[9px] font-black text-slate-400 uppercase tracking-widest">
+          <div className="grid grid-cols-[1fr_auto_1fr] gap-4 px-6 text-[9px] font-black text-slate-400 uppercase tracking-widest items-center">
               <div>Source Attribute</div>
               <div className="text-center">→</div>
-              <div>Target Mapping</div>
+              <div className="flex items-center justify-between gap-3">
+                <span>Target Mapping</span>
+                {legacyFilterOptions.length > 0 && (
+                  <div className="flex items-center gap-2">
+                    <LegacyFilterDropdown
+                      value={legacyFilter}
+                      options={legacyFilterOptions}
+                      onChange={(val) => setLegacyFilter(val)}
+                    />
+                    {legacyFilter && (
+                      <button
+                        type="button"
+                        onClick={() => setLegacyFilter('')}
+                        className="px-2 py-1 rounded-md border border-slate-200 bg-white text-[8px] font-black uppercase tracking-widest text-slate-400 hover:text-slate-600 hover:bg-slate-50"
+                      >
+                        Clear
+                      </button>
+                    )}
+                  </div>
+                )}
+              </div>
           </div>
 
           {item.features.map((f, idx) => {
@@ -517,6 +637,16 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
             
             // It has a mapping if the selected attribute is not 'UNMAPPED'
             const hasMapping = selectedAttribute !== 'UNMAPPED';
+
+            if (legacyFilter.trim()) {
+              const q = legacyFilter.toLowerCase();
+              const matchesFeatureId = f.featureId.toLowerCase().includes(q);
+              const matchesDescription = (f.description || '').toLowerCase().includes(q);
+              const matchesValue = f.values.some(v => v.toLowerCase().includes(q));
+              if (!matchesFeatureId && !matchesDescription && !matchesValue) {
+                return null;
+              }
+            }
 
             return (
                 <div key={`${item.itemId}-${f.featureId}-${idx}`} className={`grid grid-cols-[1fr_auto_1fr] gap-4 bg-white rounded-xl shadow-sm border relative transition-all duration-300 hover:shadow-md ${hasMapping ? 'border-emerald-200' : 'border-slate-200'}`}>
