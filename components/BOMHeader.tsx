@@ -11,9 +11,10 @@ interface BOMHeaderProps {
   currentUser: User;
   onLogout: () => void;
   onClearCache: () => void;
+  onOpenDashboard: () => void;
 }
 
-const BOMHeader: React.FC<BOMHeaderProps> = ({ onRegenerate, isRefreshing, onInspectData, onCommit, currentUser, onLogout, onClearCache }) => {
+const BOMHeader: React.FC<BOMHeaderProps> = ({ onRegenerate, isRefreshing, onInspectData, onCommit, currentUser, onLogout, onClearCache, onOpenDashboard }) => {
   const uploadOptions: { label: string; id: DataCategory; icon: string; adminOnly?: boolean }[] = [
     { label: 'Global Mapping', id: 'mapping', icon: 'M8 7v8a2 2 0 002 2h6M8 7V5a2 2 0 012-2h4.586a1 1 0 01.707.293l4.414 4.414a1 1 0 01.293.707V15a2 2 0 01-2 2h-2' },
     { label: 'Classifications', id: 'classification', icon: 'M4 6h16M4 10h16M4 14h16M4 18h16' },
@@ -128,16 +129,27 @@ const BOMHeader: React.FC<BOMHeaderProps> = ({ onRegenerate, isRefreshing, onIns
           {currentUser.role === 'admin' && (
             <>
               <div className="h-6 w-px bg-slate-200 mx-1"></div>
-              <button 
-                type="button"
-                onClick={handleResetDB}
-                className="flex items-center gap-1.5 px-2.5 py-1.5 bg-red-50 text-red-600 border border-red-100 hover:bg-red-100 rounded-md text-[9px] font-black transition-all whitespace-nowrap uppercase tracking-wider"
-              >
-                <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
-                </svg>
-                WIPE STATE
-              </button>
+                  <button 
+                    type="button"
+                    onClick={onOpenDashboard}
+                    className="flex items-center gap-1.5 px-2.5 py-1.5 bg-indigo-50 text-indigo-700 border border-indigo-100 hover:bg-indigo-100 rounded-md text-[9px] font-black transition-all whitespace-nowrap uppercase tracking-wider"
+                  >
+                    <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M11 3.055A9.001 9.001 0 1020.945 13H11V3.055z" />
+                    </svg>
+                    Mapping Dashboard
+                  </button>
+
+                  <button 
+                    type="button"
+                    onClick={handleResetDB}
+                    className="flex items-center gap-1.5 px-2.5 py-1.5 bg-red-50 text-red-600 border border-red-100 hover:bg-red-100 rounded-md text-[9px] font-black transition-all whitespace-nowrap uppercase tracking-wider"
+                  >
+                    <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+                    </svg>
+                    WIPE STATE
+                  </button>
             </>
           )}
         </div>

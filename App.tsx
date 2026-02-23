@@ -4,6 +4,7 @@ import BOMHeader from './components/BOMHeader';
 import ItemSidebar from './components/ItemSidebar';
 import MappingWorkspace from './components/MappingWorkspace';
 import DataInspector from './components/DataInspector';
+import MappingDashboard from './components/MappingDashboard';
 import LoginSignUp from './components/LoginSignUp';
 import { dbService } from './services/dbService';
 import { GlobalMapping, DataCategory, DatabaseState, User, ConnectionMode, LocalItemMappings } from './types';
@@ -17,6 +18,7 @@ const App: React.FC = () => {
   
   const [dbState, setDbState] = useState<DatabaseState | null>(null);
   const [activeInspector, setActiveInspector] = useState<DataCategory | null>(null);
+  const [showDashboard, setShowDashboard] = useState(false);
   
   // Initial load only; further refreshes are explicit via header/controls.
   useEffect(() => {
@@ -151,6 +153,7 @@ const App: React.FC = () => {
         currentUser={currentUser}
         onLogout={handleLogout}
         onClearCache={handleClearCache}
+        onOpenDashboard={() => setShowDashboard(true)}
       />
       
       <main className="flex flex-1 overflow-hidden relative">
@@ -207,6 +210,16 @@ const App: React.FC = () => {
                setActiveInspector(null);
             }}
             currentUser={currentUser!}
+          />
+        )}
+
+        {showDashboard && (
+          <MappingDashboard
+            bom={dbState.bom}
+            mappings={dbState.mappings}
+            localMappings={dbState.localMappings}
+            onRecompute={handleFetchFromDB}
+            onClose={() => setShowDashboard(false)}
           />
         )}
       </main>
