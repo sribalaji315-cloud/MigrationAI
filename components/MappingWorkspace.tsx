@@ -290,6 +290,7 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
   const [stagedLocalMappings, setStagedLocalMappings] = useState<GlobalMapping[]>([]);
   const [stagedClassId, setStagedClassId] = useState<string | null>(null);
   const [legacyFilter, setLegacyFilter] = useState('');
+  const [showUnmappedOnly, setShowUnmappedOnly] = useState(false);
   const isEditingRef = useRef(false);
 
   // Initialize workspace when item changes
@@ -301,12 +302,14 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
       setStagedLocalMappings(JSON.parse(JSON.stringify(localItemMappings[item.itemId] || [])));
       setManualInputs({});
       setLegacyFilter('');
+      setShowUnmappedOnly(false);
     } else {
       isEditingRef.current = false;
       setStagedClassId(null);
       setStagedLocalMappings([]);
       setManualInputs({});
       setLegacyFilter('');
+      setShowUnmappedOnly(false);
     }
   }, [item, assignedClassId, localItemMappings]);
 
@@ -414,6 +417,59 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
     });
     return Array.from(set).sort((a, b) => a.localeCompare(b));
   }, [item]);
+
+  const unmappedStats = useMemo(() => {
+    if (!item) return { attributes: 0, values: 0 };
+
+    let attrCount = 0;
+    let valueCount = 0;
+
+    item.features.forEach(f => {
+      const globalMapping = globalMappings.find(m => m.legacyFeatureIds.includes(f.featureId));
+      const localOverride = stagedLocalMappings.find(m => m.legacyFeatureIds.includes(f.featureId));
+
+      const baseTargetAttributeId = globalMapping?.newAttributeId || 'UNMAPPED';
+      let attributeOptions = baseTargetAttributeId
+        .split(';')
+        .map(a => a.trim())
+        .filter(a => a && a !== 'UNMAPPED');
+
+      const defaultGlobalAttribute = attributeOptions.length > 0 ? attributeOptions[0] : 'UNMAPPED';
+
+      const isUnmapped = attributeOptions.length === 0;
+      if (isUnmapped) {
+        attributeOptions = ['UNMAPPED', ...targetAttributes.map(a => a.attributeId)];
+      }
+
+      if (localOverride && localOverride.newAttributeId !== 'UNMAPPED' && !attributeOptions.includes(localOverride.newAttributeId)) {
+        attributeOptions.push(localOverride.newAttributeId);
+      }
+
+      if (localOverride && localOverride.newAttributeId === 'UNMAPPED' && !attributeOptions.includes('UNMAPPED')) {
+        attributeOptions = ['UNMAPPED', ...attributeOptions];
+      }
+
+      if ((isUnmapped || attributeOptions.length > 1 || !!localOverride) && !attributeOptions.includes('UNMAPPED')) {
+        attributeOptions = ['UNMAPPED', ...attributeOptions];
+      }
+
+      const selectedAttribute = localOverride?.newAttributeId || defaultGlobalAttribute;
+      const effectiveMapping = localOverride || globalMapping;
+
+      if (selectedAttribute === 'UNMAPPED') {
+        attrCount += 1;
+      }
+
+      f.values.forEach(v => {
+        const isValueMapped = effectiveMapping?.valueMappings?.[v] !== undefined;
+        if (!isValueMapped) {
+          valueCount += 1;
+        }
+      });
+    });
+
+    return { attributes: attrCount, values: valueCount };
+  }, [item, globalMappings, stagedLocalMappings, targetAttributes]);
 
   const handleUpdateLinkage = (featureId: string, attrId: string) => {
     if (!isLockedByMe) return;
@@ -572,24 +628,54 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
               <div className="text-center">→</div>
               <div className="flex items-center justify-between gap-3">
                 <span>Target Mapping</span>
-                {legacyFilterOptions.length > 0 && (
+                <div className="flex items-center gap-3">
+                  {legacyFilterOptions.length > 0 && (
+                    <div className="flex items-center gap-2">
+                      <LegacyFilterDropdown
+                        value={legacyFilter}
+                        options={legacyFilterOptions}
+                        onChange={(val) => setLegacyFilter(val)}
+                      />
+                      {legacyFilter && (
+                        <button
+                          type="button"
+                          onClick={() => setLegacyFilter('')}
+                          className="px-2 py-1 rounded-md border border-slate-200 bg-white text-[8px] font-black uppercase tracking-widest text-slate-400 hover:text-slate-600 hover:bg-slate-50"
+                        >
+                          Clear
+                        </button>
+                      )}
+                    </div>
+                  )}
+
                   <div className="flex items-center gap-2">
-                    <LegacyFilterDropdown
-                      value={legacyFilter}
-                      options={legacyFilterOptions}
-                      onChange={(val) => setLegacyFilter(val)}
-                    />
-                    {legacyFilter && (
-                      <button
-                        type="button"
-                        onClick={() => setLegacyFilter('')}
-                        className="px-2 py-1 rounded-md border border-slate-200 bg-white text-[8px] font-black uppercase tracking-widest text-slate-400 hover:text-slate-600 hover:bg-slate-50"
+                    <button
+                      type="button"
+                      onClick={() => setShowUnmappedOnly(v => !v)}
+                      className={`flex items-center gap-2 px-3 py-1 rounded-full border text-[8px] font-black uppercase tracking-widest transition-all ${
+                        showUnmappedOnly
+                          ? 'bg-emerald-600 border-emerald-500 text-white shadow-sm'
+                          : 'bg-white border-slate-200 text-slate-500 hover:bg-slate-50'
+                      }`}
+                    >
+                      <span>Unmapped Only</span>
+                      <span
+                        className={`relative inline-flex h-3 w-6 items-center rounded-full border transition-colors ${
+                          showUnmappedOnly ? 'bg-white/20 border-white' : 'bg-slate-100 border-slate-300'
+                        }`}
                       >
-                        Clear
-                      </button>
-                    )}
+                        <span
+                          className={`inline-block h-2.5 w-2.5 rounded-full bg-white shadow transform transition-transform ${
+                            showUnmappedOnly ? 'translate-x-2.5' : 'translate-x-0.5'
+                          }`}
+                        />
+                      </span>
+                    </button>
+                    <span className="text-[8px] font-black uppercase tracking-widest text-slate-400">
+                      Attr {unmappedStats.attributes} • Values {unmappedStats.values}
+                    </span>
                   </div>
-                )}
+                </div>
               </div>
           </div>
 
@@ -598,43 +684,43 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
             const globalMapping = globalMappings.find(m => m.legacyFeatureIds.includes(f.featureId));
             const localOverride = stagedLocalMappings.find(m => m.legacyFeatureIds.includes(f.featureId));
             const effectiveMapping = localOverride || globalMapping;
-            
+
             // The base target attribute comes from global mapping if it exists
             const baseTargetAttributeId = globalMapping?.newAttributeId || 'UNMAPPED';
-            
+
             // Parse semicolon-separated attributes from the GLOBAL mapping to preserve the options
             let attributeOptions = baseTargetAttributeId.split(';').map(a => a.trim()).filter(a => a && a !== 'UNMAPPED');
-            
+
             // The default selected attribute if there is no local override
             const defaultGlobalAttribute = attributeOptions.length > 0 ? attributeOptions[0] : 'UNMAPPED';
-            
+
             // If there are no options (unmapped), we should provide ALL attributes from the classification table
             const isUnmapped = attributeOptions.length === 0;
             if (isUnmapped) {
               attributeOptions = ['UNMAPPED', ...targetAttributes.map(a => a.attributeId)];
             }
-            
+
             // Ensure local override is in the options if it exists
             if (localOverride && localOverride.newAttributeId !== 'UNMAPPED' && !attributeOptions.includes(localOverride.newAttributeId)) {
               attributeOptions.push(localOverride.newAttributeId);
             }
-            
+
             // If there is a local override that is 'UNMAPPED', we need to ensure 'UNMAPPED' is in the options
             // so the user can switch back to the global mapping
             if (localOverride && localOverride.newAttributeId === 'UNMAPPED' && !attributeOptions.includes('UNMAPPED')) {
               attributeOptions = ['UNMAPPED', ...attributeOptions];
             }
-            
+
             // It has multiple options if it's unmapped (all attributes) OR if the global mapping had multiple options OR if there's a local override
             const hasMultipleOptions = isUnmapped || attributeOptions.length > 1 || !!localOverride;
 
             if (hasMultipleOptions && !attributeOptions.includes('UNMAPPED')) {
               attributeOptions = ['UNMAPPED', ...attributeOptions];
             }
-            
+
             // The currently selected attribute is the local override, OR the default global attribute
             const selectedAttribute = localOverride?.newAttributeId || defaultGlobalAttribute;
-            
+
             // It has a mapping if the selected attribute is not 'UNMAPPED'
             const hasMapping = selectedAttribute !== 'UNMAPPED';
 
@@ -647,98 +733,119 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
                 return null;
               }
             }
+            const featureHasUnmappedAttribute = selectedAttribute === 'UNMAPPED';
+            const featureHasUnmappedValues = f.values.some(v => effectiveMapping?.valueMappings?.[v] === undefined);
+
+            if (showUnmappedOnly && !featureHasUnmappedAttribute && !featureHasUnmappedValues) {
+              return null;
+            }
+
+            const candidateValuesForAttribute = attributeCandidateValues[selectedAttribute] || [];
 
             return (
-                <div key={`${item.itemId}-${f.featureId}-${idx}`} className={`grid grid-cols-[1fr_auto_1fr] gap-4 bg-white rounded-xl shadow-sm border relative transition-all duration-300 hover:shadow-md ${hasMapping ? 'border-emerald-200' : 'border-slate-200'}`}>
-                  <div className={`w-1.5 shrink-0 absolute left-0 top-0 bottom-0 rounded-l-xl ${hasMapping ? 'bg-emerald-400' : 'bg-slate-300'}`}></div>
+              <div
+                key={`${item.itemId}-${f.featureId}-${idx}`}
+                className={`bg-white rounded-xl shadow-sm border relative transition-all duration-300 hover:shadow-md ${hasMapping ? 'border-emerald-200' : 'border-slate-200'}`}
+              >
+                <div className={`w-1.5 shrink-0 absolute left-0 top-0 bottom-0 rounded-l-xl ${hasMapping ? 'bg-emerald-400' : 'bg-slate-300'}`}></div>
 
-                  {/* Source Feature column */}
-                  <div className="p-5 pl-8 flex flex-col justify-center bg-slate-50/20 rounded-l-xl">
-                    <p className="text-sm font-black text-slate-900 leading-tight">{f.featureId}</p>
-                    <p className="text-[9px] text-slate-400 font-bold uppercase tracking-wider mt-0.5">{f.description}</p>
-                    
-                    {/* Source Values */}
-                    <div className="mt-3 space-y-2">
-                      {f.values.map((v, vidx) => (
-                        <div key={`${item.itemId}-${f.featureId}-source-${vidx}`} className="px-3 py-2 bg-slate-900 text-white rounded-lg text-[9px] font-black uppercase tracking-tight truncate">
-                          {v}
-                        </div>
-                      ))}
+                <div className="p-5 pl-8 pr-6">
+                  {/* Header row: source feature meta on the left, attribute selector/badges on the right */}
+                  <div className="flex items-start justify-between gap-6">
+                    <div>
+                      <p className="text-sm font-black text-slate-900 leading-tight">{f.featureId}</p>
+                      <p className="text-[9px] text-slate-400 font-bold uppercase tracking-wider mt-0.5">{f.description}</p>
                     </div>
-                  </div>
 
-                  {/* Arrow column */}
-                  <div className="flex items-center justify-center py-5 text-2xl font-black text-slate-300">
-                    →
-                  </div>
+                    <div className="flex flex-col items-end gap-1 min-w-[220px]">
+                      <div className="flex flex-wrap items-center justify-end gap-2">
+                        {localOverride && (
+                          <span className="px-2 py-0.5 bg-purple-100 text-purple-700 text-[7px] font-black rounded-full uppercase tracking-wider">
+                            Local
+                          </span>
+                        )}
+                        {globalMapping && !localOverride && (
+                          <span className="px-2 py-0.5 bg-blue-100 text-blue-700 text-[7px] font-black rounded-full uppercase tracking-wider">
+                            Global
+                          </span>
+                        )}
+                        {hasMultipleOptions && !isLockedByMe && (
+                          <span className="px-2 py-0.5 bg-amber-100 text-amber-700 text-[7px] font-black rounded-full uppercase tracking-wider">
+                            Multiple Options
+                          </span>
+                        )}
+                      </div>
 
-                  {/* Target Mapping column */}
-                  <div className="p-5 flex flex-col justify-center border-l border-slate-100 rounded-r-xl">
-                    <div className="flex items-center gap-2 mb-2">
-                      {localOverride && (
-                        <span className="px-2 py-0.5 bg-purple-100 text-purple-700 text-[7px] font-black rounded-full uppercase tracking-wider">
-                          Local
-                        </span>
-                      )}
-                      {globalMapping && !localOverride && (
-                        <span className="px-2 py-0.5 bg-blue-100 text-blue-700 text-[7px] font-black rounded-full uppercase tracking-wider">
-                          Global
-                        </span>
-                      )}
-                      {hasMultipleOptions && !isLockedByMe && (
-                        <span className="px-2 py-0.5 bg-amber-100 text-amber-700 text-[7px] font-black rounded-full uppercase tracking-wider">
-                          Multiple Options
-                        </span>
-                      )}
-                    </div>
-                    
-                    {/* Target Attribute Selector/Display */}
-                    {hasMultipleOptions && isLockedByMe ? (
-                      <SearchableSelect
-                        value={selectedAttribute}
-                        options={attributeOptions}
-                        onChange={(val) => handleUpdateLinkage(f.featureId, val)}
-                      />
-                    ) : (
-                      <p className={`text-sm font-black leading-tight mb-2 ${hasMapping ? 'text-emerald-700' : 'text-slate-400'}`}>
-                        {selectedAttribute}
-                      </p>
-                    )}
-                    
-                    {/* Mapped Values */}
-                    <div className="mt-1 space-y-2">
-                      {f.values.map((v, vidx) => {
-                        const mappedValue = effectiveMapping?.valueMappings?.[v] ?? v;
-                        const isValueMapped = effectiveMapping?.valueMappings?.[v] !== undefined;
-
-                        if (isReadOnly) {
-                          return (
-                            <div
-                              key={`${item.itemId}-${f.featureId}-target-${vidx}`}
-                              className={`px-3 py-2 rounded-lg text-[9px] font-black uppercase tracking-tight truncate ${
-                                isValueMapped ? 'bg-emerald-600 text-white' : 'bg-slate-100 text-slate-500'
-                              }`}
-                            >
-                              {mappedValue}
-                            </div>
-                          );
-                        }
-
-                        const candidateValues = attributeCandidateValues[selectedAttribute] || [];
-
-                        return (
-                          <ValueSelector
-                            key={`${item.itemId}-${f.featureId}-target-${vidx}`}
-                            value={mappedValue}
-                            options={candidateValues}
-                            disabled={isReadOnly}
-                            onChange={(newVal) => handleUpdateValue(f.featureId, v, newVal)}
+                      {/* Target Attribute Selector/Display */}
+                      <div className="w-full max-w-xs">
+                        {hasMultipleOptions && isLockedByMe ? (
+                          <SearchableSelect
+                            value={selectedAttribute}
+                            options={attributeOptions}
+                            onChange={(val) => handleUpdateLinkage(f.featureId, val)}
                           />
-                        );
-                      })}
+                        ) : (
+                          <p
+                            className={`px-3 py-2 border rounded-lg text-[10px] font-black uppercase tracking-tight text-right truncate ${
+                              hasMapping
+                                ? 'border-emerald-300 bg-emerald-50 text-emerald-800'
+                                : 'border-slate-200 bg-slate-50 text-slate-400'
+                            }`}
+                          >
+                            {selectedAttribute}
+                          </p>
+                        )}
+                      </div>
                     </div>
+                  </div>
+
+                  {/* Per-value rows: ensure strict left/right alignment */}
+                  <div className="mt-4 space-y-2">
+                    {f.values.map((v, vidx) => {
+                      const mappedValue = effectiveMapping?.valueMappings?.[v] ?? v;
+                      const isValueMapped = effectiveMapping?.valueMappings?.[v] !== undefined;
+
+                      if (showUnmappedOnly && !featureHasUnmappedAttribute && isValueMapped) {
+                        return null;
+                      }
+
+                      return (
+                        <div
+                          key={`${item.itemId}-${f.featureId}-row-${vidx}`}
+                          className="grid grid-cols-[1fr_auto_1fr] gap-4 items-center"
+                        >
+                          <div className="px-3 py-2 bg-slate-900 text-white rounded-lg text-[9px] font-black uppercase tracking-tight truncate">
+                            {v}
+                          </div>
+
+                          <div className="flex items-center justify-center text-2xl font-black text-slate-300">
+                            →
+                          </div>
+
+                          <div>
+                            {isReadOnly ? (
+                              <div
+                                className={`px-3 py-2 rounded-lg text-[9px] font-black uppercase tracking-tight truncate ${
+                                  isValueMapped ? 'bg-emerald-600 text-white' : 'bg-slate-100 text-slate-500'
+                                }`}
+                              >
+                                {mappedValue}
+                              </div>
+                            ) : (
+                              <ValueSelector
+                                value={mappedValue}
+                                options={candidateValuesForAttribute}
+                                disabled={isReadOnly}
+                                onChange={(newVal) => handleUpdateValue(f.featureId, v, newVal)}
+                              />
+                            )}
+                          </div>
+                        </div>
+                      );
+                    })}
                   </div>
                 </div>
+              </div>
             );
           })}
         </div>

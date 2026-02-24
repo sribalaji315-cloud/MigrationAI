@@ -6,8 +6,8 @@ from .db.session import engine, Base, SessionLocal
 from .db import models
 from .core.config import settings
 
-# Create DB tables (dev convenience)
-Base.metadata.create_all(bind=engine)
+# We no longer use Base.metadata.create_all(bind=engine) because we use Alembic for migrations.
+# Base.metadata.create_all(bind=engine)
 
 app = FastAPI(title="ERP Data Migrator Backend")
 
