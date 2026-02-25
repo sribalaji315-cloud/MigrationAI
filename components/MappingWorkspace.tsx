@@ -401,6 +401,7 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
   const [stagedClassId, setStagedClassId] = useState<string | null>(null);
   const [legacyFilter, setLegacyFilter] = useState('');
   const [showUnmappedOnly, setShowUnmappedOnly] = useState(false);
+  const [expandedFeatures, setExpandedFeatures] = useState<Record<string, boolean>>({});
   const isEditingRef = useRef(false);
 
   // Initialize workspace when item changes
@@ -420,6 +421,7 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
       setManualInputs(nextManual);
       setLegacyFilter('');
       setShowUnmappedOnly(false);
+      setExpandedFeatures({});
     } else {
       isEditingRef.current = false;
       setStagedClassId(null);
@@ -427,6 +429,7 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
       setManualInputs({});
       setLegacyFilter('');
       setShowUnmappedOnly(false);
+      setExpandedFeatures({});
     }
   }, [item, assignedClassId, localItemMappings]);
 
@@ -970,19 +973,43 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
               : 'UNMAPPED';
 
             // Parse semicolon-separated attributes from the GLOBAL mapping to preserve the options
-            let attributeOptions = baseTargetAttributeId.split(';').map(a => a.trim()).filter(a => a && a !== 'UNMAPPED');
-
-            // The default selected attribute if there is no local override
-            const defaultGlobalAttribute = attributeOptions.length > 0 ? attributeOptions[0] : 'UNMAPPED';
+            let attributeOptions = baseTargetAttributeId
+              .split(';')
+              .map(a => a.trim())
+              .filter(a => a && a !== 'UNMAPPED');
 
             const usingClassScope = useNewClassTargetMapping && (stagedClassId || 'UNCLASSIFIED') !== 'UNCLASSIFIED';
+
+            // The default selected attribute if there is no local override. This may be
+            // updated in class-scoped mode to the first candidate that actually exists
+            // in the selected class.
+            let defaultGlobalAttribute = attributeOptions.length > 0 ? attributeOptions[0] : 'UNMAPPED';
 
             // If there are no options (unmapped), we should provide ALL attributes from the classification table
             let isUnmapped = attributeOptions.length === 0;
 
             if (usingClassScope) {
-              attributeOptions = targetAttributes.map(a => a.attributeId);
-              isUnmapped = attributeOptions.length === 0;
+              // In class view, try to keep the original GLOBAL mapping semantics by
+              // first filtering the semicolon-separated candidates down to only
+              // those attributes that exist in the selected class. If at least one
+              // survives this filter, we treat the feature as mapped and prefer the
+              // first matching candidate (for ACTRM this becomes COLOROFPLASTICPARTS
+              // when it is the only member present in the class).
+              const matchedForClass = attributeOptions.filter(a => {
+                const key = normalizeAttrId(a);
+                return key && classAttributeKeys.has(key);
+              });
+
+              if (matchedForClass.length > 0) {
+                attributeOptions = matchedForClass;
+                defaultGlobalAttribute = matchedForClass[0];
+                isUnmapped = false;
+              } else {
+                // None of the global candidates belong to this class – fall back to
+                // offering all attributes from the class and mark as unmapped.
+                attributeOptions = targetAttributes.map(a => a.attributeId);
+                isUnmapped = attributeOptions.length === 0;
+              }
             }
 
             if (isUnmapped) {
@@ -1083,6 +1110,7 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
             }
 
             const candidateValuesForAttribute = attributeCandidateValues[selectedAttribute] || [];
+            const isExpanded = !!expandedFeatures[f.featureId];
 
             return (
               <div
@@ -1094,9 +1122,31 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
                 <div className="p-5 pl-8 pr-6">
                   {/* Header row: source feature meta on the left, attribute selector/badges on the right */}
                   <div className="flex items-start justify-between gap-6">
-                    <div>
-                      <p className="text-sm font-black text-slate-900 leading-tight">{f.featureId}</p>
-                      <p className="text-[9px] text-slate-400 font-bold uppercase tracking-wider mt-0.5">{f.description}</p>
+                    <div className="flex items-start gap-2">
+                      <button
+                        type="button"
+                        onClick={() =>
+                          setExpandedFeatures(prev => ({
+                            ...prev,
+                            [f.featureId]: !prev[f.featureId],
+                          }))
+                        }
+                        className="mt-0.5 inline-flex h-5 w-5 items-center justify-center rounded-full border border-slate-200 bg-white text-slate-400 hover:text-slate-700 hover:bg-slate-50 text-[10px] font-black"
+                        title={isExpanded ? 'Collapse value mappings' : 'Expand value mappings'}
+                      >
+                        <svg
+                          className={`w-3 h-3 transition-transform ${isExpanded ? 'rotate-90' : ''}`}
+                          fill="none"
+                          stroke="currentColor"
+                          viewBox="0 0 24 24"
+                        >
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M9 5l7 7-7 7" />
+                        </svg>
+                      </button>
+                      <div>
+                        <p className="text-sm font-black text-slate-900 leading-tight">{f.featureId}</p>
+                        <p className="text-[9px] text-slate-400 font-bold uppercase tracking-wider mt-0.5">{f.description}</p>
+                      </div>
                     </div>
 
                     <div className="flex flex-col items-end gap-1 min-w-[220px]">
@@ -1142,8 +1192,9 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
                   </div>
 
                   {/* Per-value rows: ensure strict left/right alignment */}
-                  <div className="mt-4 space-y-2">
-                    {f.values.map((v, vidx) => {
+                  {isExpanded && (
+                    <div className="mt-4 space-y-2">
+                      {f.values.map((v, vidx) => {
                       const isValueMapped = selectedAttribute !== 'UNMAPPED' && effectiveMapping?.valueMappings?.[v] !== undefined;
                       const mappedValue = isValueMapped ? effectiveMapping!.valueMappings![v] : '';
 
@@ -1151,41 +1202,42 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
                         return null;
                       }
 
-                      return (
-                        <div
-                          key={`${item.itemId}-${f.featureId}-row-${vidx}`}
-                          className="grid grid-cols-[1fr_auto_1fr] gap-4 items-center"
-                        >
-                          <div className="px-3 py-2 bg-slate-900 text-white rounded-lg text-[9px] font-black uppercase tracking-tight truncate">
-                            {v}
-                          </div>
+                        return (
+                          <div
+                            key={`${item.itemId}-${f.featureId}-row-${vidx}`}
+                            className="grid grid-cols-[1fr_auto_1fr] gap-4 items-center"
+                          >
+                            <div className="px-3 py-2 bg-slate-900 text-white rounded-lg text-[9px] font-black uppercase tracking-tight truncate">
+                              {v}
+                            </div>
 
-                          <div className="flex items-center justify-center text-2xl font-black text-slate-300">
-                            →
-                          </div>
+                            <div className="flex items-center justify-center text-2xl font-black text-slate-300">
+                              →
+                            </div>
 
-                          <div>
-                            {isReadOnly ? (
-                              <div
-                                className={`px-3 py-2 rounded-lg text-[9px] font-black uppercase tracking-tight truncate ${
-                                  isValueMapped ? 'bg-emerald-600 text-white' : 'bg-slate-100 text-slate-500'
-                                }`}
-                              >
-                                {mappedValue}
-                              </div>
-                            ) : (
-                              <ValueSelector
-                                value={mappedValue}
-                                options={candidateValuesForAttribute}
-                                disabled={isReadOnly}
-                                onChange={(newVal) => handleUpdateValue(f.featureId, v, newVal)}
-                              />
-                            )}
+                            <div>
+                              {isReadOnly ? (
+                                <div
+                                  className={`px-3 py-2 rounded-lg text-[9px] font-black uppercase tracking-tight truncate ${
+                                    isValueMapped ? 'bg-emerald-600 text-white' : 'bg-slate-100 text-slate-500'
+                                  }`}
+                                >
+                                  {mappedValue}
+                                </div>
+                              ) : (
+                                <ValueSelector
+                                  value={mappedValue}
+                                  options={candidateValuesForAttribute}
+                                  disabled={isReadOnly}
+                                  onChange={(newVal) => handleUpdateValue(f.featureId, v, newVal)}
+                                />
+                              )}
+                            </div>
                           </div>
-                        </div>
-                      );
-                    })}
-                  </div>
+                        );
+                      })}
+                    </div>
+                  )}
                 </div>
               </div>
             );
