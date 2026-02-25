@@ -7,7 +7,7 @@ import DataInspector from './components/DataInspector';
 import MappingDashboard from './components/MappingDashboard';
 import LoginSignUp from './components/LoginSignUp';
 import { dbService } from './services/dbService';
-import { GlobalMapping, DataCategory, DatabaseState, User, ConnectionMode, LocalItemMappings } from './types';
+import { GlobalMapping, DataCategory, DatabaseState, User, ConnectionMode, LocalItemMappings, FeatureFlags, ClassAttributeValues } from './types';
 
 const App: React.FC = () => {
   const [currentUser, setCurrentUser] = useState<User | null>(null);
@@ -19,6 +19,9 @@ const App: React.FC = () => {
   const [dbState, setDbState] = useState<DatabaseState | null>(null);
   const [activeInspector, setActiveInspector] = useState<DataCategory | null>(null);
   const [showDashboard, setShowDashboard] = useState(false);
+  const [featureFlags, setFeatureFlags] = useState<FeatureFlags>(() => ({
+    useNewClassTargetMapping: import.meta.env.VITE_USE_NEW_CLASS_TARGET_MAPPING === 'true',
+  }));
   
   // Initial load only; further refreshes are explicit via header/controls.
   useEffect(() => {
@@ -77,6 +80,7 @@ const App: React.FC = () => {
     localMappings?: LocalItemMappings;
     itemClassifications?: Record<string, string>;
     globalMappings?: GlobalMapping[];
+    classAttributeValues?: ClassAttributeValues;
   }) => {
     if (!dbState) return;
     setIsRefreshing(true);
@@ -85,7 +89,11 @@ const App: React.FC = () => {
       ...dbState,
       localMappings: { ...dbState.localMappings, ...updates.localMappings },
       itemClassifications: { ...dbState.itemClassifications, ...updates.itemClassifications },
-      mappings: updates.globalMappings || dbState.mappings
+      mappings: updates.globalMappings || dbState.mappings,
+      classAttributeValues: {
+        ...(dbState.classAttributeValues || {}),
+        ...(updates.classAttributeValues || {}),
+      },
     };
 
     const newMode = await dbService.saveAll(nextState);
@@ -143,6 +151,13 @@ const App: React.FC = () => {
   const currentLock = selectedItemId ? dbState.locks[selectedItemId] : null;
   const isLockedByMe = currentLock?.userId === currentUser.userId;
 
+  const handleToggleNewClassTargetMapping = () => {
+    setFeatureFlags(prev => ({
+      ...prev,
+      useNewClassTargetMapping: !prev.useNewClassTargetMapping,
+    }));
+  };
+
   return (
     <div className="flex flex-col h-screen bg-slate-50 overflow-hidden font-sans antialiased">
       <BOMHeader 
@@ -183,10 +198,13 @@ const App: React.FC = () => {
           classes={dbState.classifications}
           globalMappings={dbState.mappings}
           localItemMappings={dbState.localMappings}
+          classAttributeValues={dbState.classAttributeValues || {}}
           assignedClassId={selectedItemId ? dbState.itemClassifications[selectedItemId] : null}
           isLockedByMe={isLockedByMe}
           lockOwner={currentLock}
           currentUser={currentUser}
+          featureFlags={featureFlags}
+          onToggleNewClassTargetMapping={handleToggleNewClassTargetMapping}
           onSignOn={async () => selectedItemId && (await handleSignOn(selectedItemId))}
           onSignOff={async () => selectedItemId && (await handleSignOff(selectedItemId))}
           onSaveChanges={handleSaveWorkspaceChanges}

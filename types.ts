@@ -48,11 +48,17 @@ export interface ItemLock {
 
 export type LocalItemMappings = Record<string, GlobalMapping[]>;
 
+// Per-item manual values for class-scoped target attributes that
+// do not originate from a specific legacy feature.
+// Shape: { [itemId]: { [attributeId]: value } }
+export type ClassAttributeValues = Record<string, Record<string, string>>;
+
 export interface DatabaseState {
   bom: LegacyItem[];
   mappings: GlobalMapping[];
   classifications: NewClassification[];
   localMappings: LocalItemMappings;
+  classAttributeValues?: ClassAttributeValues;
   itemClassifications: Record<string, string>;
   locks: Record<string, ItemLock>;
   users: User[];
@@ -62,4 +68,8 @@ export interface AIClassificationSuggestion {
   classId: string;
   confidence: number;
   reason: string;
+}
+
+export interface FeatureFlags {
+  useNewClassTargetMapping: boolean;
 }

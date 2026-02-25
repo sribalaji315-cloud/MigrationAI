@@ -130,6 +130,8 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
   const [selectedAttributeId, setSelectedAttributeId] = useState<string | null>(null);
   const [remoteAttribute, setRemoteAttribute] = useState<NewAttribute | null>(null);
   const [isAttributeLoading, setIsAttributeLoading] = useState(false);
+  const [isCsvImporting, setIsCsvImporting] = useState(false);
+  const [csvImportProgress, setCsvImportProgress] = useState(0);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   useEffect(() => {
@@ -300,6 +302,43 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
         });
       }
     }
+  };
+
+  const addAttributeToActiveClass = () => {
+    if (!activeClass) return;
+
+    const rawId = prompt('Enter new attribute ID:');
+    if (!rawId) return;
+    const trimmedId = rawId.trim();
+    if (!trimmedId) return;
+
+    const classIdx = localClassification.findIndex(c => c.classId === activeClass.classId);
+    if (classIdx === -1) return;
+
+    const existingAttrs = localClassification[classIdx].attributes || [];
+    const exists = existingAttrs.some(a => normalizeKey(a.attributeId) === normalizeKey(trimmedId));
+    if (exists) {
+      alert('An attribute with this ID already exists in this class.');
+      return;
+    }
+
+    const rawDesc = prompt('Enter attribute description (optional):') || '';
+
+    const next = [...localClassification];
+    const newAttr: NewAttribute = {
+      attributeId: trimmedId,
+      description: rawDesc,
+      allowedValues: [],
+    };
+
+    next[classIdx] = {
+      ...next[classIdx],
+      attributes: [...existingAttrs, newAttr],
+    };
+
+    setLocalClassification(next);
+    setSelectedAttributeId(trimmedId);
+    setRemoteAttribute(null);
   };
 
   const removeAllowedValueFromSelected = (valueToRemove: string) => {
@@ -520,15 +559,19 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
     }
 
     try {
+      setIsCsvImporting(true);
+      setCsvImportProgress(10);
       const text = await file.text();
+      setCsvImportProgress(40);
       const rows = parseCsv(text);
       if (!rows.length) {
         alert('CSV file is empty or has no data rows.');
+        setIsCsvImporting(false);
         return;
       }
 
       if (category === 'mapping') {
-        const next: GlobalMapping[] = rows.map(r => {
+        const imported: GlobalMapping[] = rows.map(r => {
           const legacyFeatureIds = (r['legacyFeatureIds'] || '')
             .split('|')
             .map(s => s.trim())
@@ -542,15 +585,29 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
           });
           return { legacyFeatureIds, newAttributeId, valueMappings };
         });
-        setLocalMapping(next);
+        const existing = [...localMapping];
+        const isSameMapping = (a: GlobalMapping, b: GlobalMapping) => {
+          const aKey = (a.legacyFeatureIds || []).slice().sort().join('|');
+          const bKey = (b.legacyFeatureIds || []).slice().sort().join('|');
+          return aKey === bKey && (a.newAttributeId || '') === (b.newAttributeId || '');
+        };
+        imported.forEach(m => {
+          if (!existing.some(em => isSameMapping(em, m))) {
+            existing.push(m);
+          }
+        });
+        setLocalMapping(existing);
       } else if (category === 'classification' || category === 'values') {
-        const byClass: Record<string, NewClassification> = {};
+        const next = JSON.parse(JSON.stringify(localClassification)) as NewClassification[];
+
         rows.forEach(r => {
           const classId = r['classId'] || '';
           const className = r['className'] || classId || 'New Classification';
           if (!classId) return;
-          if (!byClass[classId]) {
-            byClass[classId] = { classId, className, attributes: [] };
+          let cls = next.find(c => c.classId === classId);
+          if (!cls) {
+            cls = { classId, className, attributes: [] };
+            next.push(cls);
           }
           const attributeId = r['attributeId'] || '';
           if (attributeId) {
@@ -558,19 +615,33 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
               .split('|')
               .map(s => s.trim())
               .filter(Boolean);
-            byClass[classId].attributes.push({
-              attributeId,
-              description: r['attributeDescription'] || attributeId,
-              allowedValues,
-            });
+            const existingAttr = cls.attributes.find(a => a.attributeId === attributeId);
+            if (!existingAttr) {
+              cls.attributes.push({
+                attributeId,
+                description: r['attributeDescription'] || attributeId,
+                allowedValues,
+              });
+            } else {
+              const desc = existingAttr.description || r['attributeDescription'] || attributeId;
+              const mergedValues = new Set<string>(existingAttr.allowedValues || []);
+              allowedValues.forEach(v => mergedValues.add(v));
+              existingAttr.description = desc;
+              existingAttr.allowedValues = Array.from(mergedValues);
+            }
           }
         });
-        setLocalClassification(Object.values(byClass));
+        setLocalClassification(next);
       } else if (category === 'bom') {
         // Support both the app's BOM template and ggg.csv format:
         // - Template: itemId, description, featureId, featureDescription, values (pipe-separated)
         // - ggg.csv: itemId, itemDescription, featureId, featureDescription, featureValue (one per row)
         const byItem: Record<string, LegacyItem> = {};
+
+        // seed map with existing BOM so imports add on top
+        localBom.forEach(item => {
+          byItem[item.itemId] = JSON.parse(JSON.stringify(item));
+        });
 
         rows.forEach(r => {
           const itemId = r['itemId'] || '';
@@ -613,9 +684,15 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
 
         setLocalBom(Object.values(byItem));
       }
+      setCsvImportProgress(100);
     } catch (err) {
       console.error('CSV import failed', err);
       alert('Failed to parse CSV file. Please verify the format matches the template.');
+    } finally {
+      setTimeout(() => {
+        setIsCsvImporting(false);
+        setCsvImportProgress(0);
+      }, 300);
     }
   };
 
@@ -720,28 +797,45 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
             </button>
 
             {category !== 'users' && (
-              <div className="flex items-center gap-2">
-                <button
-                  type="button"
-                  onClick={handleDownloadTemplate}
-                  className="px-3 py-1.5 border border-slate-200 bg-white rounded-lg text-[9px] font-black text-slate-600 hover:bg-slate-50 transition-all uppercase tracking-widest"
-                >
-                  Download CSV Template
-                </button>
-                <button
-                  type="button"
-                  onClick={() => fileInputRef.current?.click()}
-                  className="px-3 py-1.5 border border-indigo-200 bg-indigo-50 rounded-lg text-[9px] font-black text-indigo-700 hover:bg-indigo-100 transition-all uppercase tracking-widest"
-                >
-                  Upload CSV
-                </button>
-                <input
-                  ref={fileInputRef}
-                  type="file"
-                  accept=".csv,text/csv"
-                  className="hidden"
-                  onChange={handleCsvUpload}
-                />
+              <div className="flex flex-col items-end gap-1">
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={handleDownloadTemplate}
+                    className="px-3 py-1.5 border border-slate-200 bg-white rounded-lg text-[9px] font-black text-slate-600 hover:bg-slate-50 transition-all uppercase tracking-widest"
+                  >
+                    Download CSV Template
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => !isCsvImporting && fileInputRef.current?.click()}
+                    className={`px-3 py-1.5 border rounded-lg text-[9px] font-black uppercase tracking-widest transition-all ${
+                      isCsvImporting
+                        ? 'border-slate-200 bg-slate-100 text-slate-400 cursor-not-allowed'
+                        : 'border-indigo-200 bg-indigo-50 text-indigo-700 hover:bg-indigo-100'
+                    }`}
+                  >
+                    {isCsvImporting ? 'Importing…' : 'Upload CSV'}
+                  </button>
+                  <input
+                    ref={fileInputRef}
+                    type="file"
+                    accept=".csv,text/csv"
+                    className="hidden"
+                    onChange={handleCsvUpload}
+                  />
+                </div>
+                {isCsvImporting && (
+                  <div className="flex items-center gap-2 text-[9px] text-slate-500">
+                    <span>Processing CSV</span>
+                    <div className="w-24 h-1.5 bg-slate-200 rounded-full overflow-hidden">
+                      <div
+                        className="h-full bg-indigo-500 transition-all"
+                        style={{ width: `${csvImportProgress}%` }}
+                      />
+                    </div>
+                  </div>
+                )}
               </div>
             )}
 
@@ -1172,24 +1266,7 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
 
           {(category === 'classification' || category === 'values') && (
             <div className="mt-4 flex gap-4 min-h-[200px]">
-              {/* Left: Domain Registry */}
-              <div className="flex-1 bg-white rounded-xl border border-slate-200 shadow-sm p-4 flex flex-col">
-                <p className="text-[9px] font-black text-slate-400 uppercase tracking-widest mb-3">Domain Registry</p>
-                <div className="text-[10px] text-slate-600 font-medium flex-1">
-                  {activeClass ? (
-                    <>
-                      <p className="text-xs font-black text-slate-900 mb-2">{activeClass.className || activeClass.classId}</p>
-                      <p className="text-[9px] text-slate-500">{activeClass.classId}</p>
-                    </>
-                  ) : (
-                    <div className="h-full flex items-center justify-center">
-                      <p className="text-[9px] text-slate-400 italic">No classification selected</p>
-                    </div>
-                  )}
-                </div>
-              </div>
-
-              {/* Right: Summary/Details */}
+              {/* Left: Summary & Attribute List */}
               <div className="flex-1 bg-white rounded-xl border border-slate-200 shadow-sm p-4 flex flex-col">
                 <p className="text-[9px] font-black text-slate-400 uppercase tracking-widest mb-3">Summary</p>
                 {activeClass ? (
@@ -1202,61 +1279,127 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
                         {uniqueAttributeCountForActiveClass} attribute{uniqueAttributeCountForActiveClass === 1 ? '' : 's'} defined
                       </p>
                     </div>
-                    {selectedAttributeForDetail && (
-                      <div className="flex-1 flex flex-col min-h-0">
-                        <p className="text-[8px] font-black text-slate-400 uppercase tracking-widest mb-1">
-                          Selected Attribute
-                        </p>
-                        <p className="text-[10px] font-black text-slate-900 truncate" title={selectedAttributeForDetail.attributeId}>
-                          {selectedAttributeForDetail.attributeId}
-                        </p>
-                        <p className="text-[9px] text-slate-600 truncate" title={selectedAttributeForDetail.description}>
-                          {selectedAttributeForDetail.description || '—'}
-                        </p>
-                        <div className="mt-2 flex flex-wrap items-center gap-1 max-h-24 overflow-y-auto">
-                          <button
-                            type="button"
-                            onClick={addAllowedValueToSelected}
-                            className="px-2 py-0.5 rounded-full border border-dashed border-slate-300 text-slate-500 text-[8px] font-black uppercase tracking-widest hover:text-indigo-600 hover:border-indigo-300"
-                            title="Add allowed value"
-                          >
-                            +
-                          </button>
-                          {isAttributeLoading ? (
-                            <span className="text-[8px] text-slate-400">Loading...</span>
-                          ) : (selectedAttributeForDetail.allowedValues || []).length === 0 ? (
-                            <span className="text-[8px] text-slate-400">No values</span>
-                          ) : (
-                            (selectedAttributeForDetail.allowedValues || []).map(v => (
-                              <div
-                                key={v}
-                                className="relative inline-flex items-center group"
+
+                    <div className="flex-1 flex flex-col min-h-0">
+                      <p className="text-[8px] font-black text-slate-400 uppercase tracking-widest mb-1">
+                        Attribute List
+                      </p>
+                      {attributeDropdownOptions.length === 0 ? (
+                        <p className="text-[8px] text-slate-400 italic">No attributes defined yet.</p>
+                      ) : (
+                        <div className="mt-1 rounded-md border border-slate-100 bg-slate-50/40 max-h-40 overflow-y-auto">
+                          {attributeDropdownOptions.map(attrId => {
+                            const isSelected = normalizeKey(attrId) === normalizeKey(selectedAttributeId);
+                            return (
+                              <button
+                                key={attrId}
+                                type="button"
+                                onClick={() => setSelectedAttributeId(attrId)}
+                                className={`w-full text-left px-2.5 py-1.5 text-[9px] font-black uppercase tracking-widest border-b last:border-b-0 ${
+                                  isSelected
+                                    ? 'bg-indigo-50 text-indigo-700 border-indigo-100'
+                                    : 'bg-transparent text-slate-700 border-slate-100 hover:bg-slate-50'
+                                }`}
                               >
-                                <span
-                                  className="px-2 py-0.5 pr-4 rounded-full bg-slate-100 text-slate-700 text-[8px] font-black uppercase tracking-widest"
-                                >
-                                  {v}
-                                </span>
-                                <button
-                                  type="button"
-                                  onClick={() => removeAllowedValueFromSelected(v)}
-                                  className="absolute -right-1 -top-1 w-3.5 h-3.5 rounded-full bg-red-500 text-white flex items-center justify-center text-[7px] opacity-0 group-hover:opacity-100 shadow-sm transition-opacity"
-                                  title="Remove value"
-                                >
-                                  ×
-                                </button>
-                              </div>
-                            ))
-                          )}
+                                {attrId}
+                              </button>
+                            );
+                          })}
                         </div>
+                      )}
+
+                      <div className="mt-3">
+                        <button
+                          type="button"
+                          onClick={addAttributeToActiveClass}
+                          className="inline-flex items-center gap-1 px-3 py-1 rounded-full border border-dashed border-slate-300 text-[8px] font-black uppercase tracking-widest text-slate-600 hover:text-indigo-600 hover:border-indigo-300"
+                        >
+                          <span className="text-xs leading-none">+</span>
+                          <span>Add Attribute</span>
+                        </button>
                       </div>
-                    )}
+                    </div>
                   </>
                 ) : (
                   <div className="flex-1 flex items-center justify-center">
-                    <p className="text-[9px] text-slate-400 italic">Select a class to view details</p>
+                    <p className="text-[9px] text-slate-400 italic">Select a class to view attributes</p>
                   </div>
                 )}
+              </div>
+
+              {/* Right: Domain Registry & Attribute Details */}
+              <div className="flex-1 bg-white rounded-xl border border-slate-200 shadow-sm p-4 flex flex-col">
+                <p className="text-[9px] font-black text-slate-400 uppercase tracking-widest mb-3">Domain Registry</p>
+                <div className="text-[10px] text-slate-600 font-medium flex-1">
+                  {activeClass ? (
+                    <>
+                      <p className="text-xs font-black text-slate-900 mb-2">{activeClass.className || activeClass.classId}</p>
+                      <p className="text-[9px] text-slate-500 mb-3">{activeClass.classId}</p>
+
+                      {selectedAttributeForDetail ? (
+                        <div className="flex flex-col min-h-0">
+                          <p className="text-[8px] font-black text-slate-400 uppercase tracking-widest mb-1">
+                            Selected Attribute
+                          </p>
+                          <p
+                            className="text-[10px] font-black text-slate-900 truncate"
+                            title={selectedAttributeForDetail.attributeId}
+                          >
+                            {selectedAttributeForDetail.attributeId}
+                          </p>
+                          <p
+                            className="text-[9px] text-slate-600 truncate"
+                            title={selectedAttributeForDetail.description}
+                          >
+                            {selectedAttributeForDetail.description || '—'}
+                          </p>
+                          <div className="mt-2 flex flex-wrap items-center gap-1 max-h-24 overflow-y-auto">
+                            <button
+                              type="button"
+                              onClick={addAllowedValueToSelected}
+                              className="px-2 py-0.5 rounded-full border border-dashed border-slate-300 text-slate-500 text-[8px] font-black uppercase tracking-widest hover:text-indigo-600 hover:border-indigo-300"
+                              title="Add allowed value"
+                            >
+                              +
+                            </button>
+                            {isAttributeLoading ? (
+                              <span className="text-[8px] text-slate-400">Loading...</span>
+                            ) : (selectedAttributeForDetail.allowedValues || []).length === 0 ? (
+                              <span className="text-[8px] text-slate-400">No values</span>
+                            ) : (
+                              (selectedAttributeForDetail.allowedValues || []).map(v => (
+                                <div
+                                  key={v}
+                                  className="relative inline-flex items-center group"
+                                >
+                                  <span className="px-2 py-0.5 pr-4 rounded-full bg-slate-100 text-slate-700 text-[8px] font-black uppercase tracking-widest">
+                                    {v}
+                                  </span>
+                                  <button
+                                    type="button"
+                                    onClick={() => removeAllowedValueFromSelected(v)}
+                                    className="absolute -right-1 -top-1 w-3.5 h-3.5 rounded-full bg-red-500 text-white flex items-center justify-center text-[7px] opacity-0 group-hover:opacity-100 shadow-sm transition-opacity"
+                                    title="Remove value"
+                                  >
+                                    ×
+                                  </button>
+                                </div>
+                              ))
+                            )}
+                          </div>
+                        </div>
+                      ) : (
+                        <p className="text-[9px] text-slate-400 italic mt-1">
+                          Select an attribute from the list to view details.
+                        </p>
+                      )}
+                    </>
+                  ) : (
+                    <div className="h-full flex items-center justify-center">
+                      <p className="text-[9px] text-slate-400 italic">No classification selected</p>
+                    </div>
+                  )}
+                </div>
               </div>
             </div>
           )}
