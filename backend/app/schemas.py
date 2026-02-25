@@ -28,6 +28,8 @@ class Attribute(BaseModel):
     attributeId: str
     description: str
     allowedValues: Optional[List[str]] = []
+    # Optional per-value descriptions, keyed by allowed value
+    valueDescriptions: Optional[Dict[str, str]] = None
 
 class ClassificationBase(BaseModel):
     classId: str
@@ -53,3 +55,5 @@ class ClassAttributeOut(BaseModel):
     attributeId: str
     description: str
     allowedValues: Optional[List[str]] = []
+    # Optional per-value descriptions, keyed by allowed value
+    valueDescriptions: Optional[Dict[str, str]] = None

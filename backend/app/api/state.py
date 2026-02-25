@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
-from typing import Dict, List
+from typing import Dict, List, Any
 from ..db import models
 from ..db.session import get_db
 from ..schemas import StateIn
@@ -59,15 +59,40 @@ def get_state(db: Session = Depends(get_db)):
 
     # --- Override BOM from dedicated tables --------------------------------------
     db_items = db.query(models.BomItem).all()
-    bom_payload: List[Dict] = []
+    bom_payload: List[Dict[str, Any]] = []
     for itm in db_items:
-        features_payload: List[Dict] = []
+        features_payload: List[Dict[str, Any]] = []
         for feat in itm.features:
+            raw_values: Any = getattr(feat, "values", []) or []
+
+            # Support both the original representation (list of strings)
+            # and a richer object with value descriptions stored in the JSON
+            values: List[str]
+            value_descriptions: Dict[str, str]
+
+            if isinstance(raw_values, list):
+                values = [str(v) for v in raw_values]
+                value_descriptions = {}
+            elif isinstance(raw_values, dict):
+                values_raw = raw_values.get("values") or []
+                values = [str(v) for v in values_raw]
+                vd = raw_values.get("valueDescriptions") or {}
+                # normalise keys to strings
+                value_descriptions = {
+                    str(k): str(v)
+                    for k, v in vd.items()
+                    if k is not None
+                }
+            else:
+                values = []
+                value_descriptions = {}
+
             features_payload.append(
                 {
                     "featureId": getattr(feat, "feature_id", None),
                     "description": getattr(feat, "description", ""),
-                    "values": getattr(feat, "values", []) or [],
+                    "values": values,
+                    **({"valueDescriptions": value_descriptions} if value_descriptions else {}),
                 }
             )
         bom_payload.append(
@@ -154,11 +179,26 @@ def sync_state(payload: StateIn, db: Session = Depends(get_db), current_user: mo
             feature_id = feat.get("featureId")
             if not feature_id:
                 continue
+
+            raw_values = feat.get("values") or []
+            value_descriptions = feat.get("valueDescriptions") or {}
+
+            # When value descriptions are provided, store an object in the JSON column
+            # so we can round-trip both values and descriptions. Otherwise, keep the
+            # original list-of-strings representation.
+            if value_descriptions:
+                composite_values: Any = {
+                    "values": raw_values,
+                    "valueDescriptions": value_descriptions,
+                }
+            else:
+                composite_values = raw_values
+
             db_feature = models.BomFeature(
                 item_id=db_item.id,
                 feature_id=feature_id,
                 description=feat.get("description") or "",
-                values=feat.get("values") or [],
+                values=composite_values,
             )
             db.add(db_feature)
 
@@ -189,6 +229,22 @@ def sync_state(payload: StateIn, db: Session = Depends(get_db), current_user: mo
             values_map = m.get("valueMappings") or {}
 
             for legacy_attr in legacy_ids:
+                # If there are no per-value mappings, we still need to persist the
+                # attribute-level override (e.g. NOT REQUIRED) so that it survives
+                # a round-trip through the database. We do this by inserting a
+                # sentinel row with an empty legacy_value / new_value pair.
+                if not values_map:
+                    row = models.LocalAttributeMapping(
+                        item_id=item_id,
+                        item_description=item_desc,
+                        legacy_attribute_id=legacy_attr,
+                        legacy_value="",
+                        new_attribute_id=new_attr,
+                        new_value="",
+                    )
+                    db.add(row)
+                    continue
+
                 for legacy_val, new_val in values_map.items():
                     if legacy_attr and legacy_val is not None:
                         row = models.LocalAttributeMapping(

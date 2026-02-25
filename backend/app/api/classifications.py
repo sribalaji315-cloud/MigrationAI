@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
-from typing import List
+from typing import Dict, List
 
 from ..db import models
 from ..db.session import get_db
@@ -45,9 +45,12 @@ def get_class_attribute(class_id: str, attribute_id: str, db: Session = Depends(
     description = ""
     values: List[str] = []
     seen_values = set()
+    # Optional collected descriptions for each allowed value
+    value_descriptions: Dict[str, str] = {}
     for attr in matched:
         if not description:
             description = attr.get("description", "") or ""
+        # Merge allowed values
         for v in (attr.get("allowedValues") or []):
             val = str(v).strip()
             key = _normalize_key(val)
@@ -55,12 +58,23 @@ def get_class_attribute(class_id: str, attribute_id: str, db: Session = Depends(
                 seen_values.add(key)
                 values.append(val)
 
+        # Merge any per-value descriptions, preferring the first non-empty one we see
+        attr_value_descs = attr.get("valueDescriptions") or {}
+        if isinstance(attr_value_descs, dict):
+            for raw_val, desc in attr_value_descs.items():
+                canonical_val = str(raw_val).strip()
+                if not canonical_val:
+                    continue
+                if desc and canonical_val not in value_descriptions:
+                    value_descriptions[canonical_val] = str(desc)
+
     return ClassAttributeOut(
         classId=record.class_id,
         className=record.class_name,
         attributeId=matched[0].get("attributeId", attribute_id),
         description=description or attribute_id,
         allowedValues=values,
+        valueDescriptions=value_descriptions or None,
     )
 
 

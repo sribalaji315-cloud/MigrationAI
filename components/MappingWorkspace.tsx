@@ -2,10 +2,67 @@
 import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { LegacyItem, NewClassification, GlobalMapping, LocalItemMappings, NewAttribute, ItemLock, User, FeatureFlags } from '../types';
 
-const SearchableSelect = ({ value, options, onChange }: { value: string, options: string[], onChange: (val: string) => void }) => {
+type Tone = 'mapped' | 'unmapped' | 'notRequired';
+
+const toneTheme: Record<Tone, {
+  trigger: string;
+  dropdownBorder: string;
+  optionActive: string;
+  optionHover: string;
+  card: string;
+  accent: string;
+  attrReadonly: string;
+  valueWrapper: string;
+  valueReadonly: string;
+  valueInput: string;
+  valueButton: string;
+}> = {
+  mapped: {
+    trigger: 'bg-emerald-50 border-emerald-300 text-emerald-800 focus:ring-emerald-400 focus:border-emerald-400',
+    dropdownBorder: 'border-emerald-200',
+    optionActive: 'bg-emerald-100 text-emerald-800',
+    optionHover: 'hover:bg-emerald-100',
+    card: 'bg-emerald-50/60 border-emerald-200',
+    accent: 'bg-emerald-500',
+    attrReadonly: 'border-emerald-200 bg-emerald-50 text-emerald-800',
+    valueWrapper: 'bg-emerald-50 border border-emerald-100',
+    valueReadonly: 'bg-emerald-600 text-white',
+    valueInput: 'bg-emerald-50 border-emerald-300 text-emerald-800 focus:ring-emerald-300 focus:border-emerald-300',
+    valueButton: 'border-emerald-200 text-emerald-700',
+  },
+  unmapped: {
+    trigger: 'bg-rose-50 border-rose-300 text-rose-800 focus:ring-rose-400 focus:border-rose-400',
+    dropdownBorder: 'border-rose-200',
+    optionActive: 'bg-rose-100 text-rose-800',
+    optionHover: 'hover:bg-rose-100',
+    card: 'bg-rose-50/60 border-rose-200',
+    accent: 'bg-rose-500',
+    attrReadonly: 'border-rose-200 bg-rose-50 text-rose-800',
+    valueWrapper: 'bg-rose-50 border border-rose-100',
+    valueReadonly: 'bg-rose-600 text-white',
+    valueInput: 'bg-rose-50 border-rose-300 text-rose-800 focus:ring-rose-300 focus:border-rose-300',
+    valueButton: 'border-rose-200 text-rose-700',
+  },
+  notRequired: {
+    trigger: 'bg-amber-50 border-amber-300 text-amber-800 focus:ring-amber-400 focus:border-amber-400',
+    dropdownBorder: 'border-amber-200',
+    optionActive: 'bg-amber-100 text-amber-800',
+    optionHover: 'hover:bg-amber-100',
+    card: 'bg-amber-50/60 border-amber-200',
+    accent: 'bg-amber-500',
+    attrReadonly: 'border-amber-200 bg-amber-50 text-amber-800',
+    valueWrapper: 'bg-amber-50 border border-amber-100',
+    valueReadonly: 'bg-amber-400 text-white',
+    valueInput: 'bg-amber-50 border-amber-300 text-amber-800 focus:ring-amber-300 focus:border-amber-300',
+    valueButton: 'border-amber-200 text-amber-700',
+  },
+};
+
+const SearchableSelect = ({ value, options, onChange, tone = 'mapped' }: { value: string, options: string[], onChange: (val: string) => void, tone?: Tone }) => {
   const [isOpen, setIsOpen] = useState(false);
   const [search, setSearch] = useState('');
   const wrapperRef = useRef<HTMLDivElement>(null);
+  const palette = toneTheme[tone];
 
   useEffect(() => {
     const handleClickOutside = (event: MouseEvent) => {
@@ -22,7 +79,7 @@ const SearchableSelect = ({ value, options, onChange }: { value: string, options
   return (
     <div ref={wrapperRef} className="relative mb-2">
       <div 
-        className="w-full px-3 py-2 pr-8 bg-white border-2 border-emerald-300 rounded-lg text-[10px] font-black text-emerald-800 uppercase tracking-tight cursor-pointer hover:bg-emerald-50 transition-colors outline-none focus:ring-2 focus:ring-emerald-400 flex items-center justify-between"
+        className={`w-full px-3 py-2 pr-8 border-2 rounded-lg text-[10px] font-black uppercase tracking-tight cursor-pointer transition-colors outline-none flex items-center justify-between ${palette.trigger}`}
         onClick={() => { setIsOpen(!isOpen); setSearch(''); }}
       >
         <span className="truncate">{value}</span>
@@ -34,7 +91,7 @@ const SearchableSelect = ({ value, options, onChange }: { value: string, options
       </div>
       
       {isOpen && (
-        <div className="absolute z-50 w-full mt-1 bg-white border-2 border-emerald-300 rounded-lg shadow-lg max-h-48 flex flex-col overflow-hidden" style={{ minWidth: '100%' }}>
+        <div className={`absolute z-50 w-full mt-1 bg-white border-2 rounded-lg shadow-lg max-h-48 flex flex-col overflow-hidden ${palette.dropdownBorder}`} style={{ minWidth: '100%' }}>
           <div className="p-2 border-b border-emerald-100 bg-slate-50">
             <input
               type="text"
@@ -50,7 +107,7 @@ const SearchableSelect = ({ value, options, onChange }: { value: string, options
             {filteredOptions.length > 0 ? filteredOptions.map((opt, idx) => (
               <div
                 key={idx}
-                className={`px-3 py-2 text-[10px] font-black uppercase tracking-tight cursor-pointer hover:bg-emerald-100 ${opt === value ? 'bg-emerald-50 text-emerald-800' : 'text-slate-700'}`}
+                className={`px-3 py-2 text-[10px] font-black uppercase tracking-tight cursor-pointer ${palette.optionHover} ${opt === value ? palette.optionActive : 'text-slate-700'}`}
                 onClick={() => {
                   onChange(opt);
                   setIsOpen(false);
@@ -261,15 +318,18 @@ const ValueSelector = ({
   options,
   disabled,
   onChange,
+  tone = 'mapped',
 }: {
   value: string;
   options: string[];
   disabled?: boolean;
   onChange: (val: string) => void;
+  tone?: Tone;
 }) => {
   const [isOpen, setIsOpen] = useState(false);
   const [search, setSearch] = useState('');
   const wrapperRef = useRef<HTMLDivElement | null>(null);
+  const palette = toneTheme[tone];
 
   useEffect(() => {
     const handleClickOutside = (event: MouseEvent) => {
@@ -299,7 +359,7 @@ const ValueSelector = ({
           className={`flex-1 px-3 py-1.5 rounded-lg border text-[9px] font-black uppercase tracking-tight outline-none transition-all ${
             disabled
               ? 'bg-slate-100 border-slate-200 text-slate-400 cursor-not-allowed'
-              : 'bg-white border-emerald-300 text-emerald-800 focus:ring-1 focus:ring-emerald-400'
+              : palette.valueInput
           }`}
         />
         <button
@@ -310,10 +370,10 @@ const ValueSelector = ({
             setIsOpen(o => !o);
             setSearch('');
           }}
-          className={`w-7 h-7 flex items-center justify-center rounded-md border text-emerald-700 bg-white shadow-sm text-[10px] ${
+          className={`w-7 h-7 flex items-center justify-center rounded-md border bg-white shadow-sm text-[10px] ${
             disabled || options.length === 0
-              ? 'opacity-40 cursor-not-allowed border-slate-200'
-              : 'border-emerald-200 hover:bg-emerald-50'
+              ? 'opacity-40 cursor-not-allowed border-slate-200 text-slate-400'
+              : palette.valueButton
           }`}
         >
           <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -323,7 +383,7 @@ const ValueSelector = ({
       </div>
 
       {isOpen && !disabled && (
-        <div className="absolute z-40 mt-1 w-full bg-white border border-emerald-200 rounded-lg shadow-lg max-h-56 overflow-hidden">
+        <div className={`absolute z-40 mt-1 w-full bg-white border rounded-lg shadow-lg max-h-56 overflow-hidden ${palette.dropdownBorder}`}>
           <div className="p-2 border-b border-slate-100 bg-slate-50">
             <input
               type="text"
@@ -338,9 +398,9 @@ const ValueSelector = ({
               filteredOptions.map((opt, idx) => (
                 <div
                   key={idx}
-                  className={`px-3 py-1.5 text-[9px] font-black uppercase tracking-tight cursor-pointer hover:bg-emerald-50 ${
-                    opt === value ? 'bg-emerald-50 text-emerald-800' : 'text-slate-700'
-                  }`}
+                  className={`px-3 py-1.5 text-[9px] font-black uppercase tracking-tight cursor-pointer ${
+                      opt === value ? palette.optionActive : 'text-slate-700'
+                    } ${palette.optionHover}`}
                   onClick={() => {
                     onChange(opt);
                     setIsOpen(false);
@@ -402,6 +462,7 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
   const [legacyFilter, setLegacyFilter] = useState('');
   const [showUnmappedOnly, setShowUnmappedOnly] = useState(false);
   const [expandedFeatures, setExpandedFeatures] = useState<Record<string, boolean>>({});
+  const [unmappedTargetsExpanded, setUnmappedTargetsExpanded] = useState(true);
   const isEditingRef = useRef(false);
 
   // Initialize workspace when item changes
@@ -717,24 +778,69 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
     });
   }, [item, useNewClassTargetMapping, stagedClassId, globalMappings, stagedLocalMappings, targetAttributes]);
 
+  const unmappedTargetGroupTone: Tone = useMemo(() => {
+    if (unmappedTargetAttributes.length === 0) return 'mapped';
+    let hasUnmapped = false;
+    let hasNotRequired = false;
+    let hasMapped = false;
+
+    unmappedTargetAttributes.forEach(attr => {
+      const manualKey = `UNMAPPED::${attr.attributeId}`;
+      const trimmed = (manualInputs[manualKey] || '').trim();
+      if (!trimmed) {
+        hasUnmapped = true;
+      } else if (trimmed === 'NOT REQUIRED') {
+        hasNotRequired = true;
+      } else {
+        hasMapped = true;
+      }
+    });
+
+    if (hasUnmapped) return 'unmapped';
+    if (hasMapped) return 'mapped';
+    return hasNotRequired ? 'notRequired' : 'mapped';
+  }, [unmappedTargetAttributes, manualInputs]);
+
+  const unmappedTargetPalette = toneTheme[unmappedTargetGroupTone];
+
   const handleUpdateLinkage = (featureId: string, attrId: string) => {
     if (!isLockedByMe) return;
+    if (!item) return;
     isEditingRef.current = true;
+
+    // Precompute feature values so we can auto-populate NOT REQUIRED mappings
+    const feature = item.features.find(f => f.featureId === featureId);
+    const featureValues = feature?.values || [];
+
     setStagedLocalMappings(prev => {
       const filtered = prev.filter(m => !m.legacyFeatureIds.includes(featureId));
       const globalRef = globalMappings.find(m => m.legacyFeatureIds.includes(featureId));
-      
+
       if (attrId === 'UNMAPPED' && !globalRef) {
         return filtered;
       }
-      
+
+      let nextValueMappings: Record<string, string> = {};
+
+      if (attrId === 'NOT REQUIRED') {
+        // When an attribute is marked as NOT REQUIRED, automatically
+        // mark all of its existing legacy values as NOT REQUIRED too
+        // so they count as fully mapped and disappear when filtering
+        // by "Unmapped Only".
+        featureValues.forEach(v => {
+          nextValueMappings[v] = 'NOT REQUIRED';
+        });
+      } else if (globalRef && globalRef.valueMappings) {
+        nextValueMappings = { ...globalRef.valueMappings };
+      }
+
       return [
         ...filtered,
         {
           legacyFeatureIds: [featureId],
           newAttributeId: attrId,
-          valueMappings: globalRef ? { ...globalRef.valueMappings } : {}
-        }
+          valueMappings: nextValueMappings,
+        },
       ];
     });
   };
@@ -1067,6 +1173,19 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
                 const key = normalizeAttrId(attrId);
                 return key === currentKey || !usedAttributeKeys.has(key);
               });
+
+              // Also allow the user to repoint to any class attributes that are
+              // currently unused on this item ("unmapped" at the class level).
+              if (unmappedTargetAttributes.length > 0) {
+                unmappedTargetAttributes.forEach(attr => {
+                  if (!attributeOptions.includes(attr.attributeId)) {
+                    attributeOptions.push(attr.attributeId);
+                  }
+                });
+              }
+
+              // Deduplicate again after appending extra options.
+              attributeOptions = Array.from(new Set(attributeOptions));
             }
 
             // Ensure "Not required" is always an explicit choice that counts as mapped
@@ -1109,15 +1228,28 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
               return null;
             }
 
-            const candidateValuesForAttribute = attributeCandidateValues[selectedAttribute] || [];
+            let candidateValuesForAttribute = attributeCandidateValues[selectedAttribute] || [];
+            if (useNewClassTargetMapping && (stagedClassId || 'UNCLASSIFIED') !== 'UNCLASSIFIED') {
+              const activeClass = classes.find(c => c.classId === (stagedClassId || 'UNCLASSIFIED'));
+              const attrDef = activeClass?.attributes.find(a => normalizeAttrId(a.attributeId) === normalizeAttrId(selectedAttribute));
+              if (attrDef && attrDef.allowedValues && attrDef.allowedValues.length > 0) {
+                candidateValuesForAttribute = attrDef.allowedValues;
+              }
+            }
+            const attributeTone: Tone = selectedAttribute === 'UNMAPPED'
+              ? 'unmapped'
+              : selectedAttribute === 'NOT REQUIRED'
+              ? 'notRequired'
+              : 'mapped';
+            const attributePalette = toneTheme[attributeTone];
             const isExpanded = !!expandedFeatures[f.featureId];
 
             return (
               <div
                 key={`${item.itemId}-${f.featureId}-${idx}`}
-                className={`bg-white rounded-xl shadow-sm border relative transition-all duration-300 hover:shadow-md ${hasMapping ? 'border-emerald-200' : 'border-slate-200'}`}
+                className={`rounded-xl shadow-sm border relative transition-all duration-300 hover:shadow-md ${attributePalette.card}`}
               >
-                <div className={`w-1.5 shrink-0 absolute left-0 top-0 bottom-0 rounded-l-xl ${hasMapping ? 'bg-emerald-400' : 'bg-slate-300'}`}></div>
+                <div className={`w-1.5 shrink-0 absolute left-0 top-0 bottom-0 rounded-l-xl ${attributePalette.accent}`}></div>
 
                 <div className="p-5 pl-8 pr-6">
                   {/* Header row: source feature meta on the left, attribute selector/badges on the right */}
@@ -1144,7 +1276,7 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
                         </svg>
                       </button>
                       <div>
-                        <p className="text-sm font-black text-slate-900 leading-tight">{f.featureId}</p>
+                        <p className={`text-sm font-black leading-tight ${attributeTone === 'mapped' ? 'text-emerald-900' : attributeTone === 'notRequired' ? 'text-amber-900' : 'text-rose-900'}`}>{f.featureId}</p>
                         <p className="text-[9px] text-slate-400 font-bold uppercase tracking-wider mt-0.5">{f.description}</p>
                       </div>
                     </div>
@@ -1170,19 +1302,16 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
 
                       {/* Target Attribute Selector/Display */}
                       <div className="w-full max-w-xs">
-                        {hasMultipleOptions && isLockedByMe ? (
+                        {isLockedByMe && (hasMultipleOptions || usingClassScope) ? (
                           <SearchableSelect
+                            tone={attributeTone}
                             value={selectedAttribute}
                             options={attributeOptions}
                             onChange={(val) => handleUpdateLinkage(f.featureId, val)}
                           />
                         ) : (
                           <p
-                            className={`px-3 py-2 border rounded-lg text-[10px] font-black uppercase tracking-tight text-right truncate ${
-                              hasMapping
-                                ? 'border-emerald-300 bg-emerald-50 text-emerald-800'
-                                : 'border-slate-200 bg-slate-50 text-slate-400'
-                            }`}
+                            className={`px-3 py-2 border rounded-lg text-[10px] font-black uppercase tracking-tight text-right truncate ${attributePalette.attrReadonly}`}
                           >
                             {selectedAttribute}
                           </p>
@@ -1195,20 +1324,51 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
                   {isExpanded && (
                     <div className="mt-4 space-y-2">
                       {f.values.map((v, vidx) => {
-                      const isValueMapped = selectedAttribute !== 'UNMAPPED' && effectiveMapping?.valueMappings?.[v] !== undefined;
-                      const mappedValue = isValueMapped ? effectiveMapping!.valueMappings![v] : '';
+                        const isValueMapped = selectedAttribute !== 'UNMAPPED' && effectiveMapping?.valueMappings?.[v] !== undefined;
+                        const mappedValue = isValueMapped ? effectiveMapping!.valueMappings![v] : '';
+                        const valueTone: Tone = attributeTone === 'notRequired'
+                          ? 'notRequired'
+                          : isValueMapped
+                            ? 'mapped'
+                            : 'unmapped';
+                        const valuePalette = toneTheme[valueTone];
 
-                      if (showUnmappedOnly && !featureHasUnmappedAttribute && isValueMapped) {
-                        return null;
-                      }
+                        if (showUnmappedOnly && !featureHasUnmappedAttribute && isValueMapped) {
+                          return null;
+                        }
+
+                        // Look up optional legacy value description, if provided via BOM
+                        const legacyDescMap = f.valueDescriptions || {};
+                        const legacyDesc = legacyDescMap[v] || '';
+
+                        // Look up optional target value description from the active class attribute
+                        let targetValueDescription = '';
+                        if (
+                          useNewClassTargetMapping &&
+                          (stagedClassId || 'UNCLASSIFIED') !== 'UNCLASSIFIED' &&
+                          selectedAttribute &&
+                          selectedAttribute !== 'UNMAPPED' &&
+                          selectedAttribute !== 'NOT REQUIRED' &&
+                          mappedValue
+                        ) {
+                          const activeClass = classes.find(c => c.classId === (stagedClassId || 'UNCLASSIFIED'));
+                          const attrDef = activeClass?.attributes.find(a => normalizeAttrId(a.attributeId) === normalizeAttrId(selectedAttribute));
+                          const descMap = attrDef?.valueDescriptions || {};
+                          targetValueDescription = descMap[mappedValue] || '';
+                        }
 
                         return (
                           <div
                             key={`${item.itemId}-${f.featureId}-row-${vidx}`}
                             className="grid grid-cols-[1fr_auto_1fr] gap-4 items-center"
                           >
-                            <div className="px-3 py-2 bg-slate-900 text-white rounded-lg text-[9px] font-black uppercase tracking-tight truncate">
-                              {v}
+                            <div className="px-3 py-2 bg-slate-900 text-white rounded-lg text-[9px] font-black uppercase tracking-tight truncate flex flex-col max-w-full">
+                              <span className="truncate">{v}</span>
+                              {legacyDesc && (
+                                <span className="mt-0.5 text-[8px] font-normal normal-case tracking-normal text-slate-100/80 truncate" title={legacyDesc}>
+                                  {legacyDesc}
+                                </span>
+                              )}
                             </div>
 
                             <div className="flex items-center justify-center text-2xl font-black text-slate-300">
@@ -1217,20 +1377,29 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
 
                             <div>
                               {isReadOnly ? (
-                                <div
-                                  className={`px-3 py-2 rounded-lg text-[9px] font-black uppercase tracking-tight truncate ${
-                                    isValueMapped ? 'bg-emerald-600 text-white' : 'bg-slate-100 text-slate-500'
-                                  }`}
-                                >
-                                  {mappedValue}
+                                <div className={`px-3 py-2 rounded-lg text-[9px] font-black uppercase tracking-tight truncate ${valuePalette.valueReadonly}`}>
+                                  {valueTone === 'notRequired' ? 'N/A' : mappedValue || '—'}
+                                  {targetValueDescription && valueTone !== 'notRequired' && (
+                                    <div className="mt-0.5 text-[8px] font-normal normal-case tracking-normal text-white/80 truncate" title={targetValueDescription}>
+                                      {targetValueDescription}
+                                    </div>
+                                  )}
                                 </div>
                               ) : (
-                                <ValueSelector
-                                  value={mappedValue}
-                                  options={candidateValuesForAttribute}
-                                  disabled={isReadOnly}
-                                  onChange={(newVal) => handleUpdateValue(f.featureId, v, newVal)}
-                                />
+                                <div className={`rounded-lg p-1 ${valuePalette.valueWrapper}`}>
+                                  <ValueSelector
+                                    tone={valueTone}
+                                    value={mappedValue}
+                                    options={candidateValuesForAttribute}
+                                    disabled={isReadOnly}
+                                    onChange={(newVal) => handleUpdateValue(f.featureId, v, newVal)}
+                                  />
+                                  {targetValueDescription && valueTone !== 'notRequired' && (
+                                    <div className="mt-1 text-[8px] font-normal normal-case tracking-normal text-slate-600 truncate" title={targetValueDescription}>
+                                      {targetValueDescription}
+                                    </div>
+                                  )}
+                                </div>
                               )}
                             </div>
                           </div>
@@ -1244,41 +1413,111 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
           })}
 
           {useNewClassTargetMapping && unmappedTargetAttributes.length > 0 && (
-            <div className="mt-4 space-y-2">
-              {unmappedTargetAttributes.map((attr, idx) => (
-                <div
-                  key={`unmapped-attr-${attr.attributeId}-${idx}`}
-                  className="grid grid-cols-[1fr_auto_1fr] gap-4 items-center"
-                >
-                  <div />
-                  <div className="flex items-center justify-center text-2xl font-black text-slate-300">
-                    →
-                  </div>
-                  <div className="space-y-1">
-                    <div className="px-3 py-1 border border-rose-200 bg-rose-50 text-rose-700 rounded-lg text-[9px] font-black uppercase tracking-tight truncate">
-                      {attr.attributeId}
+            <div className="mt-4">
+              <div
+                className={`rounded-xl shadow-sm border relative transition-all duration-300 hover:shadow-md ${unmappedTargetPalette.card}`}
+              >
+                <div className={`w-1.5 shrink-0 absolute left-0 top-0 bottom-0 rounded-l-xl ${unmappedTargetPalette.accent}`}></div>
+
+                <div className="p-5 pl-8 pr-6">
+                  <div className="flex items-start justify-between gap-6">
+                    <div className="flex items-start gap-2">
+                      <button
+                        type="button"
+                        onClick={() => setUnmappedTargetsExpanded(v => !v)}
+                        className="mt-0.5 inline-flex h-5 w-5 items-center justify-center rounded-full border border-slate-200 bg-white text-slate-400 hover:text-slate-700 hover:bg-slate-50 text-[10px] font-black"
+                        title={unmappedTargetsExpanded ? 'Collapse target-only attributes' : 'Expand target-only attributes'}
+                      >
+                        <svg
+                          className={`w-3 h-3 transition-transform ${unmappedTargetsExpanded ? 'rotate-90' : ''}`}
+                          fill="none"
+                          stroke="currentColor"
+                          viewBox="0 0 24 24"
+                        >
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M9 5l7 7-7 7" />
+                        </svg>
+                      </button>
+                      <div>
+                        <p className="text-sm font-black leading-tight text-rose-900">Target-only attributes</p>
+                        <p className="text-[9px] text-slate-400 font-bold uppercase tracking-wider mt-0.5">
+                          Attributes in this class that do not have a legacy source feature.
+                        </p>
+                      </div>
                     </div>
-                    <div>
-                      {isReadOnly ? (
-                        <div className="px-3 py-2 rounded-lg text-[9px] font-black uppercase tracking-tight truncate bg-slate-100 text-slate-500">
-                          {manualInputs[`UNMAPPED::${attr.attributeId}`] || ''}
-                        </div>
-                      ) : (
-                        <ValueSelector
-                          value={manualInputs[`UNMAPPED::${attr.attributeId}`] || ''}
-                          options={(() => {
-                            const base = attributeCandidateValues[attr.attributeId] || [];
-                            const withNotRequired = base.includes('NOT REQUIRED') ? base : [...base, 'NOT REQUIRED'];
-                            return withNotRequired;
-                          })()}
-                          disabled={isReadOnly}
-                          onChange={(val) => handleManualInputChange(`UNMAPPED::${attr.attributeId}`, val)}
-                        />
-                      )}
-                    </div>
                   </div>
+
+                  {unmappedTargetsExpanded && (
+                    <div className="mt-4 space-y-2">
+                      {unmappedTargetAttributes.map((attr, idx) => {
+                        const manualKey = `UNMAPPED::${attr.attributeId}`;
+                        const rawValue = manualInputs[manualKey] || '';
+                        const trimmedValue = (rawValue || '').trim();
+                        const toneForManual: Tone = !trimmedValue
+                          ? 'unmapped'
+                          : trimmedValue === 'NOT REQUIRED'
+                            ? 'notRequired'
+                            : 'mapped';
+
+                        if (showUnmappedOnly && toneForManual !== 'unmapped') {
+                          return null;
+                        }
+
+                        const manualPalette = toneTheme[toneForManual];
+
+                        return (
+                          <div
+                            key={`unmapped-attr-${attr.attributeId}-${idx}`}
+                            className="grid grid-cols-[auto_auto_auto] gap-2 items-center"
+                          >
+                            <div
+                              className={`px-3 py-1 border rounded-lg text-[9px] font-black uppercase tracking-tight truncate ${
+                                toneForManual === 'mapped'
+                                  ? 'border-emerald-200 bg-emerald-50 text-emerald-800'
+                                  : toneForManual === 'notRequired'
+                                    ? 'border-amber-200 bg-amber-50 text-amber-800'
+                                    : 'border-rose-200 bg-rose-50 text-rose-700'
+                              }`}
+                            >
+                              {attr.attributeId}
+                            </div>
+
+                            <div className="flex items-center justify-center text-lg font-black text-slate-300 px-1">
+                              →
+                            </div>
+
+                            <div>
+                              {isReadOnly ? (
+                                <div
+                                  className={`w-72 max-w-full px-3 py-2 rounded-lg text-[9px] font-black uppercase tracking-tight truncate ${manualPalette.valueReadonly}`}
+                                >
+                                  {toneForManual === 'notRequired' ? 'N/A' : trimmedValue || '—'}
+                                </div>
+                              ) : (
+                                <div className="rounded-lg p-1 bg-white border border-slate-200 w-72 max-w-full">
+                                  <ValueSelector
+                                    tone={toneForManual}
+                                    value={rawValue}
+                                    options={(() => {
+                                      let base = attributeCandidateValues[attr.attributeId] || [];
+                                      if (useNewClassTargetMapping && attr.allowedValues && attr.allowedValues.length > 0) {
+                                        base = attr.allowedValues;
+                                      }
+                                      const withNotRequired = base.includes('NOT REQUIRED') ? base : [...base, 'NOT REQUIRED'];
+                                      return withNotRequired;
+                                    })()}
+                                    disabled={isReadOnly}
+                                    onChange={(val) => handleManualInputChange(manualKey, val)}
+                                  />
+                                </div>
+                              )}
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
                 </div>
-              ))}
+              </div>
             </div>
           )}
         </div>

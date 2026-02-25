@@ -288,7 +288,12 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
       if (normalizeKey(attr.attributeId) !== normalizeKey(selectedAttributeId)) return attr;
       const existing = attr.allowedValues || [];
       if (existing.map(v => normalizeKey(v)).includes(normalizeKey(trimmed))) return attr;
-      return { ...attr, allowedValues: [...existing, trimmed] };
+      const nextValueDescriptions = { ...(attr.valueDescriptions || {}) };
+      // default new value's description to empty; can be populated via CSV
+      if (!nextValueDescriptions[trimmed]) {
+        nextValueDescriptions[trimmed] = '';
+      }
+      return { ...attr, allowedValues: [...existing, trimmed], valueDescriptions: nextValueDescriptions };
     });
     next[classIdx] = { ...next[classIdx], attributes: attrs };
     setLocalClassification(next);
@@ -299,6 +304,10 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
         setRemoteAttribute({
           ...remoteAttribute,
           allowedValues: [...existing, trimmed],
+          valueDescriptions: {
+            ...(remoteAttribute.valueDescriptions || {}),
+            [trimmed]: (remoteAttribute.valueDescriptions || {})[trimmed] || '',
+          },
         });
       }
     }
@@ -329,6 +338,7 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
       attributeId: trimmedId,
       description: rawDesc,
       allowedValues: [],
+      valueDescriptions: {},
     };
 
     next[classIdx] = {
@@ -352,7 +362,14 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
       if (normalizeKey(attr.attributeId) !== normalizeKey(selectedAttributeId)) return attr;
       const existing = attr.allowedValues || [];
       const filtered = existing.filter(v => normalizeKey(v) !== normalizeKey(valueToRemove));
-      return { ...attr, allowedValues: filtered };
+      const existingDescs = attr.valueDescriptions || {};
+      const nextDescs: Record<string, string> = {};
+      filtered.forEach(v => {
+        if (Object.prototype.hasOwnProperty.call(existingDescs, v)) {
+          nextDescs[v] = existingDescs[v];
+        }
+      });
+      return { ...attr, allowedValues: filtered, valueDescriptions: nextDescs };
     });
     next[classIdx] = { ...next[classIdx], attributes: attrs };
     setLocalClassification(next);
@@ -360,9 +377,17 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
     if (remoteAttribute && normalizeKey(remoteAttribute.attributeId) === normalizeKey(selectedAttributeId)) {
       const existing = remoteAttribute.allowedValues || [];
       const filtered = existing.filter(v => normalizeKey(v) !== normalizeKey(valueToRemove));
+      const existingDescs = remoteAttribute.valueDescriptions || {};
+      const nextDescs: Record<string, string> = {};
+      filtered.forEach(v => {
+        if (Object.prototype.hasOwnProperty.call(existingDescs, v)) {
+          nextDescs[v] = existingDescs[v];
+        }
+      });
       setRemoteAttribute({
         ...remoteAttribute,
         allowedValues: filtered,
+        valueDescriptions: nextDescs,
       });
     }
   };
@@ -525,13 +550,13 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
       ];
     } else if (category === 'classification' || category === 'values') {
       rows = [
-        ['classId', 'className', 'attributeId', 'attributeDescription', 'allowedValues'],
-        ['TABLE', 'TABLE', 'WIDTH', 'WIDTH', '1200|600'],
+        ['classId', 'className', 'attributeId', 'attributeDescription', 'allowedValues', 'valueDescriptions'],
+        ['TABLE', 'TABLE', 'WIDTH', 'WIDTH', '1200|600', 'Width 1200mm|Width 600mm'],
       ];
     } else if (category === 'bom') {
       rows = [
-        ['itemId', 'description', 'featureId', 'featureDescription', 'values'],
-        ['ITEM1', 'Sample Item', 'MMW', 'WIDTH', '1200|600'],
+        ['itemId', 'description', 'featureId', 'featureDescription', 'values', 'valueDescriptions'],
+        ['ITEM1', 'Sample Item', 'MMW', 'WIDTH', '1200|600', 'Width 1200mm|Width 600mm'],
       ];
     }
 
@@ -615,19 +640,41 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
               .split('|')
               .map(s => s.trim())
               .filter(Boolean);
+
+            const rawDescriptions = (r['valueDescriptions'] || '')
+              .split('|')
+              .map(s => s.trim());
+
+            const valueDescriptions: Record<string, string> = {};
+            allowedValues.forEach((v, idx) => {
+              const desc = rawDescriptions[idx] || '';
+              if (desc) {
+                valueDescriptions[v] = desc;
+              }
+            });
             const existingAttr = cls.attributes.find(a => a.attributeId === attributeId);
             if (!existingAttr) {
               cls.attributes.push({
                 attributeId,
                 description: r['attributeDescription'] || attributeId,
                 allowedValues,
+                valueDescriptions,
               });
             } else {
               const desc = existingAttr.description || r['attributeDescription'] || attributeId;
               const mergedValues = new Set<string>(existingAttr.allowedValues || []);
               allowedValues.forEach(v => mergedValues.add(v));
+
+              const existingDescs = existingAttr.valueDescriptions || {};
+              const mergedDescs: Record<string, string> = { ...existingDescs };
+              Object.entries(valueDescriptions).forEach(([val, d]) => {
+                if (d && !mergedDescs[val]) {
+                  mergedDescs[val] = d;
+                }
+              });
               existingAttr.description = desc;
               existingAttr.allowedValues = Array.from(mergedValues);
+              existingAttr.valueDescriptions = mergedDescs;
             }
           }
         });
@@ -663,21 +710,30 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
             .map(s => s.trim())
             .filter(Boolean);
 
+          const rawValueDescs = (r['valueDescriptions'] || '')
+            .split('|')
+            .map(s => s.trim());
+
           if (!rawValues.length) {
             return;
           }
 
           let feature = byItem[itemId].features.find(f => f.featureId === featureId);
           if (!feature) {
-            feature = { featureId, description: featureDescription, values: [] };
+            feature = { featureId, description: featureDescription, values: [], valueDescriptions: {} };
             byItem[itemId].features.push(feature);
           } else if (!feature.description && featureDescription) {
             feature.description = featureDescription;
           }
 
-          rawValues.forEach(v => {
+          rawValues.forEach((v, idx) => {
             if (!feature!.values.includes(v)) {
               feature!.values.push(v);
+            }
+            const desc = rawValueDescs[idx] || '';
+            if (desc) {
+              if (!feature!.valueDescriptions) feature!.valueDescriptions = {};
+              feature!.valueDescriptions[v] = desc;
             }
           });
         });
@@ -1367,24 +1423,34 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
                             ) : (selectedAttributeForDetail.allowedValues || []).length === 0 ? (
                               <span className="text-[8px] text-slate-400">No values</span>
                             ) : (
-                              (selectedAttributeForDetail.allowedValues || []).map(v => (
-                                <div
-                                  key={v}
-                                  className="relative inline-flex items-center group"
-                                >
-                                  <span className="px-2 py-0.5 pr-4 rounded-full bg-slate-100 text-slate-700 text-[8px] font-black uppercase tracking-widest">
-                                    {v}
-                                  </span>
-                                  <button
-                                    type="button"
-                                    onClick={() => removeAllowedValueFromSelected(v)}
-                                    className="absolute -right-1 -top-1 w-3.5 h-3.5 rounded-full bg-red-500 text-white flex items-center justify-center text-[7px] opacity-0 group-hover:opacity-100 shadow-sm transition-opacity"
-                                    title="Remove value"
+                              (selectedAttributeForDetail.allowedValues || []).map(v => {
+                                const descMap = selectedAttributeForDetail.valueDescriptions || {};
+                                const valDesc = descMap[v] || '';
+                                return (
+                                  <div
+                                    key={v}
+                                    className="relative inline-flex flex-col items-start group max-w-full"
                                   >
-                                    ×
-                                  </button>
-                                </div>
-                              ))
+                                    <span className="px-2 py-0.5 pr-4 rounded-full bg-slate-100 text-slate-700 text-[8px] font-black uppercase tracking-widest truncate max-w-full">
+                                      {v}
+                                    </span>
+                                    <span
+                                      className="mt-0.5 text-[8px] text-slate-400 truncate max-w-full"
+                                      title={valDesc || 'No value description'}
+                                    >
+                                      {valDesc || '—'}
+                                    </span>
+                                    <button
+                                      type="button"
+                                      onClick={() => removeAllowedValueFromSelected(v)}
+                                      className="absolute -right-1 -top-1 w-3.5 h-3.5 rounded-full bg-red-500 text-white flex items-center justify-center text-[7px] opacity-0 group-hover:opacity-100 shadow-sm transition-opacity"
+                                      title="Remove value"
+                                    >
+                                      ×
+                                    </button>
+                                  </div>
+                                );
+                              })
                             )}
                           </div>
                         </div>
@@ -1653,7 +1719,7 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
                         const idx = localBom.findIndex(i => i.itemId === selectedBomItem.itemId);
                         if (idx === -1) return;
                         const next = [...localBom];
-                        next[idx].features.push({ featureId: 'NEW_FEAT', description: 'New Feature', values: [] });
+                        next[idx].features.push({ featureId: 'NEW_FEAT', description: 'New Feature', values: [], valueDescriptions: {} });
                         setLocalBom(next);
                       }}
                       className="px-2 py-1 border border-dashed border-slate-300 rounded-md text-[8px] font-black text-slate-500 hover:text-slate-700 hover:border-slate-400 uppercase tracking-widest flex items-center gap-1 shrink-0"
@@ -1709,15 +1775,54 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
                           value={feat.values.join(', ')}
                           onChange={(e) => {
                             const next = [...localBom];
-                            next[parentIdx].features[fIdx].values = e.target.value
+                            const updatedValues = e.target.value
                               .split(',')
                               .map(s => s.trim())
                               .filter(Boolean);
+
+                            const existingDescs = next[parentIdx].features[fIdx].valueDescriptions || {};
+                            const nextDescs: Record<string, string> = {};
+                            updatedValues.forEach(v => {
+                              if (Object.prototype.hasOwnProperty.call(existingDescs, v)) {
+                                nextDescs[v] = existingDescs[v];
+                              }
+                            });
+
+                            next[parentIdx].features[fIdx].values = updatedValues;
+                            next[parentIdx].features[fIdx].valueDescriptions = nextDescs;
                             setLocalBom(next);
                           }}
                           placeholder="Values (comma separated)"
                           className="w-full text-[8px] text-slate-400 font-bold uppercase truncate bg-transparent outline-none focus:text-slate-600"
                         />
+
+                        {feat.values.length > 0 && (
+                          <div className="mt-2 space-y-1">
+                            {feat.values.map(v => {
+                              const descMap = feat.valueDescriptions || {};
+                              const current = descMap[v] || '';
+                              return (
+                                <div key={v} className="flex items-center gap-2">
+                                  <span className="px-2 py-0.5 rounded bg-slate-900 text-white text-[8px] font-black uppercase tracking-widest truncate max-w-[40%]">
+                                    {v}
+                                  </span>
+                                  <input
+                                    value={current}
+                                    onChange={(e) => {
+                                      const next = [...localBom];
+                                      const feature = next[parentIdx].features[fIdx];
+                                      if (!feature.valueDescriptions) feature.valueDescriptions = {};
+                                      feature.valueDescriptions[v] = e.target.value;
+                                      setLocalBom(next);
+                                    }}
+                                    placeholder="Value description"
+                                    className="flex-1 text-[8px] text-slate-600 bg-slate-50 border border-slate-200 rounded px-2 py-1 outline-none focus:border-indigo-400"
+                                  />
+                                </div>
+                              );
+                            })}
+                          </div>
+                        )}
                       </div>
                     );
                   })}

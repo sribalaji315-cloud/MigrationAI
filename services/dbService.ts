@@ -110,11 +110,12 @@ export const dbService = {
     return {
       attributeId: data.attributeId,
       description: data.description,
-      allowedValues: data.allowedValues || []
+      allowedValues: data.allowedValues || [],
+      valueDescriptions: data.valueDescriptions || {},
     };
   },
 
-  async saveAll(data: DatabaseState): Promise<ConnectionMode> {
+  async saveAll(data: DatabaseState, userRole: 'admin' | 'user' | undefined = 'user'): Promise<ConnectionMode> {
     const mode = await this.getConnectionMode();
     
     if (mode !== 'REMOTE_SQL' || !SQL_ENDPOINT) {
@@ -135,29 +136,36 @@ export const dbService = {
     }
 
     // After syncing the generic state, push classification list separately
-    try {
-      console.log('Sending classifications to bulk endpoint:', data.classifications);
-      const clsResp = await fetch(`${SQL_ENDPOINT}/classifications/bulk`, {
-        method: 'POST',
-        headers: { ...this._authHeaders(), 'Content-Type': 'application/json' },
-        body: JSON.stringify(data.classifications || [])
-      });
-      
-      if (clsResp.status === 403) {
-        alert('Only administrators are allowed to modify shared classifications.');
-        return 'REMOTE_SQL';
+    // but only when the current user is an administrator. Non-admin users
+    // should still be able to save BOM and mappings without hitting the
+    // admin-only classifications endpoint.
+    if (userRole === 'admin') {
+      try {
+        console.log('Sending classifications to bulk endpoint:', data.classifications);
+        const clsResp = await fetch(`${SQL_ENDPOINT}/classifications/bulk`, {
+          method: 'POST',
+          headers: { ...this._authHeaders(), 'Content-Type': 'application/json' },
+          body: JSON.stringify(data.classifications || [])
+        });
+        
+        if (clsResp.status === 403) {
+          alert('Only administrators are allowed to modify shared classifications.');
+          return 'REMOTE_SQL';
+        }
+        
+        if (!clsResp.ok) {
+          const errText = await clsResp.text();
+          console.error('Classifications bulk endpoint error:', clsResp.status, errText);
+          alert(`Failed to save classifications: ${errText}`);
+        } else {
+          console.log('Classifications saved successfully');
+        }
+      } catch (err) {
+        console.error('failed to sync classifications', err);
+        alert(`Error saving classifications: ${err}`);
       }
-      
-      if (!clsResp.ok) {
-        const errText = await clsResp.text();
-        console.error('Classifications bulk endpoint error:', clsResp.status, errText);
-        alert(`Failed to save classifications: ${errText}`);
-      } else {
-        console.log('Classifications saved successfully');
-      }
-    } catch (err) {
-      console.error('failed to sync classifications', err);
-      alert(`Error saving classifications: ${err}`);
+    } else {
+      console.log('Skipping classifications sync for non-admin user');
     }
     
     return 'REMOTE_SQL';

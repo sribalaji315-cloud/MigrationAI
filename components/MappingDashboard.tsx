@@ -80,6 +80,7 @@ const MappingDashboard: React.FC<MappingDashboardProps> = ({ bom, mappings, loca
 
     let totalFeatures = 0;
     let mappedFeatures = 0;
+    let totalNotRequiredFeatures = 0;
     let totalValues = 0;
     let mappedValues = 0;
     const totalItems = bom.length;
@@ -90,6 +91,7 @@ const MappingDashboard: React.FC<MappingDashboardProps> = ({ bom, mappings, loca
       description: string;
       totalFeatures: number;
       mappedFeatures: number;
+      notRequiredFeatures: number;
       totalValues: number;
       mappedValues: number;
       fullyMapped: boolean;
@@ -100,6 +102,7 @@ const MappingDashboard: React.FC<MappingDashboardProps> = ({ bom, mappings, loca
       const localForItem = localMappings[item.itemId] || [];
       let itemFeatures = 0;
       let itemMappedFeatures = 0;
+      let itemNotRequiredFeatures = 0;
       let itemValues = 0;
       let itemMappedValues = 0;
 
@@ -111,11 +114,14 @@ const MappingDashboard: React.FC<MappingDashboardProps> = ({ bom, mappings, loca
         const globalMapping = globalByFeature[feature.featureId];
         const effective = localMapping || globalMapping || null;
 
-        const attributeMapped = !!(
-          effective &&
-          effective.newAttributeId &&
-          effective.newAttributeId.toUpperCase() !== 'UNMAPPED'
-        );
+        const upperAttrId = (effective && effective.newAttributeId || '').toUpperCase();
+        const attributeNotRequired = !!(upperAttrId === 'NOT REQUIRED');
+        const attributeMapped = !!(upperAttrId && upperAttrId !== 'UNMAPPED' && upperAttrId !== 'NOT REQUIRED');
+
+        if (attributeNotRequired) {
+          totalNotRequiredFeatures += 1;
+          itemNotRequiredFeatures += 1;
+        }
 
         if (attributeMapped) {
           mappedFeatures += 1;
@@ -136,9 +142,11 @@ const MappingDashboard: React.FC<MappingDashboardProps> = ({ bom, mappings, loca
 
       // An item with no values (but with attribute-mapped features) is considered fully mapped.
       // An item with values must have all values mapped too.
+      const itemCoveredFeatures = itemMappedFeatures + itemNotRequiredFeatures;
+
       const itemFullyMapped =
         itemFeatures > 0 &&
-        itemFeatures === itemMappedFeatures &&
+        itemFeatures === itemCoveredFeatures &&
         (itemValues === 0 || itemValues === itemMappedValues);
 
       if (itemFullyMapped) {
@@ -150,13 +158,15 @@ const MappingDashboard: React.FC<MappingDashboardProps> = ({ bom, mappings, loca
         description: item.description || '',
         totalFeatures: itemFeatures,
         mappedFeatures: itemMappedFeatures,
+        notRequiredFeatures: itemNotRequiredFeatures,
         totalValues: itemValues,
         mappedValues: itemMappedValues,
         fullyMapped: itemFullyMapped,
       });
     });
 
-    const attributeCoverage = totalFeatures > 0 ? mappedFeatures / totalFeatures : 0;
+    const featuresRequiringMapping = totalFeatures - totalNotRequiredFeatures;
+    const attributeCoverage = featuresRequiringMapping > 0 ? mappedFeatures / featuresRequiringMapping : 0;
     const valueCoverage = totalValues > 0 ? mappedValues / totalValues : 0;
     const itemCoverage = totalItems > 0 ? itemsFullyMapped / totalItems : 0;
 
@@ -167,6 +177,7 @@ const MappingDashboard: React.FC<MappingDashboardProps> = ({ bom, mappings, loca
       mappedValues,
       totalItems,
       itemsFullyMapped,
+      totalNotRequiredFeatures,
       attributeCoverage,
       valueCoverage,
       itemCoverage,
@@ -215,7 +226,7 @@ const MappingDashboard: React.FC<MappingDashboardProps> = ({ bom, mappings, loca
               value={metrics.attributeCoverage}
               primaryColor="#22c55e"
               secondaryColor="#e5e7eb"
-              description={`${metrics.mappedFeatures.toLocaleString()} of ${metrics.totalFeatures.toLocaleString()} legacy features have a target attribute.`}
+              description={`${metrics.mappedFeatures.toLocaleString()} of ${(metrics.totalFeatures - metrics.totalNotRequiredFeatures).toLocaleString()} legacy features map to a target attribute (excluding NOT REQUIRED).`}
             />
             <DonutStat
               label="Value Mapping Coverage"
@@ -270,6 +281,7 @@ const MappingDashboard: React.FC<MappingDashboardProps> = ({ bom, mappings, loca
                     <th className="px-4 py-2 text-left font-black text-slate-500 uppercase tracking-widest text-[9px] w-40">Item ID</th>
                     <th className="px-4 py-2 text-left font-black text-slate-500 uppercase tracking-widest text-[9px]">Description</th>
                     <th className="px-4 py-2 text-center font-black text-slate-500 uppercase tracking-widest text-[9px]">Attrs</th>
+                    <th className="px-4 py-2 text-center font-black text-slate-500 uppercase tracking-widest text-[9px]">Not Req Attrs</th>
                     <th className="px-4 py-2 text-center font-black text-slate-500 uppercase tracking-widest text-[9px]">Values</th>
                     <th className="px-4 py-2 text-center font-black text-slate-500 uppercase tracking-widest text-[9px]">Status</th>
                   </tr>
@@ -277,10 +289,11 @@ const MappingDashboard: React.FC<MappingDashboardProps> = ({ bom, mappings, loca
                 <tbody>
                   {filteredItems.length === 0 ? (
                     <tr>
-                      <td colSpan={5} className="px-4 py-6 text-center text-slate-400 text-xs">No items match your filter.</td>
+                      <td colSpan={6} className="px-4 py-6 text-center text-slate-400 text-xs">No items match your filter.</td>
                     </tr>
                   ) : filteredItems.map(it => {
-                    const attrPct = it.totalFeatures > 0 ? Math.round((it.mappedFeatures / it.totalFeatures) * 100) : 100;
+                    const mappableAttrs = Math.max(0, it.totalFeatures - it.notRequiredFeatures);
+                    const attrPct = mappableAttrs > 0 ? Math.round((it.mappedFeatures / mappableAttrs) * 100) : 100;
                     const valPct = it.totalValues > 0 ? Math.round((it.mappedValues / it.totalValues) * 100) : 100;
                     return (
                       <tr key={it.itemId} className="border-b border-slate-50 hover:bg-slate-50 transition-colors">
@@ -288,8 +301,11 @@ const MappingDashboard: React.FC<MappingDashboardProps> = ({ bom, mappings, loca
                         <td className="px-4 py-2 text-slate-600 max-w-xs truncate" title={it.description}>{it.description || '—'}</td>
                         <td className="px-4 py-2 text-center">
                           <span className={`font-bold ${attrPct === 100 ? 'text-green-600' : attrPct >= 50 ? 'text-amber-500' : 'text-red-500'}`}>
-                            {it.mappedFeatures}/{it.totalFeatures}
+                            {it.mappedFeatures}/{mappableAttrs}
                           </span>
+                        </td>
+                        <td className="px-4 py-2 text-center text-slate-600 font-semibold">
+                          {it.notRequiredFeatures}
                         </td>
                         <td className="px-4 py-2 text-center">
                           <span className={`font-bold ${valPct === 100 ? 'text-green-600' : valPct >= 50 ? 'text-amber-500' : 'text-red-500'}`}>

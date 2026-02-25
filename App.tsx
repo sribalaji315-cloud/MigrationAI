@@ -1,5 +1,5 @@
 
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useMemo } from 'react';
 import BOMHeader from './components/BOMHeader';
 import ItemSidebar from './components/ItemSidebar';
 import MappingWorkspace from './components/MappingWorkspace';
@@ -8,6 +8,10 @@ import MappingDashboard from './components/MappingDashboard';
 import LoginSignUp from './components/LoginSignUp';
 import { dbService } from './services/dbService';
 import { GlobalMapping, DataCategory, DatabaseState, User, ConnectionMode, LocalItemMappings, FeatureFlags, ClassAttributeValues } from './types';
+
+type ItemStatus = 'mapped' | 'unmapped' | 'notRequired';
+
+const normalizeAttrId = (id: string) => (id || '').replace(/[^A-Za-z0-9]/g, '').toUpperCase();
 
 const App: React.FC = () => {
   const [currentUser, setCurrentUser] = useState<User | null>(null);
@@ -96,7 +100,7 @@ const App: React.FC = () => {
       },
     };
 
-    const newMode = await dbService.saveAll(nextState);
+    const newMode = await dbService.saveAll(nextState, currentUser?.role);
     setConnectionMode(newMode);
     setDbState(nextState);
     setIsRefreshing(false);
@@ -128,11 +132,119 @@ const App: React.FC = () => {
     if (category === 'bom') nextState.bom = updatedData;
     if (category === 'users') nextState.users = updatedData;
 
-    const newMode = await dbService.saveAll(nextState);
+    const newMode = await dbService.saveAll(nextState, currentUser?.role);
     setConnectionMode(newMode);
     setDbState(nextState);
     setActiveInspector(null);
   };
+
+  const selectedItem = (dbState?.bom || []).find(item => item.itemId === selectedItemId) || null;
+
+  const itemStatuses = useMemo(() => {
+    if (!dbState) return {} as Record<string, ItemStatus>;
+
+    const classAttrMap = new Map<string, Set<string>>();
+    (dbState.classifications || []).forEach(cls => {
+      classAttrMap.set(
+        cls.classId,
+        new Set((cls.attributes || []).map(attr => normalizeAttrId(attr.attributeId)))
+      );
+    });
+
+    const globalByFeature = new Map<string, GlobalMapping>();
+    (dbState.mappings || []).forEach(mapping => {
+      mapping.legacyFeatureIds.forEach(id => {
+        globalByFeature.set(id, mapping);
+      });
+    });
+
+    const localByItem: Record<string, Map<string, GlobalMapping>> = {};
+    Object.entries(dbState.localMappings || {}).forEach(([itemId, mappings]) => {
+      const featureMap = new Map<string, GlobalMapping>();
+      mappings.forEach(map => {
+        map.legacyFeatureIds.forEach(id => featureMap.set(id, map));
+      });
+      localByItem[itemId] = featureMap;
+    });
+
+    const statusMap: Record<string, ItemStatus> = {};
+
+    (dbState.bom || []).forEach(item => {
+      const classId = (dbState.itemClassifications || {})[item.itemId] || 'UNCLASSIFIED';
+      const classKeys = classAttrMap.get(classId) || new Set<string>();
+      const localOverrides = localByItem[item.itemId] || new Map<string, GlobalMapping>();
+
+      let hasUnmapped = false;
+      let anyMapped = false;
+      let allNotRequired = item.features.length > 0;
+
+      item.features.forEach(feature => {
+        const localOverride = localOverrides.get(feature.featureId);
+        const globalMapping = globalByFeature.get(feature.featureId);
+
+        const collectCandidates = (source?: string | null) => {
+          if (!source) return [] as string[];
+          return source
+            .split(';')
+            .map(s => s.trim())
+            .filter(Boolean);
+        };
+
+        const candidateFromLocal = localOverride &&
+          localOverride.newAttributeId &&
+          localOverride.newAttributeId !== 'UNMAPPED' &&
+          localOverride.newAttributeId !== 'NOT REQUIRED'
+            ? localOverride.newAttributeId
+            : '';
+
+        const fallbackCandidates = collectCandidates(candidateFromLocal || globalMapping?.newAttributeId || '');
+
+        let selectedAttribute = localOverride?.newAttributeId || (fallbackCandidates[0] || 'UNMAPPED');
+
+        if (featureFlags.useNewClassTargetMapping && classId !== 'UNCLASSIFIED' && classKeys.size > 0) {
+          const matched = fallbackCandidates.find(attr => classKeys.has(normalizeAttrId(attr)));
+          if (matched) {
+            selectedAttribute = matched;
+          } else if (
+            selectedAttribute &&
+            selectedAttribute !== 'UNMAPPED' &&
+            selectedAttribute !== 'NOT REQUIRED'
+          ) {
+            selectedAttribute = 'UNMAPPED';
+          }
+        }
+
+        const effectiveMapping = localOverride || globalMapping;
+
+        if (selectedAttribute === 'UNMAPPED' || !effectiveMapping) {
+          hasUnmapped = true;
+          allNotRequired = false;
+        } else if (selectedAttribute === 'NOT REQUIRED') {
+          // keep yellow state
+        } else {
+          anyMapped = true;
+          allNotRequired = false;
+        }
+
+        if (selectedAttribute !== 'UNMAPPED' && selectedAttribute !== 'NOT REQUIRED') {
+          feature.values.forEach(val => {
+            if (!effectiveMapping?.valueMappings || effectiveMapping.valueMappings[val] == null) {
+              hasUnmapped = true;
+            }
+          });
+        }
+      });
+
+      let status: ItemStatus;
+      if (hasUnmapped) status = 'unmapped';
+      else if (!anyMapped && allNotRequired) status = 'notRequired';
+      else status = 'mapped';
+
+      statusMap[item.itemId] = status;
+    });
+
+    return statusMap;
+  }, [dbState, featureFlags.useNewClassTargetMapping]);
 
   if (!currentUser) {
     return <LoginSignUp onLogin={handleLogin} />;
@@ -147,7 +259,6 @@ const App: React.FC = () => {
     </div>
   );
 
-  const selectedItem = dbState.bom.find(item => item.itemId === selectedItemId) || null;
   const currentLock = selectedItemId ? dbState.locks[selectedItemId] : null;
   const isLockedByMe = currentLock?.userId === currentUser.userId;
 
@@ -191,6 +302,7 @@ const App: React.FC = () => {
           onSelect={setSelectedItemId} 
           locks={dbState.locks}
           currentUserId={currentUser.userId}
+          itemStatuses={itemStatuses}
         />
         
         <MappingWorkspace 

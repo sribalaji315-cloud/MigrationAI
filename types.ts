@@ -13,6 +13,8 @@ export interface LegacyFeature {
   featureId: string;
   description: string;
   values: string[];
+  // Optional per-value descriptions, keyed by raw value
+  valueDescriptions?: Record<string, string>;
 }
 
 export interface LegacyItem {
@@ -25,6 +27,8 @@ export interface NewAttribute {
   attributeId: string;
   description: string;
   allowedValues?: string[];
+  // Optional per-value descriptions, keyed by allowed value
+  valueDescriptions?: Record<string, string>;
 }
 
 export interface NewClassification {

@@ -25,7 +25,8 @@ function parseCSVToBom(text: string): LegacyItem[] {
     itemDesc: headers.indexOf('itemdescription') >= 0 ? headers.indexOf('itemdescription') : headers.indexOf('item_description'),
     featureId: headers.indexOf('featureid') >= 0 ? headers.indexOf('featureid') : headers.indexOf('feature_id'),
     featureDesc: headers.indexOf('featuredescription') >= 0 ? headers.indexOf('featuredescription') : headers.indexOf('feature_description'),
-    featureValue: headers.indexOf('featurevalue') >= 0 ? headers.indexOf('featurevalue') : headers.indexOf('feature_value')
+    featureValue: headers.indexOf('featurevalue') >= 0 ? headers.indexOf('featurevalue') : headers.indexOf('feature_value'),
+    featureValueDesc: headers.indexOf('valuedescription') >= 0 ? headers.indexOf('valuedescription') : headers.indexOf('value_description'),
   } as Record<string, number>;
 
   // fallback to common names if not found
@@ -42,6 +43,7 @@ function parseCSVToBom(text: string): LegacyItem[] {
     const fId = cols[idx.featureId] ?? '';
     const fDesc = cols[idx.featureDesc] ?? '';
     const fVal = cols[idx.featureValue] ?? '';
+    const fValDesc = idx.featureValueDesc >= 0 ? (cols[idx.featureValueDesc] ?? '') : '';
 
     if (!itemsMap[itemId]) {
       itemsMap[itemId] = { item: { itemId, description: itemDesc, features: [] }, featuresMap: {} };
@@ -50,11 +52,16 @@ function parseCSVToBom(text: string): LegacyItem[] {
     if (fId) {
       let feat = itemsMap[itemId].featuresMap[fId];
       if (!feat) {
-        feat = { featureId: fId, description: fDesc || fId, values: [] };
+        feat = { featureId: fId, description: fDesc || fId, values: [], valueDescriptions: {} };
         itemsMap[itemId].featuresMap[fId] = feat;
         itemsMap[itemId].item.features.push(feat);
       }
-      if (fVal && !feat.values.includes(fVal)) feat.values.push(fVal);
+      if (fVal && !feat.values.includes(fVal)) {
+        feat.values.push(fVal);
+        if (fValDesc) {
+          (feat.valueDescriptions as Record<string, string>)[fVal] = fValDesc;
+        }
+      }
     }
   }
 
