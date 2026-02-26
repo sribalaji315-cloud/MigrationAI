@@ -216,7 +216,17 @@ const App: React.FC = () => {
     if (!dbState) return [];
     setIsRefreshing(true);
     try {
-      const items = await dbService.fetchBomItems(category, productType);
+      const pageSize = 500;
+      let offset = 0;
+      let items: DatabaseState['bom'] = [];
+
+      while (true) {
+        const batch = await dbService.fetchBomItems(category, productType, { limit: pageSize, offset });
+        items = items.concat(batch);
+        if (batch.length < pageSize) break;
+        offset += pageSize;
+      }
+
       setDbState(prev => {
         if (!prev) return prev;
         const lockedIds = new Set(

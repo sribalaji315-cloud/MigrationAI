@@ -4,6 +4,7 @@ import { GlobalMapping, DatabaseState, User, ConnectionMode, NewAttribute } from
 // Backend API endpoint: in production use Vite env `VITE_SQL_API_ENDPOINT`,
 // otherwise fall back to local FastAPI for development.
 const SQL_ENDPOINT = import.meta.env.VITE_SQL_API_ENDPOINT || 'http://localhost:8000';
+const MODE_CACHE_TTL_MS = 15000;
 
 const DEFAULT_ADMIN: User = {
   userId: 'USR-ADMIN',
@@ -15,18 +16,41 @@ const DEFAULT_ADMIN: User = {
 const TOKEN_KEY = 'erp_migrator_token';
 
 export const dbService = {
+  _modeCache: null as ConnectionMode | null,
+  _modeCacheExpiresAt: 0,
+  _modePromise: null as Promise<ConnectionMode> | null,
+
   async getConnectionMode(): Promise<ConnectionMode> {
     if (!SQL_ENDPOINT) return 'LOCAL_MOCK';
-    try {
-      const controller = new AbortController();
-      const id = setTimeout(() => controller.abort(), 2000); // 2s timeout for SQL probe
-      const headers = this._authHeaders();
-      const response = await fetch(`${SQL_ENDPOINT}/health`, { signal: controller.signal, headers });
-      clearTimeout(id);
-      return response.ok ? 'REMOTE_SQL' : 'LOCAL_MOCK';
-    } catch {
-      return 'LOCAL_MOCK';
+    const now = Date.now();
+    if (this._modeCache && this._modeCacheExpiresAt > now) {
+      return this._modeCache;
     }
+    if (this._modePromise) {
+      return this._modePromise;
+    }
+
+    this._modePromise = (async () => {
+      try {
+        const controller = new AbortController();
+        const id = setTimeout(() => controller.abort(), 2000); // 2s timeout for SQL probe
+        const headers = this._authHeaders();
+        const response = await fetch(`${SQL_ENDPOINT}/health`, { signal: controller.signal, headers });
+        clearTimeout(id);
+        const mode: ConnectionMode = response.ok ? 'REMOTE_SQL' : 'LOCAL_MOCK';
+        this._modeCache = mode;
+        this._modeCacheExpiresAt = Date.now() + MODE_CACHE_TTL_MS;
+        return mode;
+      } catch {
+        this._modeCache = 'LOCAL_MOCK';
+        this._modeCacheExpiresAt = Date.now() + MODE_CACHE_TTL_MS;
+        return 'LOCAL_MOCK';
+      } finally {
+        this._modePromise = null;
+      }
+    })();
+
+    return this._modePromise;
   },
 
   _authHeaders(): Record<string,string> {
@@ -150,13 +174,15 @@ export const dbService = {
     return resp.json();
   },
 
-  async fetchBomItems(category?: string, productType?: string): Promise<DatabaseState['bom']> {
+  async fetchBomItems(category?: string, productType?: string, options?: { limit?: number; offset?: number }): Promise<DatabaseState['bom']> {
     if (!SQL_ENDPOINT) {
       throw new Error('Database connection not available.');
     }
     const params = new URLSearchParams();
     if (category) params.set('category', category);
     if (productType) params.set('productType', productType);
+    if (options?.limit) params.set('limit', String(options.limit));
+    if (options?.offset) params.set('offset', String(options.offset));
     const query = params.toString();
     const resp = await fetch(`${SQL_ENDPOINT}/bom/items${query ? `?${query}` : ''}`, { headers: this._authHeaders() });
     if (!resp.ok) {

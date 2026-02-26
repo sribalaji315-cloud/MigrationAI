@@ -13,7 +13,7 @@ interface DataInspectorProps {
     bom: LegacyItem[];
     users: User[];
   };
-  onSave: (category: DataCategory, updatedData: any) => void;
+  onSave: (category: DataCategory, updatedData: any) => void | Promise<void>;
   onSwitchUser?: (user: User) => void;
   currentUser: User; // used to determine admin privileges
   bomFilters?: { categories: string[]; productTypes: string[] };
@@ -142,13 +142,26 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
   const [isAttributeLoading, setIsAttributeLoading] = useState(false);
   const [isCsvImporting, setIsCsvImporting] = useState(false);
   const [csvImportProgress, setCsvImportProgress] = useState(0);
+  const [isSaving, setIsSaving] = useState(false);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
+  const cloneData = <T,>(value: T): T => {
+    if (typeof structuredClone === 'function') {
+      return structuredClone(value);
+    }
+    return JSON.parse(JSON.stringify(value));
+  };
+
   useEffect(() => {
-    setLocalMapping(JSON.parse(JSON.stringify(data.mapping)));
-    setLocalClassification(JSON.parse(JSON.stringify(data.classification)));
-    setLocalBom(JSON.parse(JSON.stringify(data.bom)));
-    setLocalUsers(JSON.parse(JSON.stringify(data.users || [])));
+    const needsMapping = category === 'mapping';
+    const needsClassification = category === 'classification' || category === 'values';
+    const needsBom = category === 'bom' || category === 'mapping';
+    const needsUsers = category === 'users';
+
+    setLocalMapping(needsMapping ? cloneData(data.mapping) : []);
+    setLocalClassification(needsClassification ? cloneData(data.classification) : []);
+    setLocalBom(needsBom ? cloneData(data.bom) : []);
+    setLocalUsers(needsUsers ? cloneData(data.users || []) : []);
     setBomCategory('');
     setBomProductType('');
     setIsBomSyncing(false);
@@ -896,11 +909,19 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
     }
   };
 
-  const handleSave = () => {
-    if (category === 'mapping') onSave('mapping', localMapping);
-    if (category === 'classification' || category === 'values') onSave('classification', localClassification);
-    if (category === 'bom') onSave('bom', localBom);
-    if (category === 'users') onSave('users', localUsers);
+  const handleSave = async () => {
+    setIsSaving(true);
+    try {
+      if (category === 'mapping') await onSave('mapping', localMapping);
+      if (category === 'classification' || category === 'values') await onSave('classification', localClassification);
+      if (category === 'bom') await onSave('bom', localBom);
+      if (category === 'users') await onSave('users', localUsers);
+    } catch (err: any) {
+      console.error('Failed to synchronize data', err);
+      alert(`Synchronize failed: ${err?.message || String(err)}`);
+    } finally {
+      setIsSaving(false);
+    }
   };
 
   const addRootRow = () => {
@@ -2115,16 +2136,29 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
         )}
 
         {/* Footer */}
-        <div className="px-6 py-4 bg-white border-t border-slate-100 flex justify-end gap-3 shrink-0">
-          <button onClick={onClose} className="px-5 py-2 text-[10px] font-black text-slate-400 hover:text-slate-600 transition-colors uppercase tracking-widest">
+        <div className="px-6 py-4 bg-white border-t border-slate-100 flex items-center gap-3 shrink-0">
+          {isSaving && (
+            <div className="flex-1 mr-auto">
+              <div className="text-[9px] font-bold uppercase text-slate-500 tracking-widest mb-1">Synchronizing...</div>
+              <div className="h-1.5 w-full bg-slate-100 rounded-full overflow-hidden">
+                <div className="h-full w-2/3 bg-blue-600 animate-pulse rounded-full" />
+              </div>
+            </div>
+          )}
+          <button
+            onClick={onClose}
+            disabled={isSaving}
+            className="px-5 py-2 text-[10px] font-black text-slate-400 hover:text-slate-600 transition-colors uppercase tracking-widest disabled:opacity-60 disabled:cursor-not-allowed"
+          >
             Discard
           </button>
           {currentUser.role === 'admin' && hasCsvUploaded && (
             <button 
               onClick={handleSave}
-              className="px-6 py-2 bg-blue-600 text-white rounded-lg text-[10px] font-black hover:bg-blue-700 shadow-md transition-all active:scale-95 uppercase tracking-widest"
+              disabled={isSaving}
+              className="px-6 py-2 bg-blue-600 text-white rounded-lg text-[10px] font-black hover:bg-blue-700 shadow-md transition-all active:scale-95 uppercase tracking-widest disabled:opacity-60 disabled:cursor-not-allowed"
             >
-              Synchronize
+              {isSaving ? 'Synchronizing...' : 'Synchronize'}
             </button>
           )}
         </div>

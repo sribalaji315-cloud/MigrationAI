@@ -240,6 +240,8 @@ def _build_bom_payload(db_items: List[models.BomItem]) -> List[Dict[str, Any]]:
 def get_bom_items(
     category: Optional[str] = None,
     productType: Optional[str] = None,
+    limit: int = Query(0, ge=0, le=5000),
+    offset: int = Query(0, ge=0),
     db: Session = Depends(get_db),
 ):
     query = db.query(models.BomItem).options(selectinload(models.BomItem.features))
@@ -247,6 +249,10 @@ def get_bom_items(
         query = query.filter(models.BomItem.category == category)
     if productType:
         query = query.filter(models.BomItem.product_type == productType)
+
+    query = query.order_by(models.BomItem.item_id)
+    if limit:
+        query = query.limit(limit).offset(offset)
 
     db_items = query.all()
     return _build_bom_payload(db_items)
