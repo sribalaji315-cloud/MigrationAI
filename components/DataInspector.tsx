@@ -1,6 +1,6 @@
 
 import React, { useState, useEffect, useRef, useMemo } from 'react';
-import { DataCategory, GlobalMapping, NewClassification, NewAttribute, LegacyItem, LegacyFeature, User } from '../types';
+import { DataCategory, GlobalMapping, NewClassification, NewAttribute, LegacyItem, LegacyFeature, User, ItemLock } from '../types';
 import { dbService } from '../services/dbService';
 
 interface DataInspectorProps {
@@ -16,6 +16,10 @@ interface DataInspectorProps {
   onSave: (category: DataCategory, updatedData: any) => void;
   onSwitchUser?: (user: User) => void;
   currentUser: User; // used to determine admin privileges
+  bomFilters?: { categories: string[]; productTypes: string[] };
+  onFetchBomItems?: (category?: string, productType?: string) => Promise<LegacyItem[]>;
+  locks?: Record<string, ItemLock>;
+  onSignOnItem?: (itemId: string) => Promise<void>;
 }
 
 interface LegacyValueSelectorProps {
@@ -112,12 +116,18 @@ const LegacyValueSelector: React.FC<LegacyValueSelectorProps> = ({ value, option
   );
 };
 
-const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, onSave, onSwitchUser, currentUser }) => {
+const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, onSave, onSwitchUser, currentUser, bomFilters, onFetchBomItems, locks, onSignOnItem }) => {
   const normalizeKey = (value?: string | null) => (value || '').trim().toLowerCase();
   const [localMapping, setLocalMapping] = useState<GlobalMapping[]>([]);
   const [localClassification, setLocalClassification] = useState<NewClassification[]>([]);
   const [localBom, setLocalBom] = useState<LegacyItem[]>([]);
+  const [hasCsvUploaded, setHasCsvUploaded] = useState(false);
   const [localUsers, setLocalUsers] = useState<User[]>([]);
+  const [bomCategory, setBomCategory] = useState('');
+  const [bomProductType, setBomProductType] = useState('');
+  const [isBomSyncing, setIsBomSyncing] = useState(false);
+  const [availableCategories, setAvailableCategories] = useState<string[]>([]);
+  const [availableProductTypes, setAvailableProductTypes] = useState<string[]>([]);
   const [page, setPage] = useState(0);
   const [mappingSearch, setMappingSearch] = useState('');
   const [bomSearch, setBomSearch] = useState('');
@@ -139,6 +149,11 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
     setLocalClassification(JSON.parse(JSON.stringify(data.classification)));
     setLocalBom(JSON.parse(JSON.stringify(data.bom)));
     setLocalUsers(JSON.parse(JSON.stringify(data.users || [])));
+    setBomCategory('');
+    setBomProductType('');
+    setIsBomSyncing(false);
+    setAvailableCategories(bomFilters?.categories || []);
+    setAvailableProductTypes(bomFilters?.productTypes || []);
     setPage(0);
     setMappingSearch('');
     setBomSearch('');
@@ -151,7 +166,27 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
     setSelectedAttributeId(null);
     setRemoteAttribute(null);
     setIsAttributeLoading(false);
-  }, [data, category]);
+  }, [data, category, bomFilters]);
+
+  const refreshBomFilters = async (nextCategory: string, nextProductType: string) => {
+    try {
+      const filters = await dbService.fetchBomFilters({
+        category: nextCategory || undefined,
+        productType: nextProductType || undefined,
+      });
+      setAvailableCategories(filters.categories || []);
+      setAvailableProductTypes(filters.productTypes || []);
+
+      if (nextCategory && !(filters.categories || []).includes(nextCategory)) {
+        setBomCategory('');
+      }
+      if (nextProductType && !(filters.productTypes || []).includes(nextProductType)) {
+        setBomProductType('');
+      }
+    } catch (err) {
+      console.warn('Failed to refresh BOM filters', err);
+    }
+  };
 
   const titles = {
     mapping: 'Global Mapping Table',
@@ -337,6 +372,7 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
     const newAttr: NewAttribute = {
       attributeId: trimmedId,
       description: rawDesc,
+      unit: '',
       allowedValues: [],
       valueDescriptions: {},
     };
@@ -388,6 +424,28 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
         ...remoteAttribute,
         allowedValues: filtered,
         valueDescriptions: nextDescs,
+      });
+    }
+  };
+
+  const updateSelectedAttributeUnit = (nextUnit: string) => {
+    if (!selectedClassId || !selectedAttributeId) return;
+
+    const classIdx = localClassification.findIndex(c => c.classId === selectedClassId);
+    if (classIdx === -1) return;
+
+    const next = [...localClassification];
+    const attrs = next[classIdx].attributes.map(attr => {
+      if (normalizeKey(attr.attributeId) !== normalizeKey(selectedAttributeId)) return attr;
+      return { ...attr, unit: nextUnit };
+    });
+    next[classIdx] = { ...next[classIdx], attributes: attrs };
+    setLocalClassification(next);
+
+    if (remoteAttribute && normalizeKey(remoteAttribute.attributeId) === normalizeKey(selectedAttributeId)) {
+      setRemoteAttribute({
+        ...remoteAttribute,
+        unit: nextUnit,
       });
     }
   };
@@ -486,6 +544,8 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
 
   // Robust CSV line splitter that handles quoted fields with commas
   const splitCsvLine = (line: string): string[] => {
+    // Fast path: no quotes in this line — plain split is ~10x faster
+    if (line.indexOf('"') === -1) return line.split(',');
     const result: string[] = [];
     let current = '';
     let inQuotes = false;
@@ -550,13 +610,13 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
       ];
     } else if (category === 'classification' || category === 'values') {
       rows = [
-        ['classId', 'className', 'attributeId', 'attributeDescription', 'allowedValues', 'valueDescriptions'],
-        ['TABLE', 'TABLE', 'WIDTH', 'WIDTH', '1200|600', 'Width 1200mm|Width 600mm'],
+        ['classId', 'className', 'attributeId', 'attributeDescription', 'unit', 'allowedValues', 'valueDescriptions'],
+        ['TABLE', 'TABLE', 'WIDTH', 'WIDTH', 'MM', '1200|600', 'Width 1200mm|Width 600mm'],
       ];
     } else if (category === 'bom') {
       rows = [
-        ['itemId', 'description', 'featureId', 'featureDescription', 'values', 'valueDescriptions'],
-        ['ITEM1', 'Sample Item', 'MMW', 'WIDTH', '1200|600', 'Width 1200mm|Width 600mm'],
+        ['itemId', 'description', 'category', 'productType', 'featureId', 'featureDescription', 'unit', 'values', 'valueDescriptions'],
+        ['ITEM1', 'Sample Item', 'TABLES', 'DINING', 'MMW', 'WIDTH', 'MM', '1200|600', 'Width 1200mm|Width 600mm'],
       ];
     }
 
@@ -588,8 +648,17 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
       setCsvImportProgress(10);
       const text = await file.text();
       setCsvImportProgress(40);
-      const rows = parseCsv(text);
-      if (!rows.length) {
+
+      // Classification uses its own optimised parser — skip the generic parseCsv to avoid
+      // building 40,000 intermediate row objects.
+      const needsGenericParse = category !== 'classification' && category !== 'values';
+      const rows = needsGenericParse ? parseCsv(text) : [];
+      if (needsGenericParse && !rows.length) {
+        alert('CSV file is empty or has no data rows.');
+        setIsCsvImporting(false);
+        return;
+      }
+      if (!needsGenericParse && text.trim().split(/\r?\n/).length < 2) {
         alert('CSV file is empty or has no data rows.');
         setIsCsvImporting(false);
         return;
@@ -622,63 +691,103 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
           }
         });
         setLocalMapping(existing);
+        setHasCsvUploaded(true);
       } else if (category === 'classification' || category === 'values') {
-        const next = JSON.parse(JSON.stringify(localClassification)) as NewClassification[];
+        // --- Optimised path: Map-based O(1) lookups + no intermediate row objects + async batching ---
+        const BATCH = 2000; // yield to UI every N rows
+        const yield_ = () => new Promise<void>(res => setTimeout(res, 0));
 
-        rows.forEach(r => {
-          const classId = r['classId'] || '';
-          const className = r['className'] || classId || 'New Classification';
-          if (!classId) return;
-          let cls = next.find(c => c.classId === classId);
+        // Pre-split all lines once (strip \r)
+        const allLines = text.split('\n');
+        const headerLine = allLines[0].replace(/\r$/, '');
+        const headers = splitCsvLine(headerLine).map(h => h.trim());
+
+        const iClassId      = headers.indexOf('classId');
+        const iClassName    = headers.indexOf('className');
+        const iAttrId       = headers.indexOf('attributeId');
+        const iAttrDesc     = headers.indexOf('attributeDescription');
+        const iUnit         = headers.indexOf('unit');
+        const iAllowed      = headers.indexOf('allowedValues');
+        const iValueDesc    = headers.indexOf('valueDescriptions');
+
+        // Seed Maps from existing data (deep-clone once upfront)
+        const seedData = JSON.parse(JSON.stringify(localClassification)) as NewClassification[];
+        const classMap = new Map<string, NewClassification>();
+        const attrMapByClass = new Map<string, Map<string, any>>();
+        seedData.forEach(cls => {
+          classMap.set(cls.classId, cls);
+          const am = new Map<string, any>();
+          cls.attributes.forEach(a => am.set(a.attributeId, a));
+          attrMapByClass.set(cls.classId, am);
+        });
+
+        let processed = 0;
+        for (let i = 1; i < allLines.length; i++) {
+          const line = allLines[i].replace(/\r$/, '');
+          if (!line.trim()) continue;
+
+          const cols = splitCsvLine(line);
+          const classId  = iClassId  >= 0 ? (cols[iClassId]  ?? '').trim() : '';
+          if (!classId) continue;
+
+          let cls = classMap.get(classId);
           if (!cls) {
+            const className = iClassName >= 0 ? (cols[iClassName] ?? '').trim() || classId : classId;
             cls = { classId, className, attributes: [] };
-            next.push(cls);
+            classMap.set(classId, cls);
+            attrMapByClass.set(classId, new Map());
           }
-          const attributeId = r['attributeId'] || '';
-          if (attributeId) {
-            const allowedValues = (r['allowedValues'] || '')
-              .split('|')
-              .map(s => s.trim())
-              .filter(Boolean);
 
-            const rawDescriptions = (r['valueDescriptions'] || '')
-              .split('|')
-              .map(s => s.trim());
+          const attributeId = iAttrId >= 0 ? (cols[iAttrId] ?? '').trim() : '';
+          if (!attributeId) continue;
 
-            const valueDescriptions: Record<string, string> = {};
-            allowedValues.forEach((v, idx) => {
-              const desc = rawDescriptions[idx] || '';
-              if (desc) {
-                valueDescriptions[v] = desc;
-              }
-            });
-            const existingAttr = cls.attributes.find(a => a.attributeId === attributeId);
-            if (!existingAttr) {
-              cls.attributes.push({
-                attributeId,
-                description: r['attributeDescription'] || attributeId,
-                allowedValues,
-                valueDescriptions,
-              });
-            } else {
-              const desc = existingAttr.description || r['attributeDescription'] || attributeId;
-              const mergedValues = new Set<string>(existingAttr.allowedValues || []);
-              allowedValues.forEach(v => mergedValues.add(v));
+          const unit          = iUnit     >= 0 ? (cols[iUnit]     ?? '').trim() : '';
+          const allowedRaw    = iAllowed  >= 0 ? (cols[iAllowed]  ?? '').trim() : '';
+          const valueDescRaw  = iValueDesc >= 0 ? (cols[iValueDesc] ?? '').trim() : '';
+          const attrDescRaw   = iAttrDesc  >= 0 ? (cols[iAttrDesc]  ?? '').trim() : '';
 
-              const existingDescs = existingAttr.valueDescriptions || {};
-              const mergedDescs: Record<string, string> = { ...existingDescs };
-              Object.entries(valueDescriptions).forEach(([val, d]) => {
-                if (d && !mergedDescs[val]) {
-                  mergedDescs[val] = d;
-                }
-              });
-              existingAttr.description = desc;
-              existingAttr.allowedValues = Array.from(mergedValues);
-              existingAttr.valueDescriptions = mergedDescs;
+          const allowedValues = allowedRaw ? allowedRaw.split('|').map(s => s.trim()).filter(Boolean) : [];
+          const rawDescArr    = valueDescRaw ? valueDescRaw.split('|') : [];
+          const valueDescriptions: Record<string, string> = {};
+          for (let j = 0; j < allowedValues.length; j++) {
+            const d = (rawDescArr[j] || '').trim();
+            if (d) valueDescriptions[allowedValues[j]] = d;
+          }
+
+          const attrMap = attrMapByClass.get(classId)!;
+          const existingAttr = attrMap.get(attributeId);
+          if (!existingAttr) {
+            const newAttr = {
+              attributeId,
+              description: attrDescRaw || attributeId,
+              unit: unit || undefined,
+              allowedValues,
+              valueDescriptions,
+            };
+            cls.attributes.push(newAttr);
+            attrMap.set(attributeId, newAttr);
+          } else {
+            if (!existingAttr.description && attrDescRaw) existingAttr.description = attrDescRaw;
+            if (!existingAttr.unit && unit) existingAttr.unit = unit;
+            const existingSet = new Set<string>(existingAttr.allowedValues || []);
+            for (const v of allowedValues) {
+              if (!existingSet.has(v)) { existingAttr.allowedValues.push(v); existingSet.add(v); }
+            }
+            if (!existingAttr.valueDescriptions) existingAttr.valueDescriptions = {};
+            for (const [v, d] of Object.entries(valueDescriptions)) {
+              if (d && !existingAttr.valueDescriptions[v]) existingAttr.valueDescriptions[v] = d as string;
             }
           }
-        });
-        setLocalClassification(next);
+
+          processed++;
+          if (processed % BATCH === 0) {
+            setCsvImportProgress(40 + Math.min(55, Math.round((i / allLines.length) * 55)));
+            await yield_();
+          }
+        }
+
+        setLocalClassification(Array.from(classMap.values()));
+        setHasCsvUploaded(true);
       } else if (category === 'bom') {
         // Support both the app's BOM template and ggg.csv format:
         // - Template: itemId, description, featureId, featureDescription, values (pipe-separated)
@@ -695,16 +804,28 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
           if (!itemId) return;
 
           const description = r['description'] || r['itemDescription'] || '';
+          const category = r['category'] || '';
+          const productType = r['productType'] || r['producttype'] || r['product_type'] || '';
+
           if (!byItem[itemId]) {
-            byItem[itemId] = { itemId, description, features: [] };
-          } else if (!byItem[itemId].description && description) {
-            byItem[itemId].description = description;
+            byItem[itemId] = { itemId, description, category, productType, features: [] };
+          } else {
+            if (!byItem[itemId].description && description) {
+              byItem[itemId].description = description;
+            }
+            if (category && !byItem[itemId].category) {
+              byItem[itemId].category = category;
+            }
+            if (productType && !byItem[itemId].productType) {
+              byItem[itemId].productType = productType;
+            }
           }
 
           const featureId = r['featureId'] || '';
           if (!featureId) return;
 
           const featureDescription = r['featureDescription'] || featureId;
+          const featureUnit = r['unit'] || '';
           const rawValues = (r['values'] || r['featureValue'] || '')
             .split('|')
             .map(s => s.trim())
@@ -720,10 +841,12 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
 
           let feature = byItem[itemId].features.find(f => f.featureId === featureId);
           if (!feature) {
-            feature = { featureId, description: featureDescription, values: [], valueDescriptions: {} };
+            feature = { featureId, description: featureDescription, unit: featureUnit || undefined, values: [], valueDescriptions: {} };
             byItem[itemId].features.push(feature);
           } else if (!feature.description && featureDescription) {
             feature.description = featureDescription;
+          } else if (featureUnit && !feature.unit) {
+            feature.unit = featureUnit;
           }
 
           rawValues.forEach((v, idx) => {
@@ -739,6 +862,7 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
         });
 
         setLocalBom(Object.values(byItem));
+        setHasCsvUploaded(true);
       }
       setCsvImportProgress(100);
     } catch (err) {
@@ -749,6 +873,26 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
         setIsCsvImporting(false);
         setCsvImportProgress(0);
       }, 300);
+    }
+  };
+
+  const handleBomSync = async () => {
+    if (!onFetchBomItems) return;
+    if (!bomCategory && !bomProductType) {
+      alert('Select a category or product type before syncing BOM items.');
+      return;
+    }
+    try {
+      setIsBomSyncing(true);
+      const items = await onFetchBomItems(bomCategory || undefined, bomProductType || undefined);
+      setLocalBom(items || []);
+      setSelectedBomItemId(items?.[0]?.itemId || null);
+      setBomSearch('');
+      setPage(0);
+    } catch (err: any) {
+      alert(`Failed to fetch BOM items: ${err?.message || String(err)}`);
+    } finally {
+      setIsBomSyncing(false);
     }
   };
 
@@ -774,7 +918,7 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
       const uniqueId = `NEW_CLASS_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
       setLocalClassification([...localClassification, { classId: uniqueId, className: 'New Classification', attributes: [] }]);
     } else if (category === 'bom') {
-      const next = [...localBom, { itemId: 'NEW-ITEM', description: 'New Item Description', features: [] }];
+      const next = [...localBom, { itemId: 'NEW-ITEM', description: 'New Item Description', category: '', productType: '', features: [] }];
       setLocalBom(next);
       setSelectedBomItemId('NEW-ITEM');
     } else if (category === 'users') {
@@ -926,6 +1070,47 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
                     maxVisibleOptions={attributeDropdownOptions.length || 10}
                   />
                 </div>
+              </div>
+            )}
+
+            {category === 'bom' && onFetchBomItems && bomFilters && (
+              <div className="flex-1 flex flex-wrap justify-end gap-2 mt-3 sm:mt-0">
+                <div className="w-40">
+                  <LegacyValueSelector
+                    value={bomCategory}
+                    options={availableCategories}
+                    onChange={(val) => {
+                      setBomCategory(val);
+                      refreshBomFilters(val, bomProductType);
+                    }}
+                    placeholder="Category..."
+                    maxVisibleOptions={10}
+                  />
+                </div>
+                <div className="w-40">
+                  <LegacyValueSelector
+                    value={bomProductType}
+                    options={availableProductTypes}
+                    onChange={(val) => {
+                      setBomProductType(val);
+                      refreshBomFilters(bomCategory, val);
+                    }}
+                    placeholder="Product type..."
+                    maxVisibleOptions={10}
+                  />
+                </div>
+                <button
+                  type="button"
+                  onClick={handleBomSync}
+                  disabled={isBomSyncing}
+                  className={`px-3 py-1.5 border rounded-lg text-[9px] font-black uppercase tracking-widest transition-all ${
+                    isBomSyncing
+                      ? 'border-slate-200 bg-slate-100 text-slate-400 cursor-not-allowed'
+                      : 'border-emerald-200 bg-emerald-50 text-emerald-700 hover:bg-emerald-100'
+                  }`}
+                >
+                  {isBomSyncing ? 'Syncing…' : 'Sync Items'}
+                </button>
               </div>
             )}
 
@@ -1177,6 +1362,9 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
                         <tr className="bg-slate-50 border-b border-slate-100">
                           <th className="px-6 py-4 text-[10px] font-black text-slate-400 uppercase tracking-widest w-48">Item Master</th>
                           <th className="px-6 py-4 text-[10px] font-black text-slate-400 uppercase tracking-widest">Description</th>
+                          <th className="px-6 py-4 text-[10px] font-black text-slate-400 uppercase tracking-widest w-36">Category</th>
+                          <th className="px-6 py-4 text-[10px] font-black text-slate-400 uppercase tracking-widest w-36">Product Type</th>
+                          <th className="px-6 py-4 text-[10px] font-black text-slate-400 uppercase tracking-widest w-24 text-center">Session</th>
                           <th className="px-6 py-4 text-[10px] font-black text-slate-400 uppercase tracking-widest w-16 text-center">X</th>
                         </tr>
                       </thead>
@@ -1184,6 +1372,9 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
                         {pagedBom.map((item, visibleIdx) => {
                           const idx = filteredBom.indexOf(item);
                           const isSelected = selectedBomItemId === item.itemId;
+                          const lock = locks?.[item.itemId];
+                          const isLockedByMe = lock && lock.userId === currentUser.userId;
+                          const isLockedByOther = lock && lock.userId !== currentUser.userId;
                           return (
                             <tr
                               key={item.itemId || idx}
@@ -1211,6 +1402,42 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
                                 <p className="text-[10px] text-slate-700 font-medium line-clamp-2">
                                   {item.description || 'No description'}
                                 </p>
+                              </td>
+                              <td className="px-6 py-3 align-top">
+                                <p className="text-[10px] text-slate-500 font-medium">
+                                  {item.category || <span className="text-slate-300">—</span>}
+                                </p>
+                              </td>
+                              <td className="px-6 py-3 align-top">
+                                <p className="text-[10px] text-slate-500 font-medium">
+                                  {item.productType || <span className="text-slate-300">—</span>}
+                                </p>
+                              </td>
+                              <td className="px-6 py-3 align-top text-center">
+                                {isLockedByMe ? (
+                                  <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-emerald-100 text-emerald-700 text-[8px] font-black uppercase tracking-widest">
+                                    Signed On
+                                  </span>
+                                ) : isLockedByOther ? (
+                                  <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-amber-100 text-amber-700 text-[8px] font-black uppercase tracking-widest">
+                                    Locked
+                                  </span>
+                                ) : onSignOnItem ? (
+                                  <button
+                                    type="button"
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      onSignOnItem(item.itemId).catch(() => {
+                                        // errors handled upstream
+                                      });
+                                    }}
+                                    className="px-2 py-0.5 rounded-full bg-indigo-600 text-white text-[8px] font-black uppercase tracking-widest hover:bg-indigo-700"
+                                  >
+                                    Sign On
+                                  </button>
+                                ) : (
+                                  <span className="text-[9px] text-slate-300">—</span>
+                                )}
                               </td>
                               <td className="px-6 py-3 align-top text-center">
                                 <button
@@ -1409,6 +1636,17 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
                           >
                             {selectedAttributeForDetail.description || '—'}
                           </p>
+                          <div className="mt-1">
+                            <label className="text-[8px] font-black text-slate-400 uppercase tracking-widest block mb-1">
+                              Unit
+                            </label>
+                            <input
+                              value={selectedAttributeForDetail.unit || ''}
+                              onChange={(e) => updateSelectedAttributeUnit(e.target.value)}
+                              placeholder="Unit"
+                              className="w-full text-[9px] font-black text-slate-700 bg-slate-50 border border-slate-200 rounded px-2 py-1 outline-none focus:border-indigo-400"
+                            />
+                          </div>
                           <div className="mt-2 flex flex-wrap items-center gap-1 max-h-24 overflow-y-auto">
                             <button
                               type="button"
@@ -1653,7 +1891,7 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
                 </div>
               </div>
 
-              <div className="grid grid-cols-1 md:grid-cols-3 gap-3 mb-4">
+              <div className="grid grid-cols-1 md:grid-cols-4 gap-3 mb-4">
                 <div className="md:col-span-1">
                   <label className="text-[8px] font-black text-slate-400 uppercase tracking-widest mb-1 block">
                     Part Number
@@ -1672,7 +1910,41 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
                     placeholder="Part Number"
                   />
                 </div>
-                <div className="md:col-span-2">
+                <div className="md:col-span-1">
+                  <label className="text-[8px] font-black text-slate-400 uppercase tracking-widest mb-1 block">
+                    Category
+                  </label>
+                  <input
+                    value={selectedBomItem.category || ''}
+                    onChange={(e) => {
+                      const idx = localBom.findIndex(i => i.itemId === selectedBomItem.itemId);
+                      if (idx === -1) return;
+                      const next = [...localBom];
+                      next[idx] = { ...next[idx], category: e.target.value };
+                      setLocalBom(next);
+                    }}
+                    className="w-full p-2 text-[10px] bg-white border border-slate-200 rounded-md font-medium text-slate-700 outline-none focus:border-indigo-400"
+                    placeholder="Category"
+                  />
+                </div>
+                <div className="md:col-span-1">
+                  <label className="text-[8px] font-black text-slate-400 uppercase tracking-widest mb-1 block">
+                    Product Type
+                  </label>
+                  <input
+                    value={selectedBomItem.productType || ''}
+                    onChange={(e) => {
+                      const idx = localBom.findIndex(i => i.itemId === selectedBomItem.itemId);
+                      if (idx === -1) return;
+                      const next = [...localBom];
+                      next[idx] = { ...next[idx], productType: e.target.value };
+                      setLocalBom(next);
+                    }}
+                    className="w-full p-2 text-[10px] bg-white border border-slate-200 rounded-md font-medium text-slate-700 outline-none focus:border-indigo-400"
+                    placeholder="Product Type"
+                  />
+                </div>
+                <div className="md:col-span-1">
                   <label className="text-[8px] font-black text-slate-400 uppercase tracking-widest mb-1 block">
                     Part Description
                   </label>
@@ -1719,7 +1991,7 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
                         const idx = localBom.findIndex(i => i.itemId === selectedBomItem.itemId);
                         if (idx === -1) return;
                         const next = [...localBom];
-                        next[idx].features.push({ featureId: 'NEW_FEAT', description: 'New Feature', values: [], valueDescriptions: {} });
+                        next[idx].features.push({ featureId: 'NEW_FEAT', description: 'New Feature', unit: '', values: [], valueDescriptions: {} });
                         setLocalBom(next);
                       }}
                       className="px-2 py-1 border border-dashed border-slate-300 rounded-md text-[8px] font-black text-slate-500 hover:text-slate-700 hover:border-slate-400 uppercase tracking-widest flex items-center gap-1 shrink-0"
@@ -1756,6 +2028,16 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
                               setLocalBom(next);
                             }}
                             className="text-[9px] font-black text-slate-900 flex-1 outline-none"
+                          />
+                          <input
+                            value={feat.unit || ''}
+                            onChange={(e) => {
+                              const next = [...localBom];
+                              next[parentIdx].features[fIdx].unit = e.target.value;
+                              setLocalBom(next);
+                            }}
+                            placeholder="Unit"
+                            className="w-20 text-[8px] font-black uppercase text-slate-500 bg-slate-50 border border-slate-200 rounded px-1.5 py-0.5 outline-none focus:border-indigo-300"
                           />
                           <button
                             type="button"
@@ -1837,12 +2119,14 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
           <button onClick={onClose} className="px-5 py-2 text-[10px] font-black text-slate-400 hover:text-slate-600 transition-colors uppercase tracking-widest">
             Discard
           </button>
-          <button 
-            onClick={handleSave}
-            className="px-6 py-2 bg-blue-600 text-white rounded-lg text-[10px] font-black hover:bg-blue-700 shadow-md transition-all active:scale-95 uppercase tracking-widest"
-          >
-            Synchronize
-          </button>
+          {currentUser.role === 'admin' && hasCsvUploaded && (
+            <button 
+              onClick={handleSave}
+              className="px-6 py-2 bg-blue-600 text-white rounded-lg text-[10px] font-black hover:bg-blue-700 shadow-md transition-all active:scale-95 uppercase tracking-widest"
+            >
+              Synchronize
+            </button>
+          )}
         </div>
       </div>
     </div>

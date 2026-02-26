@@ -23,8 +23,11 @@ function parseCSVToBom(text: string): LegacyItem[] {
   const idx = {
     itemId: headers.indexOf('itemid') >= 0 ? headers.indexOf('itemid') : headers.indexOf('item_id'),
     itemDesc: headers.indexOf('itemdescription') >= 0 ? headers.indexOf('itemdescription') : headers.indexOf('item_description'),
+    itemCategory: headers.indexOf('category'),
+    itemProductType: headers.indexOf('producttype') >= 0 ? headers.indexOf('producttype') : headers.indexOf('product_type'),
     featureId: headers.indexOf('featureid') >= 0 ? headers.indexOf('featureid') : headers.indexOf('feature_id'),
     featureDesc: headers.indexOf('featuredescription') >= 0 ? headers.indexOf('featuredescription') : headers.indexOf('feature_description'),
+    featureUnit: headers.indexOf('unit'),
     featureValue: headers.indexOf('featurevalue') >= 0 ? headers.indexOf('featurevalue') : headers.indexOf('feature_value'),
     featureValueDesc: headers.indexOf('valuedescription') >= 0 ? headers.indexOf('valuedescription') : headers.indexOf('value_description'),
   } as Record<string, number>;
@@ -40,21 +43,33 @@ function parseCSVToBom(text: string): LegacyItem[] {
     const itemId = cols[idx.itemId] ?? '';
     if (!itemId) continue;
     const itemDesc = cols[idx.itemDesc] ?? '';
+    const itemCategory = idx.itemCategory >= 0 ? (cols[idx.itemCategory] ?? '') : '';
+    const itemProductType = idx.itemProductType >= 0 ? (cols[idx.itemProductType] ?? '') : '';
     const fId = cols[idx.featureId] ?? '';
     const fDesc = cols[idx.featureDesc] ?? '';
+    const fUnit = idx.featureUnit >= 0 ? (cols[idx.featureUnit] ?? '') : '';
     const fVal = cols[idx.featureValue] ?? '';
     const fValDesc = idx.featureValueDesc >= 0 ? (cols[idx.featureValueDesc] ?? '') : '';
 
     if (!itemsMap[itemId]) {
-      itemsMap[itemId] = { item: { itemId, description: itemDesc, features: [] }, featuresMap: {} };
+      itemsMap[itemId] = { item: { itemId, description: itemDesc, category: itemCategory, productType: itemProductType, features: [] }, featuresMap: {} };
+    } else {
+      if (itemCategory && !itemsMap[itemId].item.category) {
+        itemsMap[itemId].item.category = itemCategory;
+      }
+      if (itemProductType && !itemsMap[itemId].item.productType) {
+        itemsMap[itemId].item.productType = itemProductType;
+      }
     }
 
     if (fId) {
       let feat = itemsMap[itemId].featuresMap[fId];
       if (!feat) {
-        feat = { featureId: fId, description: fDesc || fId, values: [], valueDescriptions: {} };
+        feat = { featureId: fId, description: fDesc || fId, unit: fUnit || undefined, values: [], valueDescriptions: {} };
         itemsMap[itemId].featuresMap[fId] = feat;
         itemsMap[itemId].item.features.push(feat);
+      } else if (fUnit && !feat.unit) {
+        feat.unit = fUnit;
       }
       if (fVal && !feat.values.includes(fVal)) {
         feat.values.push(fVal);

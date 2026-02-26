@@ -23,20 +23,66 @@ const App: React.FC = () => {
   const [dbState, setDbState] = useState<DatabaseState | null>(null);
   const [activeInspector, setActiveInspector] = useState<DataCategory | null>(null);
   const [showDashboard, setShowDashboard] = useState(false);
+  const [bomFilters, setBomFilters] = useState<{ categories: string[]; productTypes: string[] }>({ categories: [], productTypes: [] });
+  const [dashboardSnapshot, setDashboardSnapshot] = useState<{ bom: DatabaseState['bom']; mappings: DatabaseState['mappings']; localMappings: DatabaseState['localMappings'] } | null>(null);
   const [featureFlags, setFeatureFlags] = useState<FeatureFlags>(() => ({
     useNewClassTargetMapping: import.meta.env.VITE_USE_NEW_CLASS_TARGET_MAPPING === 'true',
   }));
   
-  // Initial load only; further refreshes are explicit via header/controls.
+  // Initial load: restore session from token if present, then fetch DB state.
   useEffect(() => {
-    handleFetchFromDB();
+    const token = localStorage.getItem('erp_migrator_token');
+    if (token) {
+      dbService.me().then((remoteUser: any) => {
+        const user: User = {
+          userId: `USR-${remoteUser.id}`,
+          userName: remoteUser.username,
+          password: '',
+          role: remoteUser.role,
+        };
+        setCurrentUser(user);
+        handleFetchFromDB(user);
+      }).catch(() => {
+        // Token expired/invalid — fall through to login screen
+        localStorage.removeItem('erp_migrator_token');
+        handleFetchFromDB();
+      });
+    } else {
+      handleFetchFromDB();
+    }
   }, []);
 
-  const handleFetchFromDB = async () => {
+  const handleFetchFromDB = async (user?: User | null) => {
     try {
-      const { state, mode } = await dbService.fetchAll();
-      setDbState(state);
+      const { state, mode } = await dbService.fetchAll({ includeBom: false });
+      const activeUser = user ?? currentUser;
+      let lockedItems: DatabaseState['bom'] = [];
+      if (activeUser) {
+        const lockIds = Object.values(state.locks || {})
+          .filter(lock => activeUser.role === 'admin' || lock.userId === activeUser.userId)
+          .map(lock => lock.itemId)
+          .filter(Boolean);
+
+        if (lockIds.length) {
+          try {
+            lockedItems = await dbService.fetchBomItemsByIds(lockIds);
+          } catch (err) {
+            console.warn('Failed to fetch locked BOM items', err);
+          }
+        }
+      }
+
+      setDbState(prev => ({
+        ...state,
+        bom: lockedItems.length ? lockedItems : (prev?.bom || []),
+      }));
       setConnectionMode(mode);
+      try {
+        const filters = await dbService.fetchBomFilters();
+        setBomFilters(filters);
+      } catch (err) {
+        console.warn('Failed to fetch BOM filters', err);
+      }
     } catch (error: any) {
       console.error("Database sync failed", error);
       alert(`Failed to connect to database: ${error?.message || 'Unknown error'}. Please ensure the backend server is running on port 8000.`);
@@ -47,7 +93,7 @@ const App: React.FC = () => {
 
   const handleLogin = (user: User) => {
     setCurrentUser(user);
-    handleFetchFromDB();
+    handleFetchFromDB(user);
   };
 
   const handleLogout = () => {
@@ -57,10 +103,21 @@ const App: React.FC = () => {
 
   const handleSignOn = async (itemId: string) => {
     if (!currentUser) return;
+    const existingLocks = Object.values(dbState?.locks || {}).filter(lock => lock.userId === currentUser.userId);
+    if (existingLocks.length >= 2 && !existingLocks.some(lock => lock.itemId === itemId)) {
+      alert('You can only sign on to two items at a time. Please sign off another item first.');
+      return;
+    }
     setIsRefreshing(true);
-    const success = await dbService.acquireLock(itemId, currentUser.userId, currentUser.userName);
-    if (!success) {
-      alert("This item is currently locked by another session.");
+    const result = await dbService.acquireLock(itemId, currentUser.userId, currentUser.userName);
+    if (!result.acquired) {
+      if (result.reason === 'limit') {
+        alert('You can only sign on to two items at a time. Please sign off another item first.');
+      } else if (result.reason === 'locked') {
+        alert('This item is currently locked by another session.');
+      } else {
+        alert('Failed to sign on. Please try again.');
+      }
     }
     await handleFetchFromDB();
     setIsRefreshing(false);
@@ -100,7 +157,11 @@ const App: React.FC = () => {
       },
     };
 
-    const newMode = await dbService.saveAll(nextState, currentUser?.role);
+    // Never send the partial session BOM (only signed-on items) to the sync endpoint —
+    // doing so would wipe every other item from the database.  BOM is managed exclusively
+    // through the DataInspector CSV upload / Synchronize flow.
+    const { bom: _bom, ...stateWithoutBom } = nextState as any;
+    const newMode = await dbService.saveAll(stateWithoutBom as DatabaseState, currentUser?.role);
     setConnectionMode(newMode);
     setDbState(nextState);
     setIsRefreshing(false);
@@ -114,6 +175,19 @@ const App: React.FC = () => {
     setIsRefreshing(false);
     setShowSuccess(true);
     setTimeout(() => setShowSuccess(false), 3000);
+  };
+
+  const handleFetchDashboardSnapshot = async () => {
+    try {
+      const { state } = await dbService.fetchAll({ includeBom: true });
+      setDashboardSnapshot({
+        bom: state.bom || [],
+        mappings: state.mappings || [],
+        localMappings: state.localMappings || {},
+      });
+    } catch (err) {
+      console.warn('Failed to fetch dashboard snapshot', err);
+    }
   };
 
   const handleClearCache = async () => {
@@ -138,7 +212,53 @@ const App: React.FC = () => {
     setActiveInspector(null);
   };
 
-  const selectedItem = (dbState?.bom || []).find(item => item.itemId === selectedItemId) || null;
+  const handleFetchBomItems = async (category?: string, productType?: string) => {
+    if (!dbState) return [];
+    setIsRefreshing(true);
+    try {
+      const items = await dbService.fetchBomItems(category, productType);
+      setDbState(prev => {
+        if (!prev) return prev;
+        const lockedIds = new Set(
+          Object.values(prev.locks || {})
+            .filter(lock => !currentUser || currentUser.role === 'admin' || lock.userId === currentUser.userId)
+            .map(lock => lock.itemId)
+        );
+
+        const lockedItems = prev.bom.filter(item => lockedIds.has(item.itemId));
+        const nextById: Record<string, DatabaseState['bom'][number]> = {};
+        lockedItems.forEach(item => {
+          nextById[item.itemId] = item;
+        });
+        items.forEach(item => {
+          nextById[item.itemId] = item;
+        });
+
+        return { ...prev, bom: Object.values(nextById) };
+      });
+      return items;
+    } finally {
+      setIsRefreshing(false);
+    }
+  };
+
+  const visibleBomItems = useMemo(() => {
+    if (!dbState || !currentUser) return [] as DatabaseState['bom'];
+    const lockedIds = new Set(
+      Object.values(dbState.locks || {})
+        .filter(lock => currentUser.role === 'admin' || lock.userId === currentUser.userId)
+        .map(lock => lock.itemId)
+    );
+    return (dbState.bom || []).filter(item => lockedIds.has(item.itemId));
+  }, [dbState, currentUser]);
+
+  useEffect(() => {
+    if (selectedItemId && !visibleBomItems.some(item => item.itemId === selectedItemId)) {
+      setSelectedItemId(null);
+    }
+  }, [selectedItemId, visibleBomItems]);
+
+  const selectedItem = visibleBomItems.find(item => item.itemId === selectedItemId) || null;
 
   const itemStatuses = useMemo(() => {
     if (!dbState) return {} as Record<string, ItemStatus>;
@@ -279,7 +399,10 @@ const App: React.FC = () => {
         currentUser={currentUser}
         onLogout={handleLogout}
         onClearCache={handleClearCache}
-        onOpenDashboard={() => setShowDashboard(true)}
+        onOpenDashboard={() => {
+          setShowDashboard(true);
+          handleFetchDashboardSnapshot();
+        }}
       />
       
       <main className="flex flex-1 overflow-hidden relative">
@@ -297,7 +420,7 @@ const App: React.FC = () => {
         )}
 
         <ItemSidebar 
-          items={dbState.bom} 
+          items={visibleBomItems} 
           selectedId={selectedItemId} 
           onSelect={setSelectedItemId} 
           locks={dbState.locks}
@@ -340,16 +463,23 @@ const App: React.FC = () => {
                setActiveInspector(null);
             }}
             currentUser={currentUser!}
+            bomFilters={bomFilters}
+            onFetchBomItems={handleFetchBomItems}
+            locks={dbState.locks}
+            onSignOnItem={handleSignOn}
           />
         )}
 
         {showDashboard && (
           <MappingDashboard
-            bom={dbState.bom}
-            mappings={dbState.mappings}
-            localMappings={dbState.localMappings}
-            onRecompute={handleFetchFromDB}
-            onClose={() => setShowDashboard(false)}
+            bom={dashboardSnapshot?.bom || []}
+            mappings={dashboardSnapshot?.mappings || []}
+            localMappings={dashboardSnapshot?.localMappings || {}}
+            onRecompute={handleFetchDashboardSnapshot}
+            onClose={() => {
+              setShowDashboard(false);
+              setDashboardSnapshot(null);
+            }}
           />
         )}
       </main>

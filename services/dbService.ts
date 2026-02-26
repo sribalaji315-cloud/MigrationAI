@@ -66,11 +66,12 @@ export const dbService = {
     return resp.json();
   },
 
-  async fetchAll(): Promise<{ state: DatabaseState; mode: ConnectionMode }> {
+  async fetchAll(options?: { includeBom?: boolean }): Promise<{ state: DatabaseState; mode: ConnectionMode }> {
     const mode = await this.getConnectionMode();
+    const includeBom = options?.includeBom ?? true;
     
     if (mode === 'REMOTE_SQL' && SQL_ENDPOINT) {
-      const response = await fetch(`${SQL_ENDPOINT}/state`, { headers: this._authHeaders() });
+      const response = await fetch(`${SQL_ENDPOINT}/state?include_bom=${includeBom ? 'true' : 'false'}`, { headers: this._authHeaders() });
       if (!response.ok) {
         throw new Error(`Failed to fetch state from database: ${response.status}`);
       }
@@ -112,7 +113,57 @@ export const dbService = {
       description: data.description,
       allowedValues: data.allowedValues || [],
       valueDescriptions: data.valueDescriptions || {},
+      unit: data.unit || '',
     };
+  },
+
+  async fetchBomFilters(options?: { category?: string; productType?: string }): Promise<{ categories: string[]; productTypes: string[] }> {
+    if (!SQL_ENDPOINT) {
+      throw new Error('Database connection not available.');
+    }
+    const params = new URLSearchParams();
+    if (options?.category) params.set('category', options.category);
+    if (options?.productType) params.set('productType', options.productType);
+    const query = params.toString();
+    const resp = await fetch(`${SQL_ENDPOINT}/bom/filters${query ? `?${query}` : ''}`, { headers: this._authHeaders() });
+    if (!resp.ok) {
+      const errText = await resp.text();
+      throw new Error(`Failed to fetch BOM filters: ${resp.status} ${errText}`);
+    }
+    return resp.json();
+  },
+
+  async fetchBomItemsByIds(itemIds: string[]): Promise<DatabaseState['bom']> {
+    if (!SQL_ENDPOINT) {
+      throw new Error('Database connection not available.');
+    }
+    if (!itemIds.length) return [];
+    const resp = await fetch(`${SQL_ENDPOINT}/bom/items/by-ids`, {
+      method: 'POST',
+      headers: { ...this._authHeaders(), 'Content-Type': 'application/json' },
+      body: JSON.stringify(itemIds),
+    });
+    if (!resp.ok) {
+      const errText = await resp.text();
+      throw new Error(`Failed to fetch BOM items by ids: ${resp.status} ${errText}`);
+    }
+    return resp.json();
+  },
+
+  async fetchBomItems(category?: string, productType?: string): Promise<DatabaseState['bom']> {
+    if (!SQL_ENDPOINT) {
+      throw new Error('Database connection not available.');
+    }
+    const params = new URLSearchParams();
+    if (category) params.set('category', category);
+    if (productType) params.set('productType', productType);
+    const query = params.toString();
+    const resp = await fetch(`${SQL_ENDPOINT}/bom/items${query ? `?${query}` : ''}`, { headers: this._authHeaders() });
+    if (!resp.ok) {
+      const errText = await resp.text();
+      throw new Error(`Failed to fetch BOM items: ${resp.status} ${errText}`);
+    }
+    return resp.json();
   },
 
   async saveAll(data: DatabaseState, userRole: 'admin' | 'user' | undefined = 'user'): Promise<ConnectionMode> {
@@ -171,7 +222,7 @@ export const dbService = {
     return 'REMOTE_SQL';
   },
 
-  async acquireLock(itemId: string, userId: string, userName: string): Promise<boolean> {
+  async acquireLock(itemId: string, userId: string, userName: string): Promise<{ acquired: boolean; reason?: string }> {
     if (!SQL_ENDPOINT) {
       throw new Error('Database connection not available');
     }
@@ -182,10 +233,17 @@ export const dbService = {
         headers: { ...this._authHeaders(), 'Content-Type': 'application/json' },
         body: JSON.stringify({ itemId, userId, userName, action: 'acquire' })
       });
-      return response.ok;
+      if (!response.ok) {
+        return { acquired: false, reason: 'error' };
+      }
+      const data = await response.json().catch(() => ({}));
+      if (data && typeof data.acquired === 'boolean') {
+        return { acquired: data.acquired, reason: data.reason };
+      }
+      return { acquired: response.ok };
     } catch (e) {
       console.error("Failed to acquire lock", e);
-      return false;
+      return { acquired: false, reason: 'error' };
     }
   },
 

@@ -643,12 +643,26 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
     let totalAttrCount = 0;
     let totalValueCount = 0;
 
+    const globalByFeature: Record<string, GlobalMapping> = {};
+    globalMappings.forEach(m => {
+      m.legacyFeatureIds.forEach(fid => {
+        globalByFeature[fid] = m;
+      });
+    });
+
+    const localByFeature: Record<string, any> = {};
+    stagedLocalMappings.forEach(m => {
+      m.legacyFeatureIds.forEach(fid => {
+        localByFeature[fid] = m;
+      });
+    });
+
     item.features.forEach(f => {
       totalAttrCount += 1;
       totalValueCount += f.values.length;
 
-      const globalMapping = globalMappings.find(m => m.legacyFeatureIds.includes(f.featureId));
-      const localOverride = stagedLocalMappings.find(m => m.legacyFeatureIds.includes(f.featureId));
+      const globalMapping = globalByFeature[f.featureId];
+      const localOverride = localByFeature[f.featureId];
 
       const baseTargetAttributeId = globalMapping?.newAttributeId
         ? globalMapping.newAttributeId.replace(/\s+/g, '')
@@ -748,9 +762,23 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
 
     const usedKeys = new Set<string>();
 
+    const globalByFeature: Record<string, GlobalMapping> = {};
+    globalMappings.forEach(m => {
+      m.legacyFeatureIds.forEach(fid => {
+        globalByFeature[fid] = m;
+      });
+    });
+
+    const localByFeature: Record<string, any> = {};
+    stagedLocalMappings.forEach(m => {
+      m.legacyFeatureIds.forEach(fid => {
+        localByFeature[fid] = m;
+      });
+    });
+
     item.features.forEach(f => {
-      const globalMapping = globalMappings.find(m => m.legacyFeatureIds.includes(f.featureId));
-      const localOverride = stagedLocalMappings.find(m => m.legacyFeatureIds.includes(f.featureId));
+      const globalMapping = globalByFeature[f.featureId];
+      const localOverride = localByFeature[f.featureId];
 
       const baseTargetAttributeId = globalMapping?.newAttributeId
         ? globalMapping.newAttributeId.replace(/\s+/g, '')
@@ -1067,10 +1095,25 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
               </div>
           </div>
 
-          {item.features.map((f, idx) => {
-            // Find global mapping for this feature
-            const globalMapping = globalMappings.find(m => m.legacyFeatureIds.includes(f.featureId));
-            const localOverride = stagedLocalMappings.find(m => m.legacyFeatureIds.includes(f.featureId));
+          {(() => {
+            const globalByFeature: Record<string, GlobalMapping> = {};
+            globalMappings.forEach(m => {
+              m.legacyFeatureIds.forEach(fid => {
+                globalByFeature[fid] = m;
+              });
+            });
+
+            const localByFeature: Record<string, any> = {};
+            stagedLocalMappings.forEach(m => {
+              m.legacyFeatureIds.forEach(fid => {
+                localByFeature[fid] = m;
+              });
+            });
+
+            return item.features.map((f, idx) => {
+              // Find global mapping for this feature
+              const globalMapping = globalByFeature[f.featureId];
+              const localOverride = localByFeature[f.featureId];
             const effectiveMapping = localOverride || globalMapping;
 
             // The base target attribute comes from global mapping if it exists
@@ -1149,8 +1192,8 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
             if (usingClassScope) {
               const usedAttributeKeys = new Set<string>();
               item.features.forEach(otherFeature => {
-                const gm = globalMappings.find(m => m.legacyFeatureIds.includes(otherFeature.featureId));
-                const lo = stagedLocalMappings.find(m => m.legacyFeatureIds.includes(otherFeature.featureId));
+                const gm = globalByFeature[otherFeature.featureId];
+                const lo = localByFeature[otherFeature.featureId];
                 const baseId = gm?.newAttributeId || 'UNMAPPED';
                 let baseOptions = baseId
                   .split(';')
@@ -1410,7 +1453,7 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
                 </div>
               </div>
             );
-          })}
+          })})()}
 
           {useNewClassTargetMapping && unmappedTargetAttributes.length > 0 && (
             <div className="mt-4">

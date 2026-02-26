@@ -72,7 +72,7 @@ const LoginSignUp: React.FC<LoginSignUpProps> = ({ onLogin }) => {
       };
 
       state.users.push(newUser);
-      await dbService.saveAll(state);
+      await dbService.saveAll(state, 'user', { includeBom: false });
       onLogin(newUser);
     }
   };

@@ -38,6 +38,8 @@ class BomItem(Base):
     id = Column(Integer, primary_key=True, index=True)
     item_id = Column(String, unique=True, index=True, nullable=False)
     description = Column(String, nullable=True)
+    category = Column(String, index=True, nullable=True)
+    product_type = Column(String, index=True, nullable=True)
 
     features = relationship("BomFeature", back_populates="item", cascade="all, delete-orphan")
 
@@ -54,6 +56,7 @@ class BomFeature(Base):
     item_id = Column(Integer, ForeignKey("bom_items.id", ondelete="CASCADE"), nullable=False)
     feature_id = Column(String, index=True, nullable=False)
     description = Column(String, nullable=True)
+    unit = Column(String, nullable=True)
     values = Column("values_json", JSON, nullable=True)
 
     item = relationship("BomItem", back_populates="features")
@@ -88,6 +91,8 @@ class LocalAttributeMapping(Base):
     id = Column(Integer, primary_key=True, index=True)
     item_id = Column(String, index=True, nullable=False)
     item_description = Column(String, nullable=True)
+    category = Column(String, index=True, nullable=True)
+    product_type = Column(String, index=True, nullable=True)
     legacy_attribute_id = Column(String, index=True, nullable=False)
     legacy_value = Column(String, nullable=False)
     new_attribute_id = Column(String, nullable=False)

@@ -27,6 +27,7 @@ class StateIn(BaseModel):
 class Attribute(BaseModel):
     attributeId: str
     description: str
+    unit: Optional[str] = None
     allowedValues: Optional[List[str]] = []
     # Optional per-value descriptions, keyed by allowed value
     valueDescriptions: Optional[Dict[str, str]] = None
@@ -54,6 +55,7 @@ class ClassAttributeOut(BaseModel):
     className: str
     attributeId: str
     description: str
+    unit: Optional[str] = None
     allowedValues: Optional[List[str]] = []
     # Optional per-value descriptions, keyed by allowed value
     valueDescriptions: Optional[Dict[str, str]] = None

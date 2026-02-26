@@ -1,6 +1,6 @@
-from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy.orm import Session
-from typing import Dict, List, Any
+from fastapi import APIRouter, Depends, HTTPException, Query
+from sqlalchemy.orm import Session, selectinload
+from typing import Dict, List, Any, Optional
 from ..db import models
 from ..db.session import get_db
 from ..schemas import StateIn
@@ -13,7 +13,7 @@ def health():
     return {"ok": True}
 
 @router.get("/state")
-def get_state(db: Session = Depends(get_db)):
+def get_state(include_bom: bool = Query(True), db: Session = Depends(get_db)):
     record = db.query(models.AppState).filter(models.AppState.id == 1).first()
     # build base state from JSON store (omitting whatever classification list may accidentally be there)
     if not record or not record.state:
@@ -58,51 +58,57 @@ def get_state(db: Session = Depends(get_db)):
     state["users"] = json_users
 
     # --- Override BOM from dedicated tables --------------------------------------
-    db_items = db.query(models.BomItem).all()
-    bom_payload: List[Dict[str, Any]] = []
-    for itm in db_items:
-        features_payload: List[Dict[str, Any]] = []
-        for feat in itm.features:
-            raw_values: Any = getattr(feat, "values", []) or []
+    if include_bom:
+        db_items = db.query(models.BomItem).options(selectinload(models.BomItem.features)).all()
+        bom_payload: List[Dict[str, Any]] = []
+        for itm in db_items:
+            features_payload: List[Dict[str, Any]] = []
+            for feat in itm.features:
+                raw_values: Any = getattr(feat, "values", []) or []
 
-            # Support both the original representation (list of strings)
-            # and a richer object with value descriptions stored in the JSON
-            values: List[str]
-            value_descriptions: Dict[str, str]
+                # Support both the original representation (list of strings)
+                # and a richer object with value descriptions stored in the JSON
+                values: List[str]
+                value_descriptions: Dict[str, str]
 
-            if isinstance(raw_values, list):
-                values = [str(v) for v in raw_values]
-                value_descriptions = {}
-            elif isinstance(raw_values, dict):
-                values_raw = raw_values.get("values") or []
-                values = [str(v) for v in values_raw]
-                vd = raw_values.get("valueDescriptions") or {}
-                # normalise keys to strings
-                value_descriptions = {
-                    str(k): str(v)
-                    for k, v in vd.items()
-                    if k is not None
-                }
-            else:
-                values = []
-                value_descriptions = {}
+                if isinstance(raw_values, list):
+                    values = [str(v) for v in raw_values]
+                    value_descriptions = {}
+                elif isinstance(raw_values, dict):
+                    values_raw = raw_values.get("values") or []
+                    values = [str(v) for v in values_raw]
+                    vd = raw_values.get("valueDescriptions") or {}
+                    # normalise keys to strings
+                    value_descriptions = {
+                        str(k): str(v)
+                        for k, v in vd.items()
+                        if k is not None
+                    }
+                else:
+                    values = []
+                    value_descriptions = {}
 
-            features_payload.append(
+                features_payload.append(
+                    {
+                        "featureId": getattr(feat, "feature_id", None),
+                        "description": getattr(feat, "description", ""),
+                        **({"unit": getattr(feat, "unit", None)} if getattr(feat, "unit", None) else {}),
+                        "values": values,
+                        **({"valueDescriptions": value_descriptions} if value_descriptions else {}),
+                    }
+                )
+            bom_payload.append(
                 {
-                    "featureId": getattr(feat, "feature_id", None),
-                    "description": getattr(feat, "description", ""),
-                    "values": values,
-                    **({"valueDescriptions": value_descriptions} if value_descriptions else {}),
+                    "itemId": getattr(itm, "item_id", None),
+                    "description": getattr(itm, "description", ""),
+                    **({"category": getattr(itm, "category", None)} if getattr(itm, "category", None) else {}),
+                    **({"productType": getattr(itm, "product_type", None)} if getattr(itm, "product_type", None) else {}),
+                    "features": features_payload,
                 }
             )
-        bom_payload.append(
-            {
-                "itemId": getattr(itm, "item_id", None),
-                "description": getattr(itm, "description", ""),
-                "features": features_payload,
-            }
-        )
-    state["bom"] = bom_payload
+        state["bom"] = bom_payload
+    else:
+        state["bom"] = []
 
     # --- Override global mappings from dedicated table ---------------------------
     db_mappings = db.query(models.GlobalMapping).all()
@@ -151,6 +157,113 @@ def get_state(db: Session = Depends(get_db)):
 
     return state
 
+
+@router.get("/bom/filters")
+def get_bom_filters(
+    category: Optional[str] = None,
+    productType: Optional[str] = None,
+    db: Session = Depends(get_db),
+):
+    base_query = db.query(models.BomItem)
+    if category:
+        base_query = base_query.filter(models.BomItem.category == category)
+    if productType:
+        base_query = base_query.filter(models.BomItem.product_type == productType)
+
+    categories = (
+        base_query.with_entities(models.BomItem.category)
+        .distinct()
+        .all()
+    )
+    product_types = (
+        base_query.with_entities(models.BomItem.product_type)
+        .distinct()
+        .all()
+    )
+
+    category_list = sorted({c[0] for c in categories if c and c[0]})
+    product_type_list = sorted({p[0] for p in product_types if p and p[0]})
+
+    return {"categories": category_list, "productTypes": product_type_list}
+
+
+def _build_bom_payload(db_items: List[models.BomItem]) -> List[Dict[str, Any]]:
+    bom_payload: List[Dict[str, Any]] = []
+
+    for itm in db_items:
+        features_payload: List[Dict[str, Any]] = []
+        for feat in itm.features:
+            raw_values: Any = getattr(feat, "values", []) or []
+            values: List[str]
+            value_descriptions: Dict[str, str]
+
+            if isinstance(raw_values, list):
+                values = [str(v) for v in raw_values]
+                value_descriptions = {}
+            elif isinstance(raw_values, dict):
+                values_raw = raw_values.get("values") or []
+                values = [str(v) for v in values_raw]
+                vd = raw_values.get("valueDescriptions") or {}
+                value_descriptions = {
+                    str(k): str(v)
+                    for k, v in vd.items()
+                    if k is not None
+                }
+            else:
+                values = []
+                value_descriptions = {}
+
+            features_payload.append(
+                {
+                    "featureId": getattr(feat, "feature_id", None),
+                    "description": getattr(feat, "description", ""),
+                    **({"unit": getattr(feat, "unit", None)} if getattr(feat, "unit", None) else {}),
+                    "values": values,
+                    **({"valueDescriptions": value_descriptions} if value_descriptions else {}),
+                }
+            )
+
+        bom_payload.append(
+            {
+                "itemId": getattr(itm, "item_id", None),
+                "description": getattr(itm, "description", ""),
+                **({"category": getattr(itm, "category", None)} if getattr(itm, "category", None) else {}),
+                **({"productType": getattr(itm, "product_type", None)} if getattr(itm, "product_type", None) else {}),
+                "features": features_payload,
+            }
+        )
+
+    return bom_payload
+
+
+@router.get("/bom/items")
+def get_bom_items(
+    category: Optional[str] = None,
+    productType: Optional[str] = None,
+    db: Session = Depends(get_db),
+):
+    query = db.query(models.BomItem).options(selectinload(models.BomItem.features))
+    if category:
+        query = query.filter(models.BomItem.category == category)
+    if productType:
+        query = query.filter(models.BomItem.product_type == productType)
+
+    db_items = query.all()
+    return _build_bom_payload(db_items)
+
+
+@router.post("/bom/items/by-ids")
+def get_bom_items_by_ids(
+    payload: List[str],
+    db: Session = Depends(get_db),
+):
+    item_ids = [i for i in payload if i]
+    if not item_ids:
+        return []
+
+    db_items = db.query(models.BomItem).options(selectinload(models.BomItem.features)).filter(models.BomItem.item_id.in_(item_ids)).all()
+    return _build_bom_payload(db_items)
+
 @router.post("/sync")
 def sync_state(payload: StateIn, db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
     # when classifications are persisted separately we ignore that property on sync requests
@@ -158,70 +271,95 @@ def sync_state(payload: StateIn, db: Session = Depends(get_db), current_user: mo
     incoming.pop("classifications", None)
 
     # peel off BOM, mappings and localMappings so they are stored in dedicated tables
-    bom_payload = incoming.pop("bom", []) or []
+    # Only replace BOM when it is explicitly included in the payload (key present and non-null).
+    # Workspace saves don't include the full BOM, so we must not wipe the table for those.
+    bom_key_present = "bom" in incoming
+    bom_payload = incoming.pop("bom", None)
     mappings_payload = incoming.pop("mappings", []) or []
     local_mappings_payload = incoming.pop("localMappings", {}) or {}
 
-    # Replace BOM & features with the incoming state
-    db.query(models.BomFeature).delete()
-    db.query(models.BomItem).delete()
+    # Replace BOM & features ONLY when the caller explicitly sent a bom list
+    if bom_key_present and bom_payload is not None:
+        db.query(models.BomFeature).delete()
+        db.query(models.BomItem).delete()
 
-    for item in bom_payload:
-        item_id = item.get("itemId")
-        if not item_id:
-            continue
-        description = item.get("description") or ""
-        db_item = models.BomItem(item_id=item_id, description=description)
-        db.add(db_item)
-        db.flush()  # obtain primary key for relationship
-
-        for feat in item.get("features") or []:
-            feature_id = feat.get("featureId")
-            if not feature_id:
+        bom_items_to_add = []
+        for item in (bom_payload or []):
+            item_id = item.get("itemId")
+            if not item_id:
                 continue
-
-            raw_values = feat.get("values") or []
-            value_descriptions = feat.get("valueDescriptions") or {}
-
-            # When value descriptions are provided, store an object in the JSON column
-            # so we can round-trip both values and descriptions. Otherwise, keep the
-            # original list-of-strings representation.
-            if value_descriptions:
-                composite_values: Any = {
-                    "values": raw_values,
-                    "valueDescriptions": value_descriptions,
-                }
-            else:
-                composite_values = raw_values
-
-            db_feature = models.BomFeature(
-                item_id=db_item.id,
-                feature_id=feature_id,
-                description=feat.get("description") or "",
-                values=composite_values,
+            description = item.get("description") or ""
+            db_item = models.BomItem(
+                item_id=item_id,
+                description=description,
+                category=item.get("category") or None,
+                product_type=item.get("productType") or None,
             )
-            db.add(db_feature)
+            
+            features_to_add = []
+            for feat in item.get("features") or []:
+                feature_id = feat.get("featureId")
+                if not feature_id:
+                    continue
+
+                raw_values = feat.get("values") or []
+                value_descriptions = feat.get("valueDescriptions") or {}
+
+                # When value descriptions are provided, store an object in the JSON column
+                # so we can round-trip both values and descriptions. Otherwise, keep the
+                # original list-of-strings representation.
+                if value_descriptions:
+                    composite_values: Any = {
+                        "values": raw_values,
+                        "valueDescriptions": value_descriptions,
+                    }
+                else:
+                    composite_values = raw_values
+
+                db_feature = models.BomFeature(
+                    feature_id=feature_id,
+                    description=feat.get("description") or "",
+                    unit=feat.get("unit") or None,
+                    values=composite_values,
+                )
+                features_to_add.append(db_feature)
+            
+            db_item.features = features_to_add
+            bom_items_to_add.append(db_item)
+            
+        if bom_items_to_add:
+            db.add_all(bom_items_to_add)
 
     # Replace global mappings
     db.query(models.GlobalMapping).delete()
+    global_mappings_to_add = []
     for m in mappings_payload:
         db_mapping = models.GlobalMapping(
             legacy_feature_ids=m.get("legacyFeatureIds") or [],
             new_attribute_id=m.get("newAttributeId") or "",
             value_mappings=m.get("valueMappings") or {},
         )
-        db.add(db_mapping)
+        global_mappings_to_add.append(db_mapping)
+    if global_mappings_to_add:
+        db.add_all(global_mappings_to_add)
 
     # Replace local attribute mappings
     db.query(models.LocalAttributeMapping).delete()
 
+    item_ids = list((local_mappings_payload or {}).keys())
+    bom_rows = db.query(models.BomItem).filter(models.BomItem.item_id.in_(item_ids)).all()
+    bom_by_item_id = {row.item_id: row for row in bom_rows}
+
+    local_mappings_to_add = []
     for item_id, mappings_for_item in (local_mappings_payload or {}).items():
         if not item_id:
             continue
 
         # Look up description from BOM table if present
-        bom_row = db.query(models.BomItem).filter(models.BomItem.item_id == item_id).first()
+        bom_row = bom_by_item_id.get(item_id)
         item_desc = getattr(bom_row, "description", "") if bom_row else ""
+        item_category = getattr(bom_row, "category", None) if bom_row else None
+        item_product_type = getattr(bom_row, "product_type", None) if bom_row else None
 
         for m in mappings_for_item or []:
             legacy_ids = m.get("legacyFeatureIds") or []
@@ -237,12 +375,14 @@ def sync_state(payload: StateIn, db: Session = Depends(get_db), current_user: mo
                     row = models.LocalAttributeMapping(
                         item_id=item_id,
                         item_description=item_desc,
+                        category=item_category,
+                        product_type=item_product_type,
                         legacy_attribute_id=legacy_attr,
                         legacy_value="",
                         new_attribute_id=new_attr,
                         new_value="",
                     )
-                    db.add(row)
+                    local_mappings_to_add.append(row)
                     continue
 
                 for legacy_val, new_val in values_map.items():
@@ -250,12 +390,17 @@ def sync_state(payload: StateIn, db: Session = Depends(get_db), current_user: mo
                         row = models.LocalAttributeMapping(
                             item_id=item_id,
                             item_description=item_desc,
+                            category=item_category,
+                            product_type=item_product_type,
                             legacy_attribute_id=legacy_attr,
                             legacy_value=str(legacy_val),
                             new_attribute_id=new_attr,
                             new_value=str(new_val),
                         )
-                        db.add(row)
+                        local_mappings_to_add.append(row)
+    
+    if local_mappings_to_add:
+        db.add_all(local_mappings_to_add)
 
     # Persist the remainder of the JSON state as a lightweight shell
     record = db.query(models.AppState).filter(models.AppState.id == 1).first()
@@ -295,19 +440,26 @@ def handle_lock(action_payload: Dict, db: Session = Depends(get_db)):
     existing_locks = base_state.get("locks") or {}
     locks: Dict = dict(existing_locks)
 
+    response_payload: Dict[str, Any] = {"ok": True}
+
     if action == "acquire":
         userId = action_payload.get("userId")
         userName = action_payload.get("userName")
         existing = locks.get(itemId)
         if existing and existing.get("userId") != userId:
             # Another user holds this lock
-            return {"acquired": False}
+            return {"acquired": False, "reason": "locked"}
+        if not existing:
+            user_lock_count = sum(1 for l in locks.values() if l.get("userId") == userId)
+            if user_lock_count >= 2:
+                return {"acquired": False, "reason": "limit"}
         locks[itemId] = {
             "itemId": itemId,
             "userId": userId,
             "userName": userName,
             "timestamp": __import__("time").time() * 1000,
         }
+        response_payload = {"acquired": True}
     elif action == "release":
         userId = action_payload.get("userId")
         print(f"[LOCK RELEASE] Attempting to release itemId={itemId}, userId={userId}, current locks: {locks}")
@@ -335,7 +487,7 @@ def handle_lock(action_payload: Dict, db: Session = Depends(get_db)):
         record.state = base_state
 
     db.commit()
-    return {"ok": True}
+    return response_payload
 
 @router.post("/reset")
 def reset(db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):

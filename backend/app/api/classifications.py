@@ -43,6 +43,7 @@ def get_class_attribute(class_id: str, attribute_id: str, db: Session = Depends(
         raise HTTPException(status_code=404, detail="attribute not found")
 
     description = ""
+    unit = ""
     values: List[str] = []
     seen_values = set()
     # Optional collected descriptions for each allowed value
@@ -50,6 +51,8 @@ def get_class_attribute(class_id: str, attribute_id: str, db: Session = Depends(
     for attr in matched:
         if not description:
             description = attr.get("description", "") or ""
+        if not unit:
+            unit = attr.get("unit", "") or ""
         # Merge allowed values
         for v in (attr.get("allowedValues") or []):
             val = str(v).strip()
@@ -73,6 +76,7 @@ def get_class_attribute(class_id: str, attribute_id: str, db: Session = Depends(
         className=record.class_name,
         attributeId=matched[0].get("attributeId", attribute_id),
         description=description or attribute_id,
+        unit=unit or None,
         allowedValues=values,
         valueDescriptions=value_descriptions or None,
     )
@@ -118,13 +122,15 @@ def bulk_replace_classifications(
     try:
         # delete all existing records
         db.query(models.Classification).delete()
+        records = []
         for cls in payload:
             record = models.Classification(
                 class_id=cls.classId,
                 class_name=cls.className,
                 attributes=[attr.dict() for attr in cls.attributes],
             )
-            db.add(record)
+            records.append(record)
+        db.add_all(records)
         db.commit()
         return {"ok": True}
     except IntegrityError as e:

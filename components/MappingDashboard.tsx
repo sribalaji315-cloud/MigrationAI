@@ -100,6 +100,13 @@ const MappingDashboard: React.FC<MappingDashboardProps> = ({ bom, mappings, loca
 
     bom.forEach(item => {
       const localForItem = localMappings[item.itemId] || [];
+      const localByFeature: Record<string, any> = {};
+      localForItem.forEach(m => {
+        (m.legacyFeatureIds || []).forEach(fid => {
+          localByFeature[fid] = m;
+        });
+      });
+
       let itemFeatures = 0;
       let itemMappedFeatures = 0;
       let itemNotRequiredFeatures = 0;
@@ -110,7 +117,7 @@ const MappingDashboard: React.FC<MappingDashboardProps> = ({ bom, mappings, loca
         totalFeatures += 1;
         itemFeatures += 1;
 
-        const localMapping = localForItem.find(m => (m.legacyFeatureIds || []).includes(feature.featureId));
+        const localMapping = localByFeature[feature.featureId];
         const globalMapping = globalByFeature[feature.featureId];
         const effective = localMapping || globalMapping || null;
 
