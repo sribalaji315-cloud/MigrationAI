@@ -1,5 +1,5 @@
 
-import React from 'react';
+import React, { useMemo, useState } from 'react';
 import { LegacyItem, ItemLock } from '../types';
 
 type ItemStatus = 'mapped' | 'unmapped' | 'notRequired';
@@ -11,6 +11,8 @@ interface ItemSidebarProps {
   locks: Record<string, ItemLock>;
   currentUserId: string;
   itemStatuses?: Record<string, ItemStatus>;
+  showUnmappedOnly?: boolean;
+  onToggleUnmappedOnly?: () => void;
 }
 
 const statusPalette: Record<ItemStatus, { wrapper: string; badge: string; indicator: string; text: string }> = {
@@ -34,15 +36,46 @@ const statusPalette: Record<ItemStatus, { wrapper: string; badge: string; indica
   },
 };
 
-const ItemSidebar: React.FC<ItemSidebarProps> = ({ items, selectedId, onSelect, locks, currentUserId, itemStatuses }) => {
+const ItemSidebar: React.FC<ItemSidebarProps> = ({ items, selectedId, onSelect, locks, currentUserId, itemStatuses, showUnmappedOnly = false, onToggleUnmappedOnly }) => {
+  const [search, setSearch] = useState('');
+
+  const filteredItems = useMemo(() => {
+    const q = search.trim().toLowerCase();
+    let next = items;
+    if (showUnmappedOnly) {
+      next = next.filter(item => itemStatuses?.[item.itemId] === 'unmapped');
+    }
+    if (!q) return next;
+    return next.filter(item => {
+      const id = (item.itemId || '').toLowerCase();
+      const desc = (item.description || '').toLowerCase();
+      return id.includes(q) || desc.includes(q);
+    });
+  }, [items, itemStatuses, showUnmappedOnly, search]);
+
   return (
     <div className="w-64 bg-white border-r border-slate-200 flex flex-col h-full shrink-0">
       <div className="p-4 border-b border-slate-100 bg-slate-50/30">
-        <h2 className="text-[10px] font-black text-slate-400 uppercase tracking-[0.2em] mb-3">BOM Index ({items.length})</h2>
+        <div className="flex items-center justify-between mb-3">
+          <h2 className="text-[10px] font-black text-slate-400 uppercase tracking-[0.2em]">BOM Index ({filteredItems.length})</h2>
+          <button
+            type="button"
+            onClick={() => onToggleUnmappedOnly?.()}
+            className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full border text-[7px] font-black uppercase tracking-widest transition-all ${
+              showUnmappedOnly
+                ? 'bg-emerald-600 border-emerald-500 text-white'
+                : 'bg-white border-slate-200 text-slate-500 hover:bg-slate-50'
+            }`}
+          >
+            <span>Unmapped Only</span>
+          </button>
+        </div>
         <div className="relative">
           <input 
             type="text" 
             placeholder="Search records..." 
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
             className="w-full pl-8 pr-3 py-1.5 text-xs bg-white border border-slate-200 rounded-md focus:outline-none focus:ring-1 focus:ring-blue-500/30 transition-shadow"
           />
           <svg className="w-3.5 h-3.5 absolute left-2.5 top-2 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -51,7 +84,7 @@ const ItemSidebar: React.FC<ItemSidebarProps> = ({ items, selectedId, onSelect, 
         </div>
       </div>
       <div className="flex-1 overflow-y-auto no-scrollbar">
-        {items.map((item) => {
+        {filteredItems.map((item) => {
           const lock = locks[item.itemId];
           const isLockedByOthers = lock && lock.userId !== currentUserId;
           const isLockedByMe = lock && lock.userId === currentUserId;

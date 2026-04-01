@@ -1,10 +1,11 @@
 import React, { useMemo, useState } from 'react';
-import { LegacyItem, GlobalMapping, LocalItemMappings } from '../types';
+import { LegacyItem, GlobalMapping, LocalItemMappings, MappingTypeConfig } from '../types';
 
 interface MappingDashboardProps {
   bom: LegacyItem[];
   mappings: GlobalMapping[];
   localMappings: LocalItemMappings;
+  mappingTypeConfig?: MappingTypeConfig;
   onClose: () => void;
   onRecompute: () => void;
 }
@@ -65,12 +66,49 @@ const DonutStat: React.FC<DonutStatProps> = ({ label, value, primaryColor, secon
   );
 };
 
-const MappingDashboard: React.FC<MappingDashboardProps> = ({ bom, mappings, localMappings, onClose, onRecompute }) => {
+const normalizeMappingType = (value?: string | null) => (value || '').trim().toLowerCase();
+
+const resolveValueMapping = (valueMappings: Record<string, string> | undefined, legacyValue: string): string | undefined => {
+  if (!valueMappings) return undefined;
+  const exact = valueMappings[legacyValue];
+  if (exact !== undefined && exact !== '') return exact;
+  const spaceIdx = legacyValue.indexOf(' ');
+  if (spaceIdx > 0) {
+    const prefix = legacyValue.substring(0, spaceIdx);
+    const prefixVal = valueMappings[prefix];
+    if (prefixVal !== undefined && prefixVal !== '') return prefixVal;
+  }
+  return exact;
+};
+
+const MappingDashboard: React.FC<MappingDashboardProps> = ({ bom, mappings, localMappings, mappingTypeConfig, onClose, onRecompute }) => {
   const [itemFilter, setItemFilter] = useState('');
+  const [includeExcluded, setIncludeExcluded] = useState(false);
 
   const metrics = useMemo(() => {
-    const globalByFeature: Record<string, GlobalMapping> = {};
+    // Build a lookup of ALL global mappings (regardless of type) to detect excluded features
+    const allGlobalByFeature: Record<string, GlobalMapping> = {};
     mappings.forEach(m => {
+      (m.legacyFeatureIds || []).forEach(fid => {
+        if (fid && !allGlobalByFeature[fid]) {
+          allGlobalByFeature[fid] = m;
+        }
+      });
+    });
+
+    // Build a lookup of only INCLUDED global mappings (matching checked attribute types)
+    const globalByFeature: Record<string, GlobalMapping> = {};
+    const available = (mappingTypeConfig?.availableTypes || []).map(normalizeMappingType).filter(Boolean);
+    const included = (mappingTypeConfig?.includedTypes || []).map(normalizeMappingType).filter(Boolean);
+    const includedSet = available.length ? new Set(included.length ? included : available) : null;
+
+    mappings.forEach(m => {
+      const attrType = normalizeMappingType(m.attributeType);
+      if (!includedSet) {
+        if (!attrType) return;
+      } else if (!includedSet.has(attrType)) {
+        return;
+      }
       (m.legacyFeatureIds || []).forEach(fid => {
         if (fid && !globalByFeature[fid]) {
           globalByFeature[fid] = m;
@@ -81,8 +119,10 @@ const MappingDashboard: React.FC<MappingDashboardProps> = ({ bom, mappings, loca
     let totalFeatures = 0;
     let mappedFeatures = 0;
     let totalNotRequiredFeatures = 0;
+    let totalExcludedFeatures = 0;
     let totalValues = 0;
     let mappedValues = 0;
+    let excludedValues = 0;
     const totalItems = bom.length;
     let itemsFullyMapped = 0;
 
@@ -92,8 +132,10 @@ const MappingDashboard: React.FC<MappingDashboardProps> = ({ bom, mappings, loca
       totalFeatures: number;
       mappedFeatures: number;
       notRequiredFeatures: number;
+      excludedFeatures: number;
       totalValues: number;
       mappedValues: number;
+      excludedValues: number;
       fullyMapped: boolean;
     }
     const perItem: ItemStat[] = [];
@@ -110,14 +152,38 @@ const MappingDashboard: React.FC<MappingDashboardProps> = ({ bom, mappings, loca
       let itemFeatures = 0;
       let itemMappedFeatures = 0;
       let itemNotRequiredFeatures = 0;
+      let itemExcludedFeatures = 0;
       let itemValues = 0;
       let itemMappedValues = 0;
+      let itemExcludedValues = 0;
 
       item.features.forEach(feature => {
+        // Determine if this feature belongs to an excluded attribute type
+        const localMapping = localByFeature[feature.featureId];
+        const anyGlobalMapping = allGlobalByFeature[feature.featureId];
+        const effectiveForType = localMapping || anyGlobalMapping || null;
+        const attrType = normalizeMappingType(effectiveForType?.attributeType);
+        const isExcluded = !!(includedSet && attrType && !includedSet.has(attrType));
+
+        if (isExcluded) {
+          itemExcludedFeatures += 1;
+          totalExcludedFeatures += 1;
+          itemExcludedValues += feature.values.length;
+          excludedValues += feature.values.length;
+
+          if (includeExcluded) {
+            // When toggle is on, count excluded features in totals but not as mapped
+            totalFeatures += 1;
+            itemFeatures += 1;
+            totalValues += feature.values.length;
+            itemValues += feature.values.length;
+          }
+          return;
+        }
+
         totalFeatures += 1;
         itemFeatures += 1;
 
-        const localMapping = localByFeature[feature.featureId];
         const globalMapping = globalByFeature[feature.featureId];
         const effective = localMapping || globalMapping || null;
 
@@ -139,7 +205,8 @@ const MappingDashboard: React.FC<MappingDashboardProps> = ({ bom, mappings, loca
           totalValues += 1;
           itemValues += 1;
 
-          const mapped = !!(effective && effective.valueMappings && effective.valueMappings[v] !== undefined && effective.valueMappings[v] !== '');
+          const resolved = effective ? resolveValueMapping(effective.valueMappings, v) : undefined;
+          const mapped = resolved !== undefined && resolved !== '';
           if (mapped) {
             mappedValues += 1;
             itemMappedValues += 1;
@@ -151,9 +218,10 @@ const MappingDashboard: React.FC<MappingDashboardProps> = ({ bom, mappings, loca
       // An item with values must have all values mapped too.
       const itemCoveredFeatures = itemMappedFeatures + itemNotRequiredFeatures;
 
+      const effectiveItemFeatures = itemFeatures;
       const itemFullyMapped =
-        itemFeatures > 0 &&
-        itemFeatures === itemCoveredFeatures &&
+        effectiveItemFeatures > 0 &&
+        effectiveItemFeatures === itemCoveredFeatures &&
         (itemValues === 0 || itemValues === itemMappedValues);
 
       if (itemFullyMapped) {
@@ -166,8 +234,10 @@ const MappingDashboard: React.FC<MappingDashboardProps> = ({ bom, mappings, loca
         totalFeatures: itemFeatures,
         mappedFeatures: itemMappedFeatures,
         notRequiredFeatures: itemNotRequiredFeatures,
+        excludedFeatures: itemExcludedFeatures,
         totalValues: itemValues,
         mappedValues: itemMappedValues,
+        excludedValues: itemExcludedValues,
         fullyMapped: itemFullyMapped,
       });
     });
@@ -185,12 +255,14 @@ const MappingDashboard: React.FC<MappingDashboardProps> = ({ bom, mappings, loca
       totalItems,
       itemsFullyMapped,
       totalNotRequiredFeatures,
+      totalExcludedFeatures,
+      excludedValues,
       attributeCoverage,
       valueCoverage,
       itemCoverage,
       perItem,
     };
-  }, [bom, mappings, localMappings]);
+  }, [bom, mappings, localMappings, mappingTypeConfig, includeExcluded]);
 
   const filteredItems = useMemo(() => {
     const q = itemFilter.trim().toLowerCase();
@@ -251,6 +323,37 @@ const MappingDashboard: React.FC<MappingDashboardProps> = ({ bom, mappings, loca
             />
           </div>
 
+          {/* Toggle for including excluded attributes in calculations */}
+          {metrics.totalExcludedFeatures > 0 && (
+            <div className="flex items-center gap-3 px-1">
+              <button
+                type="button"
+                onClick={() => setIncludeExcluded(v => !v)}
+                className={`flex items-center gap-2 px-3 py-1.5 rounded-full border text-[9px] font-black uppercase tracking-widest transition-all ${
+                  includeExcluded
+                    ? 'bg-amber-600 border-amber-500 text-white shadow-sm'
+                    : 'bg-white border-slate-200 text-slate-500 hover:bg-slate-50'
+                }`}
+              >
+                <span>{includeExcluded ? 'Excluded Attrs in Calc' : 'Excluded Attrs Ignored'}</span>
+                <span
+                  className={`relative inline-flex h-3.5 w-6 items-center rounded-full border transition-colors ${
+                    includeExcluded ? 'bg-white/20 border-white' : 'bg-slate-100 border-slate-300'
+                  }`}
+                >
+                  <span
+                    className={`inline-block h-2.5 w-2.5 rounded-full bg-white shadow transform transition-transform ${
+                      includeExcluded ? 'translate-x-2.5' : 'translate-x-0.5'
+                    }`}
+                  />
+                </span>
+              </button>
+              <span className="text-[9px] text-slate-400 font-medium">
+                {metrics.totalExcludedFeatures} excluded attribute{metrics.totalExcludedFeatures === 1 ? '' : 's'} ({metrics.excludedValues} value{metrics.excludedValues === 1 ? '' : 's'}) from unchecked categories
+              </span>
+            </div>
+          )}
+
           <div className="mt-2 grid grid-cols-1 md:grid-cols-3 gap-3 text-[10px] text-slate-600">
             <div className="p-3 rounded-xl bg-white border border-slate-100 shadow-sm">
               <p className="text-[9px] font-black text-slate-400 uppercase tracking-widest mb-1">Feature Universe</p>
@@ -289,6 +392,7 @@ const MappingDashboard: React.FC<MappingDashboardProps> = ({ bom, mappings, loca
                     <th className="px-4 py-2 text-left font-black text-slate-500 uppercase tracking-widest text-[9px]">Description</th>
                     <th className="px-4 py-2 text-center font-black text-slate-500 uppercase tracking-widest text-[9px]">Attrs</th>
                     <th className="px-4 py-2 text-center font-black text-slate-500 uppercase tracking-widest text-[9px]">Not Req Attrs</th>
+                    <th className="px-4 py-2 text-center font-black text-slate-500 uppercase tracking-widest text-[9px]">Excluded Attrs</th>
                     <th className="px-4 py-2 text-center font-black text-slate-500 uppercase tracking-widest text-[9px]">Values</th>
                     <th className="px-4 py-2 text-center font-black text-slate-500 uppercase tracking-widest text-[9px]">Status</th>
                   </tr>
@@ -296,7 +400,7 @@ const MappingDashboard: React.FC<MappingDashboardProps> = ({ bom, mappings, loca
                 <tbody>
                   {filteredItems.length === 0 ? (
                     <tr>
-                      <td colSpan={6} className="px-4 py-6 text-center text-slate-400 text-xs">No items match your filter.</td>
+                      <td colSpan={7} className="px-4 py-6 text-center text-slate-400 text-xs">No items match your filter.</td>
                     </tr>
                   ) : filteredItems.map(it => {
                     const mappableAttrs = Math.max(0, it.totalFeatures - it.notRequiredFeatures);
@@ -313,6 +417,15 @@ const MappingDashboard: React.FC<MappingDashboardProps> = ({ bom, mappings, loca
                         </td>
                         <td className="px-4 py-2 text-center text-slate-600 font-semibold">
                           {it.notRequiredFeatures}
+                        </td>
+                        <td className="px-4 py-2 text-center">
+                          {it.excludedFeatures > 0 ? (
+                            <span className="font-bold text-slate-500" title={`${it.excludedFeatures} attr(s), ${it.excludedValues} value(s) from unchecked categories`}>
+                              {it.excludedFeatures}
+                            </span>
+                          ) : (
+                            <span className="text-slate-300">0</span>
+                          )}
                         </td>
                         <td className="px-4 py-2 text-center">
                           <span className={`font-bold ${valPct === 100 ? 'text-green-600' : valPct >= 50 ? 'text-amber-500' : 'text-red-500'}`}>

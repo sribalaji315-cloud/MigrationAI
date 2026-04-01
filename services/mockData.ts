@@ -58,6 +58,7 @@ export const MOCK_GLOBAL_MAPPINGS: GlobalMapping[] = [
   {
     legacyFeatureIds: ["FRM_MAT"],
     newAttributeId: "MAT_COMP",
+    attributeType: "engineering",
     valueMappings: {
       "Aluminum 6061": "ALU_6061",
       "Carbon Fiber T800": "CARB_T800"
@@ -66,6 +67,7 @@ export const MOCK_GLOBAL_MAPPINGS: GlobalMapping[] = [
   {
     legacyFeatureIds: ["WHL_SIZE"],
     newAttributeId: "WHEEL_DIAM",
+    attributeType: "engineering",
     valueMappings: {
       "27.5": "27.5IN",
       "29": "29IN",
@@ -75,16 +77,19 @@ export const MOCK_GLOBAL_MAPPINGS: GlobalMapping[] = [
   {
     legacyFeatureIds: ["DRV_SYS"],
     newAttributeId: "TRANS_GRP",
+    attributeType: "engineering",
     valueMappings: {}
   },
   {
     legacyFeatureIds: ["CLR"],
     newAttributeId: "COLOR_EXT",
+    attributeType: "engineering",
     valueMappings: {}
   },
   {
     legacyFeatureIds: ["SZ"],
     newAttributeId: "SIZE_CAT",
+    attributeType: "engineering",
     valueMappings: {}
   }
 ];

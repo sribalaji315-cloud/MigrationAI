@@ -75,6 +75,7 @@ class GlobalMapping(Base):
     id = Column(Integer, primary_key=True, index=True)
     legacy_feature_ids = Column(JSON, nullable=False)
     new_attribute_id = Column(String, nullable=False)
+    attribute_type = Column(String, nullable=False, default="")
     value_mappings = Column(JSON, nullable=True)
 
 

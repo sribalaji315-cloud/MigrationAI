@@ -36,6 +36,11 @@ function parseCSVToBom(text: string): LegacyItem[] {
   if (idx.itemId < 0) idx.itemId = headers.indexOf('id');
   if (idx.itemDesc < 0) idx.itemDesc = headers.indexOf('description');
 
+  // Require a valueDescription column so values and descriptions are stored separately
+  if (idx.featureValueDesc < 0) {
+    throw new Error('CSV is missing a required "valueDescription" (or "value_description") column. Each feature value must have a corresponding description column.');
+  }
+
   const itemsMap: Record<string, { item: LegacyItem; featuresMap: Record<string, LegacyFeature> }> = {};
 
   for (let i = 1; i < lines.length; i++) {
@@ -49,7 +54,7 @@ function parseCSVToBom(text: string): LegacyItem[] {
     const fDesc = cols[idx.featureDesc] ?? '';
     const fUnit = idx.featureUnit >= 0 ? (cols[idx.featureUnit] ?? '') : '';
     const fVal = cols[idx.featureValue] ?? '';
-    const fValDesc = idx.featureValueDesc >= 0 ? (cols[idx.featureValueDesc] ?? '') : '';
+    const fValDesc = cols[idx.featureValueDesc] ?? '';
 
     if (!itemsMap[itemId]) {
       itemsMap[itemId] = { item: { itemId, description: itemDesc, category: itemCategory, productType: itemProductType, features: [] }, featuresMap: {} };

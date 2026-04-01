@@ -7,11 +7,12 @@ import DataInspector from './components/DataInspector';
 import MappingDashboard from './components/MappingDashboard';
 import LoginSignUp from './components/LoginSignUp';
 import { dbService } from './services/dbService';
-import { GlobalMapping, DataCategory, DatabaseState, User, ConnectionMode, LocalItemMappings, FeatureFlags, ClassAttributeValues } from './types';
+import { GlobalMapping, DataCategory, DatabaseState, User, ConnectionMode, LocalItemMappings, FeatureFlags, ClassAttributeValues, MappingTypeConfig } from './types';
 
 type ItemStatus = 'mapped' | 'unmapped' | 'notRequired';
 
 const normalizeAttrId = (id: string) => (id || '').replace(/[^A-Za-z0-9]/g, '').toUpperCase();
+const normalizeMappingType = (value?: string | null) => (value || '').trim().toLowerCase();
 
 const App: React.FC = () => {
   const [currentUser, setCurrentUser] = useState<User | null>(null);
@@ -23,8 +24,9 @@ const App: React.FC = () => {
   const [dbState, setDbState] = useState<DatabaseState | null>(null);
   const [activeInspector, setActiveInspector] = useState<DataCategory | null>(null);
   const [showDashboard, setShowDashboard] = useState(false);
+  const [showUnmappedOnlyInSidebar, setShowUnmappedOnlyInSidebar] = useState(false);
   const [bomFilters, setBomFilters] = useState<{ categories: string[]; productTypes: string[] }>({ categories: [], productTypes: [] });
-  const [dashboardSnapshot, setDashboardSnapshot] = useState<{ bom: DatabaseState['bom']; mappings: DatabaseState['mappings']; localMappings: DatabaseState['localMappings'] } | null>(null);
+  const [dashboardSnapshot, setDashboardSnapshot] = useState<{ bom: DatabaseState['bom']; mappings: DatabaseState['mappings']; localMappings: DatabaseState['localMappings']; mappingTypeConfig?: MappingTypeConfig } | null>(null);
   const [featureFlags, setFeatureFlags] = useState<FeatureFlags>(() => ({
     useNewClassTargetMapping: import.meta.env.VITE_USE_NEW_CLASS_TARGET_MAPPING === 'true',
   }));
@@ -57,6 +59,7 @@ const App: React.FC = () => {
       const { state, mode } = await dbService.fetchAll({ includeBom: false });
       const activeUser = user ?? currentUser;
       let lockedItems: DatabaseState['bom'] = [];
+      let adminFallbackItems: DatabaseState['bom'] = [];
       if (activeUser) {
         const lockIds = Object.values(state.locks || {})
           .filter(lock => activeUser.role === 'admin' || lock.userId === activeUser.userId)
@@ -69,12 +72,20 @@ const App: React.FC = () => {
           } catch (err) {
             console.warn('Failed to fetch locked BOM items', err);
           }
+        } else if (activeUser.role === 'admin') {
+          try {
+            // Admin fallback: after a hard reload there may be no active locks yet.
+            // Load an initial page so BOM data remains visible and users can sign on.
+            adminFallbackItems = await dbService.fetchBomItems(undefined, undefined, { limit: 500, offset: 0 });
+          } catch (err) {
+            console.warn('Failed to fetch admin fallback BOM items', err);
+          }
         }
       }
 
       setDbState(prev => ({
         ...state,
-        bom: lockedItems.length ? lockedItems : (prev?.bom || []),
+        bom: lockedItems.length ? lockedItems : (adminFallbackItems.length ? adminFallbackItems : (prev?.bom || [])),
       }));
       setConnectionMode(mode);
       try {
@@ -184,6 +195,7 @@ const App: React.FC = () => {
         bom: state.bom || [],
         mappings: state.mappings || [],
         localMappings: state.localMappings || {},
+        mappingTypeConfig: state.mappingTypeConfig,
       });
     } catch (err) {
       console.warn('Failed to fetch dashboard snapshot', err);
@@ -201,7 +213,14 @@ const App: React.FC = () => {
     if (!dbState) return;
     let nextState = { ...dbState };
 
-    if (category === 'mapping') nextState.mappings = updatedData;
+    if (category === 'mapping') {
+      if (Array.isArray(updatedData)) {
+        nextState.mappings = updatedData;
+      } else {
+        nextState.mappings = updatedData?.mappings || [];
+        nextState.mappingTypeConfig = updatedData?.mappingTypeConfig;
+      }
+    }
     if (category === 'classification' || category === 'values') nextState.classifications = updatedData;
     if (category === 'bom') nextState.bom = updatedData;
     if (category === 'users') nextState.users = updatedData;
@@ -254,21 +273,26 @@ const App: React.FC = () => {
 
   const visibleBomItems = useMemo(() => {
     if (!dbState || !currentUser) return [] as DatabaseState['bom'];
+    if (currentUser.role === 'admin') {
+      return dbState.bom || [];
+    }
     const lockedIds = new Set(
       Object.values(dbState.locks || {})
-        .filter(lock => currentUser.role === 'admin' || lock.userId === currentUser.userId)
+        .filter(lock => lock.userId === currentUser.userId)
         .map(lock => lock.itemId)
     );
     return (dbState.bom || []).filter(item => lockedIds.has(item.itemId));
   }, [dbState, currentUser]);
 
-  useEffect(() => {
-    if (selectedItemId && !visibleBomItems.some(item => item.itemId === selectedItemId)) {
-      setSelectedItemId(null);
+  const includedMappingTypes = useMemo(() => {
+    const available = (dbState?.mappingTypeConfig?.availableTypes || []).map(normalizeMappingType).filter(Boolean);
+    const included = (dbState?.mappingTypeConfig?.includedTypes || []).map(normalizeMappingType).filter(Boolean);
+    if (!available.length) {
+      return null;
     }
-  }, [selectedItemId, visibleBomItems]);
-
-  const selectedItem = visibleBomItems.find(item => item.itemId === selectedItemId) || null;
+    const includeSet = new Set(included.length ? included : available);
+    return includeSet;
+  }, [dbState]);
 
   const itemStatuses = useMemo(() => {
     if (!dbState) return {} as Record<string, ItemStatus>;
@@ -282,7 +306,17 @@ const App: React.FC = () => {
     });
 
     const globalByFeature = new Map<string, GlobalMapping>();
+    const allGlobalByFeature = new Map<string, GlobalMapping>();
     (dbState.mappings || []).forEach(mapping => {
+      mapping.legacyFeatureIds.forEach(id => {
+        allGlobalByFeature.set(id, mapping);
+      });
+      const attrType = normalizeMappingType(mapping.attributeType);
+      if (!includedMappingTypes) {
+        if (!attrType) return;
+      } else if (!includedMappingTypes.has(attrType)) {
+        return;
+      }
       mapping.legacyFeatureIds.forEach(id => {
         globalByFeature.set(id, mapping);
       });
@@ -306,11 +340,19 @@ const App: React.FC = () => {
 
       let hasUnmapped = false;
       let anyMapped = false;
-      let allNotRequired = item.features.length > 0;
+      let allNotRequired = true;
+      let consideredFeatures = 0;
 
       item.features.forEach(feature => {
         const localOverride = localOverrides.get(feature.featureId);
         const globalMapping = globalByFeature.get(feature.featureId);
+        const fallbackGlobalMapping = allGlobalByFeature.get(feature.featureId);
+        const effectiveMappingForType = localOverride || fallbackGlobalMapping;
+        const effectiveType = normalizeMappingType(effectiveMappingForType?.attributeType);
+        if (includedMappingTypes && effectiveType && !includedMappingTypes.has(effectiveType)) {
+          return;
+        }
+        consideredFeatures += 1;
 
         const collectCandidates = (source?: string | null) => {
           if (!source) return [] as string[];
@@ -366,7 +408,8 @@ const App: React.FC = () => {
       });
 
       let status: ItemStatus;
-      if (hasUnmapped) status = 'unmapped';
+      if (consideredFeatures === 0) status = 'notRequired';
+      else if (hasUnmapped) status = 'unmapped';
       else if (!anyMapped && allNotRequired) status = 'notRequired';
       else status = 'mapped';
 
@@ -374,7 +417,20 @@ const App: React.FC = () => {
     });
 
     return statusMap;
-  }, [dbState, featureFlags.useNewClassTargetMapping]);
+  }, [dbState, featureFlags.useNewClassTargetMapping, includedMappingTypes]);
+
+  const sidebarItems = useMemo(() => {
+    if (!showUnmappedOnlyInSidebar) return visibleBomItems;
+    return visibleBomItems.filter(item => itemStatuses[item.itemId] === 'unmapped');
+  }, [visibleBomItems, showUnmappedOnlyInSidebar, itemStatuses]);
+
+  useEffect(() => {
+    if (selectedItemId && !sidebarItems.some(item => item.itemId === selectedItemId)) {
+      setSelectedItemId(null);
+    }
+  }, [selectedItemId, sidebarItems]);
+
+  const selectedItem = sidebarItems.find(item => item.itemId === selectedItemId) || null;
 
   if (!currentUser) {
     return <LoginSignUp onLogin={handleLogin} />;
@@ -399,6 +455,83 @@ const App: React.FC = () => {
     }));
   };
 
+  const handleExportBomCsv = () => {
+    if (!dbState) return;
+    const allBom = dbState.bom || [];
+    const allMappings = dbState.mappings || [];
+    const allLocalMappings = dbState.localMappings || {};
+
+    // Build global mapping lookup by feature
+    const globalByFeature: Record<string, GlobalMapping[]> = {};
+    allMappings.forEach(m => {
+      (m.legacyFeatureIds || []).forEach(fid => {
+        if (!globalByFeature[fid]) globalByFeature[fid] = [];
+        globalByFeature[fid].push(m);
+      });
+    });
+
+    const escCsv = (val: string) => {
+      if (val.includes(',') || val.includes('"') || val.includes('\n')) {
+        return '"' + val.replace(/"/g, '""') + '"';
+      }
+      return val;
+    };
+
+    const rows: string[] = ['Item ID,Description,Legacy Attribute,Legacy Value,Target Attribute,Target Value,Attribute Type'];
+
+    allBom.forEach(item => {
+      const localForItem = allLocalMappings[item.itemId] || [];
+      const localByFeature: Record<string, GlobalMapping> = {};
+      localForItem.forEach(m => {
+        (m.legacyFeatureIds || []).forEach(fid => {
+          localByFeature[fid] = m;
+        });
+      });
+
+      item.features.forEach(feature => {
+        const localMapping = localByFeature[feature.featureId];
+        const globalMappings = globalByFeature[feature.featureId] || [];
+        const primaryGlobal = globalMappings[0] || null;
+        const effective = localMapping || primaryGlobal;
+        const targetAttr = effective?.newAttributeId || '';
+        const attrType = effective?.attributeType || primaryGlobal?.attributeType || '';
+
+        if (feature.values.length === 0) {
+          rows.push(
+            [item.itemId, item.description || '', feature.featureId, '', targetAttr, '', attrType].map(escCsv).join(',')
+          );
+        } else {
+          feature.values.forEach(val => {
+            let targetVal = effective?.valueMappings?.[val] ?? '';
+            // Fallback: if exact key yields empty, try short-code prefix (e.g. "TR00F" from "TR00F Black")
+            if (!targetVal && effective?.valueMappings) {
+              const spaceIdx = val.indexOf(' ');
+              if (spaceIdx > 0) {
+                const prefix = val.substring(0, spaceIdx);
+                const prefixVal = effective.valueMappings[prefix];
+                if (prefixVal) targetVal = prefixVal;
+              }
+            }
+            rows.push(
+              [item.itemId, item.description || '', feature.featureId, val, targetAttr, targetVal, attrType].map(escCsv).join(',')
+            );
+          });
+        }
+      });
+    });
+
+    const csv = rows.join('\n');
+    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `bom_export_${new Date().toISOString().slice(0, 10)}.csv`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  };
+
   return (
     <div className="flex flex-col h-screen bg-slate-50 overflow-hidden font-sans antialiased">
       <BOMHeader 
@@ -409,6 +542,7 @@ const App: React.FC = () => {
         currentUser={currentUser}
         onLogout={handleLogout}
         onClearCache={handleClearCache}
+        onExportBomCsv={handleExportBomCsv}
         onOpenDashboard={() => {
           setShowDashboard(true);
           handleFetchDashboardSnapshot();
@@ -430,18 +564,21 @@ const App: React.FC = () => {
         )}
 
         <ItemSidebar 
-          items={visibleBomItems} 
+          items={sidebarItems} 
           selectedId={selectedItemId} 
           onSelect={setSelectedItemId} 
           locks={dbState.locks}
           currentUserId={currentUser.userId}
           itemStatuses={itemStatuses}
+          showUnmappedOnly={showUnmappedOnlyInSidebar}
+          onToggleUnmappedOnly={() => setShowUnmappedOnlyInSidebar(v => !v)}
         />
         
         <MappingWorkspace 
           item={selectedItem}
           classes={dbState.classifications}
           globalMappings={dbState.mappings}
+          mappingTypeConfig={dbState.mappingTypeConfig}
           localItemMappings={dbState.localMappings}
           classAttributeValues={dbState.classAttributeValues || {}}
           assignedClassId={selectedItemId ? dbState.itemClassifications[selectedItemId] : null}
@@ -467,6 +604,7 @@ const App: React.FC = () => {
               bom: dbState.bom,
               users: dbState.users
             }}
+            mappingTypeConfig={dbState.mappingTypeConfig}
             onSave={handleSaveInspectorData}
             onSwitchUser={(user) => {
                setCurrentUser(user);
@@ -485,6 +623,7 @@ const App: React.FC = () => {
             bom={dashboardSnapshot?.bom || []}
             mappings={dashboardSnapshot?.mappings || []}
             localMappings={dashboardSnapshot?.localMappings || {}}
+            mappingTypeConfig={dashboardSnapshot?.mappingTypeConfig}
             onRecompute={handleFetchDashboardSnapshot}
             onClose={() => {
               setShowDashboard(false);

@@ -1,6 +1,6 @@
 
 import React, { useState, useEffect, useRef, useMemo } from 'react';
-import { DataCategory, GlobalMapping, NewClassification, NewAttribute, LegacyItem, LegacyFeature, User, ItemLock } from '../types';
+import { DataCategory, GlobalMapping, NewClassification, NewAttribute, LegacyItem, LegacyFeature, User, ItemLock, MappingTypeConfig } from '../types';
 import { dbService } from '../services/dbService';
 
 interface DataInspectorProps {
@@ -13,6 +13,7 @@ interface DataInspectorProps {
     bom: LegacyItem[];
     users: User[];
   };
+  mappingTypeConfig?: MappingTypeConfig;
   onSave: (category: DataCategory, updatedData: any) => void | Promise<void>;
   onSwitchUser?: (user: User) => void;
   currentUser: User; // used to determine admin privileges
@@ -116,9 +117,14 @@ const LegacyValueSelector: React.FC<LegacyValueSelectorProps> = ({ value, option
   );
 };
 
-const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, onSave, onSwitchUser, currentUser, bomFilters, onFetchBomItems, locks, onSignOnItem }) => {
+const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, mappingTypeConfig, onSave, onSwitchUser, currentUser, bomFilters, onFetchBomItems, locks, onSignOnItem }) => {
   const normalizeKey = (value?: string | null) => (value || '').trim().toLowerCase();
+  const normalizeAttributeType = (value?: string | null): string => (value || '').trim().toLowerCase();
   const [localMapping, setLocalMapping] = useState<GlobalMapping[]>([]);
+  const [availableAttributeTypes, setAvailableAttributeTypes] = useState<string[]>([]);
+  const [includedAttributeTypes, setIncludedAttributeTypes] = useState<string[]>([]);
+  const [newAttributeType, setNewAttributeType] = useState('');
+  const [exportTypeFilter, setExportTypeFilter] = useState('__all__');
   const [localClassification, setLocalClassification] = useState<NewClassification[]>([]);
   const [localBom, setLocalBom] = useState<LegacyItem[]>([]);
   const [hasCsvUploaded, setHasCsvUploaded] = useState(false);
@@ -152,15 +158,147 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
     return JSON.parse(JSON.stringify(value));
   };
 
+  const prunePlaceholderMappings = (mappings: GlobalMapping[]): GlobalMapping[] => {
+    const realMappingFeatures = new Set<string>();
+
+    (mappings || []).forEach(mapping => {
+      const targetAttr = (mapping.newAttributeId || '').trim();
+      if (!targetAttr) return;
+      (mapping.legacyFeatureIds || []).forEach(featureId => {
+        const normalized = (featureId || '').trim();
+        if (normalized) {
+          realMappingFeatures.add(normalized);
+        }
+      });
+    });
+
+    return (mappings || []).filter(mapping => {
+      const targetAttr = (mapping.newAttributeId || '').trim();
+      const featureIds = (mapping.legacyFeatureIds || []).map(fid => (fid || '').trim()).filter(Boolean);
+      if (targetAttr || featureIds.length !== 1) {
+        return true;
+      }
+      return !realMappingFeatures.has(featureIds[0]);
+    });
+  };
+
+  const ensureMappingsCoverBom = (mappings: GlobalMapping[], bomItems: LegacyItem[]): GlobalMapping[] => {
+    const featureValues = new Map<string, Set<string>>();
+    (bomItems || []).forEach(item => {
+      (item.features || []).forEach(feature => {
+        const featureId = (feature.featureId || '').trim();
+        if (!featureId) return;
+        const bucket = featureValues.get(featureId) || new Set<string>();
+        (feature.values || []).forEach(v => {
+          const val = String(v || '').trim();
+          if (val) bucket.add(val);
+        });
+        featureValues.set(featureId, bucket);
+      });
+    });
+
+    const next = (mappings || []).map(m => ({
+      ...m,
+      legacyFeatureIds: [...(m.legacyFeatureIds || [])],
+      valueMappings: { ...(m.valueMappings || {}) },
+      attributeType: normalizeAttributeType((m as any).attributeType),
+    }));
+
+    const featureToMappingIndexes = new Map<string, number[]>();
+    next.forEach((mapping, idx) => {
+      (mapping.legacyFeatureIds || []).forEach(fid => {
+        if (!fid) return;
+        const bucket = featureToMappingIndexes.get(fid) || [];
+        bucket.push(idx);
+        featureToMappingIndexes.set(fid, bucket);
+      });
+    });
+
+    const getTargetIndexes = (featureId: string) => {
+      const candidateIndexes = featureToMappingIndexes.get(featureId) || [];
+      const realIndexes = candidateIndexes.filter(idx => {
+        const targetAttr = (next[idx]?.newAttributeId || '').trim();
+        return Boolean(targetAttr);
+      });
+      return realIndexes.length ? realIndexes : candidateIndexes;
+    };
+
+    let changed = false;
+
+    featureValues.forEach((values, featureId) => {
+      let targetIndexes = getTargetIndexes(featureId);
+      if (!targetIndexes.length) {
+        next.push({
+          legacyFeatureIds: [featureId],
+          newAttributeId: '',
+          attributeType: '',
+          valueMappings: {},
+        });
+        targetIndexes = [next.length - 1];
+        featureToMappingIndexes.set(featureId, [...(featureToMappingIndexes.get(featureId) || []), next.length - 1]);
+        changed = true;
+      }
+
+      targetIndexes.forEach(mappingIndex => {
+        const mapping = next[mappingIndex];
+        if (!mapping.valueMappings) {
+          mapping.valueMappings = {};
+          changed = true;
+        }
+
+        values.forEach(val => {
+          if (!(val in mapping.valueMappings)) {
+            mapping.valueMappings[val] = '';
+            changed = true;
+          }
+        });
+      });
+    });
+
+    const pruned = prunePlaceholderMappings(next);
+    if (pruned.length !== next.length) {
+      changed = true;
+    }
+
+    return changed ? pruned : mappings;
+  };
+
   useEffect(() => {
     const needsMapping = category === 'mapping';
     const needsClassification = category === 'classification' || category === 'values';
     const needsBom = category === 'bom' || category === 'mapping';
     const needsUsers = category === 'users';
 
-    setLocalMapping(needsMapping ? cloneData(data.mapping) : []);
+    const nextBom = needsBom ? cloneData(data.bom) : [];
+    const nextMappingBase = needsMapping
+      ? cloneData(data.mapping).map(m => ({
+          ...m,
+          attributeType: normalizeAttributeType((m as any).attributeType),
+        }))
+      : [];
+    const nextMapping = needsMapping ? ensureMappingsCoverBom(nextMappingBase, nextBom) : [];
+    const discoveredTypes = Array.from(
+      new Set(
+        nextMapping
+          .map(m => normalizeAttributeType((m as any).attributeType))
+          .filter(Boolean)
+      )
+    );
+    const configuredTypes = (mappingTypeConfig?.availableTypes || []).map(normalizeAttributeType).filter(Boolean);
+    const availableTypes = Array.from(new Set([...configuredTypes, ...discoveredTypes]));
+    const configuredIncluded = (mappingTypeConfig?.includedTypes || []).map(normalizeAttributeType).filter(Boolean);
+    const includedTypes = availableTypes.filter(t => (configuredIncluded.length ? configuredIncluded.includes(t) : true));
+
+    setLocalMapping(nextMapping);
+    setAvailableAttributeTypes(availableTypes);
+    setIncludedAttributeTypes(includedTypes);
+    setNewAttributeType('');
+    setExportTypeFilter('__all__');
+    if (needsMapping && currentUser.role === 'admin') {
+      setHasCsvUploaded(true);
+    }
     setLocalClassification(needsClassification ? cloneData(data.classification) : []);
-    setLocalBom(needsBom ? cloneData(data.bom) : []);
+    setLocalBom(nextBom);
     setLocalUsers(needsUsers ? cloneData(data.users || []) : []);
     setBomCategory('');
     setBomProductType('');
@@ -179,7 +317,7 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
     setSelectedAttributeId(null);
     setRemoteAttribute(null);
     setIsAttributeLoading(false);
-  }, [data, category, bomFilters]);
+  }, [data, category, bomFilters, mappingTypeConfig, currentUser.role]);
 
   const refreshBomFilters = async (nextCategory: string, nextProductType: string) => {
     try {
@@ -483,7 +621,8 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
       const legacy = (m.legacyFeatureIds || []).join('|').toLowerCase();
       const target = (m.newAttributeId || '').toLowerCase();
       const desc = (attributeDescriptions[m.newAttributeId] || '').toLowerCase();
-      return legacy.includes(q) || target.includes(q) || desc.includes(q);
+      const attrType = normalizeAttributeType((m as any).attributeType);
+      return legacy.includes(q) || target.includes(q) || desc.includes(q) || attrType.includes(q);
     });
   }, [localMapping, mappingSearch, attributeDescriptions]);
 
@@ -607,6 +746,32 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
     return rows;
   };
 
+  const isTypeIncludedInExport = (value?: string | null) => {
+    if (exportTypeFilter === '__all__') return true;
+    return normalizeAttributeType(value) === exportTypeFilter;
+  };
+
+  const addAttributeType = () => {
+    const nextType = normalizeAttributeType(newAttributeType);
+    if (!nextType) return;
+    if (availableAttributeTypes.includes(nextType)) {
+      setNewAttributeType('');
+      return;
+    }
+    setAvailableAttributeTypes(prev => [...prev, nextType]);
+    setIncludedAttributeTypes(prev => [...prev, nextType]);
+    setNewAttributeType('');
+    setHasCsvUploaded(true);
+  };
+
+  const toggleIncludedAttributeType = (type: string) => {
+    setIncludedAttributeTypes(prev => {
+      if (prev.includes(type)) return prev.filter(t => t !== type);
+      return [...prev, type];
+    });
+    setHasCsvUploaded(true);
+  };
+
   const handleDownloadTemplate = () => {
     if (category === 'users') return;
     if ((category === 'classification' || category === 'values') && currentUser.role !== 'admin') {
@@ -617,9 +782,12 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
     let rows: string[][] = [];
 
     if (category === 'mapping') {
+      const sampleTypeA = availableAttributeTypes[0] || 'type_a';
+      const sampleTypeB = availableAttributeTypes[1] || sampleTypeA;
       rows = [
-        ['legacyFeatureIds', 'newAttributeId', 'valuePairs'],
-        ['FRM_MAT|FRAME_SPEC', 'MAT_COMP', 'RED:RED_MAT|BLUE:BLUE_MAT'],
+        ['legacyFeatureIds', 'newAttributeId', 'attributeType', 'legacy value', 'new value'],
+        ['FRM_MAT', 'MAT_COMP', sampleTypeA, 'RED', 'RED_MAT'],
+        ['FRM_MFG', 'MAT_MFG1;MAT_MFG2', sampleTypeB, 'VIOLET', 'VIOLETNEW'],
       ];
     } else if (category === 'classification' || category === 'values') {
       rows = [
@@ -640,6 +808,77 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
     const link = document.createElement('a');
     link.href = url;
     link.download = `${category}-template.csv`;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
+  };
+
+  const handleExportRawMappings = () => {
+    if (category !== 'mapping') return;
+
+    const rows: string[][] = [['legacyFeatureIds', 'newAttributeId', 'attributeType', 'legacy value', 'new value']];
+
+    localMapping.forEach(m => {
+      if (!isTypeIncludedInExport(m.attributeType)) return;
+      const featureCell = (m.legacyFeatureIds || []).join('|');
+      const targetCell = m.newAttributeId || '';
+      const attrTypeCell = normalizeAttributeType((m as any).attributeType);
+      const pairs = Object.entries(m.valueMappings || {});
+
+      if (!pairs.length) {
+        rows.push([featureCell, targetCell, attrTypeCell, '', '']);
+        return;
+      }
+
+      pairs.forEach(([legacyValue, newValue]) => {
+        rows.push([featureCell, targetCell, attrTypeCell, legacyValue || '', newValue || '']);
+      });
+    });
+
+    const csv = buildCsv(rows);
+    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = 'global-mapping-raw.csv';
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
+  };
+
+  const handleExportExpandedMappings = () => {
+    if (category !== 'mapping') return;
+
+    const rows: string[][] = [['legacyFeatureId', 'newAttributeId', 'attributeType', 'legacy value', 'new value']];
+
+    localMapping.forEach(m => {
+      if (!isTypeIncludedInExport(m.attributeType)) return;
+      const featureIds = (m.legacyFeatureIds || []).filter(Boolean);
+      const targetCell = m.newAttributeId || '';
+      const attrTypeCell = normalizeAttributeType((m as any).attributeType);
+      const pairs = Object.entries(m.valueMappings || {});
+      const sourceFeatures = featureIds.length ? featureIds : [''];
+
+      sourceFeatures.forEach(featureId => {
+        if (!pairs.length) {
+          rows.push([featureId, targetCell, attrTypeCell, '', '']);
+          return;
+        }
+
+        pairs.forEach(([legacyValue, newValue]) => {
+          rows.push([featureId, targetCell, attrTypeCell, legacyValue || '', newValue || '']);
+        });
+      });
+    });
+
+    const csv = buildCsv(rows);
+    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = 'global-mapping-raw-expanded.csv';
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
@@ -678,32 +917,112 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
       }
 
       if (category === 'mapping') {
-        const imported: GlobalMapping[] = rows.map(r => {
-          const legacyFeatureIds = (r['legacyFeatureIds'] || '')
-            .split('|')
+        const parseList = (raw: string, delimiters: RegExp): string[] => {
+          return (raw || '')
+            .split(delimiters)
             .map(s => s.trim())
             .filter(Boolean);
-          const newAttributeId = r['newAttributeId'] || '';
-          const valuePairs = (r['valuePairs'] || '').split('|').map(s => s.trim()).filter(Boolean);
-          const valueMappings: Record<string, string> = {};
+        };
+        const allowedTypes = new Set(availableAttributeTypes.map(normalizeAttributeType).filter(Boolean));
+
+        const imported: GlobalMapping[] = [];
+        rows.forEach((r, rowIndex) => {
+          const legacyFeatureIds = parseList(r['legacyFeatureIds'] || r['legacyFeatureId'] || '', /[|,;]/);
+          if (!legacyFeatureIds.length) return;
+
+          const rawNewAttributes = (r['newAttributeId'] || r['new attribute'] || '').trim();
+          const parsedAttributeIds = parseList(rawNewAttributes, /;/);
+          const newAttributeIds = parsedAttributeIds.length ? parsedAttributeIds : [''];
+          const attributeType = normalizeAttributeType(r['attributeType'] || r['attribute type'] || r['type']);
+          if (attributeType && !allowedTypes.has(attributeType)) {
+            throw new Error(`Row ${rowIndex + 2}: attributeType "${attributeType}" is not defined in Attribute Type Configuration.`);
+          }
+
+          const legacyValue = (r['legacy value'] || r['legacyValue'] || r['legacy_value'] || '').trim();
+          const newValue = (r['new value'] || r['newValue'] || r['new_value'] || '').trim();
+          const valuePairs = parseList(r['valuePairs'] || r['valuepairs'] || '', /\|/);
+
+          const rowValueMappings: Record<string, string> = {};
           valuePairs.forEach(p => {
             const [from, to] = p.split(':');
-            if (from && to) valueMappings[from.trim()] = to.trim();
+            const fromVal = (from || '').trim();
+            const toVal = (to || '').trim();
+            if (fromVal && toVal) rowValueMappings[fromVal] = toVal;
           });
-          return { legacyFeatureIds, newAttributeId, valueMappings };
+          if (legacyValue && newValue) {
+            rowValueMappings[legacyValue] = newValue;
+          }
+
+          newAttributeIds.forEach(newAttributeId => {
+            imported.push({
+              legacyFeatureIds: [...legacyFeatureIds],
+              newAttributeId,
+              attributeType,
+              valueMappings: { ...rowValueMappings },
+            });
+          });
         });
-        const existing = [...localMapping];
-        const isSameMapping = (a: GlobalMapping, b: GlobalMapping) => {
-          const aKey = (a.legacyFeatureIds || []).slice().sort().join('|');
-          const bKey = (b.legacyFeatureIds || []).slice().sort().join('|');
-          return aKey === bKey && (a.newAttributeId || '') === (b.newAttributeId || '');
+
+        const existing = localMapping.map(m => ({
+          ...m,
+          legacyFeatureIds: [...(m.legacyFeatureIds || [])],
+          attributeType: normalizeAttributeType((m as any).attributeType),
+          valueMappings: { ...(m.valueMappings || {}) },
+        }));
+
+        const keyFor = (mapping: GlobalMapping) => {
+          const featureKey = (mapping.legacyFeatureIds || []).slice().sort().join('|');
+          const attrType = normalizeAttributeType(mapping.attributeType);
+          return `${featureKey}=>${mapping.newAttributeId || ''}=>${attrType}`;
         };
-        imported.forEach(m => {
-          if (!existing.some(em => isSameMapping(em, m))) {
-            existing.push(m);
+
+        const baseKeyFor = (mapping: GlobalMapping) => {
+          const featureKey = (mapping.legacyFeatureIds || []).slice().sort().join('|');
+          return `${featureKey}=>${mapping.newAttributeId || ''}`;
+        };
+
+        const existingByKey = new Map<string, GlobalMapping>();
+        const existingByBaseKey = new Map<string, GlobalMapping>();
+        existing.forEach(m => {
+          existingByKey.set(keyFor(m), m);
+          if (!existingByBaseKey.has(baseKeyFor(m))) {
+            existingByBaseKey.set(baseKeyFor(m), m);
           }
         });
-        setLocalMapping(existing);
+
+        imported.forEach(m => {
+          const key = keyFor(m);
+          const baseKey = baseKeyFor(m);
+          let existingMapping = existingByKey.get(key) || existingByBaseKey.get(baseKey);
+          if (!existingMapping) {
+            const clone: GlobalMapping = {
+              legacyFeatureIds: [...(m.legacyFeatureIds || [])],
+              newAttributeId: m.newAttributeId,
+              attributeType: normalizeAttributeType(m.attributeType),
+              valueMappings: { ...(m.valueMappings || {}) },
+            };
+            existing.push(clone);
+            existingByKey.set(key, clone);
+            existingByBaseKey.set(baseKey, clone);
+            return;
+          }
+
+          const incomingType = normalizeAttributeType(m.attributeType);
+          if (incomingType && normalizeAttributeType(existingMapping.attributeType) !== incomingType) {
+            const oldExactKey = keyFor(existingMapping);
+            existingMapping.attributeType = incomingType;
+            existingByKey.delete(oldExactKey);
+            existingByKey.set(keyFor(existingMapping), existingMapping);
+          }
+
+          Object.entries(m.valueMappings || {}).forEach(([legacy, nextVal]) => {
+            if (legacy) {
+              existingMapping.valueMappings[legacy] = nextVal;
+            }
+          });
+        });
+
+        setLocalMapping(prunePlaceholderMappings(existing));
         setHasCsvUploaded(true);
       } else if (category === 'classification' || category === 'values') {
         // --- Optimised path: Map-based O(1) lookups + no intermediate row objects + async batching ---
@@ -805,6 +1124,15 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
         // Support both the app's BOM template and ggg.csv format:
         // - Template: itemId, description, featureId, featureDescription, values (pipe-separated)
         // - ggg.csv: itemId, itemDescription, featureId, featureDescription, featureValue (one per row)
+
+        // Require a valueDescriptions column so values and descriptions are stored separately
+        const firstRow = rows[0] || {};
+        const headerKeys = Object.keys(firstRow);
+        const hasValueDescCol = headerKeys.some(h => h === 'valueDescriptions' || h === 'value_description' || h === 'valueDescription');
+        if (!hasValueDescCol) {
+          throw new Error('CSV is missing a required "valueDescriptions" (or "value_description") column. Each feature value must have a corresponding description column.');
+        }
+
         const byItem: Record<string, LegacyItem> = {};
 
         // seed map with existing BOM so imports add on top
@@ -844,13 +1172,10 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
             .map(s => s.trim())
             .filter(Boolean);
 
+          const hasDescCol = !!(r['valueDescriptions']);
           const rawValueDescs = (r['valueDescriptions'] || '')
             .split('|')
             .map(s => s.trim());
-
-          if (!rawValues.length) {
-            return;
-          }
 
           let feature = byItem[itemId].features.find(f => f.featureId === featureId);
           if (!feature) {
@@ -880,7 +1205,7 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
       setCsvImportProgress(100);
     } catch (err) {
       console.error('CSV import failed', err);
-      alert('Failed to parse CSV file. Please verify the format matches the template.');
+      alert(`Failed to parse CSV file: ${(err as any)?.message || 'Please verify the format matches the template.'}`);
     } finally {
       setTimeout(() => {
         setIsCsvImporting(false);
@@ -899,6 +1224,9 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
       setIsBomSyncing(true);
       const items = await onFetchBomItems(bomCategory || undefined, bomProductType || undefined);
       setLocalBom(items || []);
+      if (category === 'mapping') {
+        setLocalMapping(prev => ensureMappingsCoverBom(prev, items || []));
+      }
       setSelectedBomItemId(items?.[0]?.itemId || null);
       setBomSearch('');
       setPage(0);
@@ -912,7 +1240,17 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
   const handleSave = async () => {
     setIsSaving(true);
     try {
-      if (category === 'mapping') await onSave('mapping', localMapping);
+      if (category === 'mapping') {
+        const sanitizedMappings = prunePlaceholderMappings(localMapping);
+        setLocalMapping(sanitizedMappings);
+        await onSave('mapping', {
+          mappings: sanitizedMappings,
+          mappingTypeConfig: {
+            availableTypes: availableAttributeTypes,
+            includedTypes: includedAttributeTypes.filter(type => availableAttributeTypes.includes(type)),
+          },
+        });
+      }
       if (category === 'classification' || category === 'values') await onSave('classification', localClassification);
       if (category === 'bom') await onSave('bom', localBom);
       if (category === 'users') await onSave('users', localUsers);
@@ -931,7 +1269,7 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
     }
 
     if (category === 'mapping') {
-      const next = [...localMapping, { legacyFeatureIds: [], newAttributeId: '', valueMappings: {} }];
+      const next = [...localMapping, { legacyFeatureIds: [], newAttributeId: '', attributeType: '', valueMappings: {} }];
       setLocalMapping(next);
       setSelectedMappingIndex(next.length - 1);
     } else if (category === 'classification' || category === 'values') {
@@ -1027,6 +1365,35 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
                   >
                     Download CSV Template
                   </button>
+                  {category === 'mapping' && (
+                    <>
+                      <select
+                        value={exportTypeFilter}
+                        onChange={(e) => setExportTypeFilter(e.target.value)}
+                        className="px-2 py-1.5 border border-slate-200 bg-white rounded-lg text-[9px] font-black text-slate-600 uppercase tracking-widest"
+                        title="Filter export by attribute type"
+                      >
+                        <option value="__all__">all types</option>
+                        {availableAttributeTypes.map(type => (
+                          <option key={type} value={type}>{type}</option>
+                        ))}
+                      </select>
+                      <button
+                        type="button"
+                        onClick={handleExportRawMappings}
+                        className="px-3 py-1.5 border border-emerald-200 bg-emerald-50 rounded-lg text-[9px] font-black text-emerald-700 hover:bg-emerald-100 transition-all uppercase tracking-widest"
+                      >
+                        Export Raw
+                      </button>
+                      <button
+                        type="button"
+                        onClick={handleExportExpandedMappings}
+                        className="px-3 py-1.5 border border-teal-200 bg-teal-50 rounded-lg text-[9px] font-black text-teal-700 hover:bg-teal-100 transition-all uppercase tracking-widest"
+                      >
+                        Export Expanded
+                      </button>
+                    </>
+                  )}
                   <button
                     type="button"
                     onClick={() => !isCsvImporting && fileInputRef.current?.click()}
@@ -1180,6 +1547,52 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
             )}
           </div>
 
+          {category === 'mapping' && (
+            <div className="mb-4 rounded-xl border border-slate-200 bg-white p-3">
+              <div className="flex flex-wrap items-center gap-2 justify-between">
+                <p className="text-[9px] font-black text-slate-400 uppercase tracking-widest">Attribute Type Configuration</p>
+                <div className="flex items-center gap-2">
+                  <input
+                    type="text"
+                    value={newAttributeType}
+                    onChange={(e) => setNewAttributeType(e.target.value)}
+                    placeholder="new type"
+                    className="px-2 py-1.5 text-[9px] font-black uppercase rounded-md border border-slate-200 bg-slate-50 text-slate-700 outline-none focus:border-indigo-400"
+                  />
+                  <button
+                    type="button"
+                    onClick={addAttributeType}
+                    className="px-2.5 py-1.5 rounded-md border border-indigo-200 bg-indigo-50 text-[9px] font-black uppercase tracking-widest text-indigo-700 hover:bg-indigo-100"
+                  >
+                    Add Type
+                  </button>
+                </div>
+              </div>
+              <p className="mt-1 text-[9px] text-slate-500">Checked types are included in mapping statistics and dashboard coverage.</p>
+              <div className="mt-2 flex flex-wrap gap-2">
+                {availableAttributeTypes.length === 0 && (
+                  <span className="text-[9px] text-slate-400">No types configured yet.</span>
+                )}
+                {availableAttributeTypes.map(type => {
+                  const included = includedAttributeTypes.includes(type);
+                  return (
+                    <label
+                      key={type}
+                      className={`inline-flex items-center gap-1.5 px-2 py-1 rounded-full text-[8px] font-black uppercase tracking-widest border ${included ? 'bg-emerald-50 border-emerald-200 text-emerald-700' : 'bg-slate-50 border-slate-200 text-slate-500'}`}
+                    >
+                      <input
+                        type="checkbox"
+                        checked={included}
+                        onChange={() => toggleIncludedAttributeType(type)}
+                      />
+                      <span>{type}</span>
+                    </label>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
           <div className="bg-white rounded-xl border border-slate-200 overflow-hidden shadow-sm">
             {category === 'users' ? (
                 <table className="w-full text-left">
@@ -1262,6 +1675,7 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
                         <tr className="bg-slate-50 border-b border-slate-100">
                           <th className="px-6 py-4 text-[10px] font-black text-slate-400 uppercase tracking-widest w-56">Schema Link</th>
                           <th className="px-6 py-4 text-[10px] font-black text-slate-400 uppercase tracking-widest">Interface Bridge</th>
+                          <th className="px-6 py-4 text-[10px] font-black text-slate-400 uppercase tracking-widest w-36">Attribute Type</th>
                           <th className="px-6 py-4 text-[10px] font-black text-slate-400 uppercase tracking-widest w-16 text-center">X</th>
                         </tr>
                       </thead>
@@ -1271,6 +1685,7 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
                           const isSelected = selectedMappingIndex === globalIdx;
                           const legacyLabel = (m.legacyFeatureIds || []).join(' | ') || '—';
                           const targetLabel = m.newAttributeId || 'UNMAPPED';
+                          const attrType = normalizeAttributeType((m as any).attributeType);
                           const targetDesc = attributeDescriptions[m.newAttributeId] || '';
                           return (
                             <tr
@@ -1298,6 +1713,11 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
                                     </span>
                                   )}
                                 </div>
+                              </td>
+                              <td className="px-6 py-3 align-top">
+                                <span className={`inline-flex items-center px-2 py-0.5 rounded-full text-[8px] font-black uppercase tracking-widest ${attrType ? 'bg-sky-100 text-sky-700' : 'bg-slate-100 text-slate-500'}`}>
+                                  {attrType || 'blank'}
+                                </span>
                               </td>
                               <td className="px-6 py-3 align-top text-center">
                                 <button
@@ -1754,7 +2174,7 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
                 </button>
               </div>
 
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4">
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-4">
                 <div>
                   <label className="text-[8px] font-black text-slate-400 uppercase tracking-widest mb-1 block">
                     Legacy Features
@@ -1795,6 +2215,35 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
                     placeholder="e.g. MAT_COMP"
                     className="w-full p-2 text-[10px] bg-indigo-50 text-indigo-700 border border-indigo-100 rounded-md font-black outline-none focus:border-indigo-400"
                   />
+                </div>
+                <div>
+                  <label className="text-[8px] font-black text-slate-400 uppercase tracking-widest mb-1 block">
+                    Attribute Type
+                  </label>
+                  <select
+                    value={normalizeAttributeType((selectedMapping as any).attributeType)}
+                    onChange={(e) => {
+                      if (selectedMappingIndex == null) return;
+                      const nextType = normalizeAttributeType(e.target.value);
+                      const next = [...localMapping];
+                      next[selectedMappingIndex] = {
+                        ...next[selectedMappingIndex],
+                        attributeType: nextType,
+                      };
+                      setLocalMapping(next);
+                      if (nextType && !availableAttributeTypes.includes(nextType)) {
+                        setAvailableAttributeTypes(prev => [...prev, nextType]);
+                        setIncludedAttributeTypes(prev => [...prev, nextType]);
+                      }
+                      setHasCsvUploaded(true);
+                    }}
+                    className="w-full p-2 text-[10px] bg-white border border-slate-200 rounded-md font-black text-slate-700 outline-none focus:border-indigo-400"
+                  >
+                    <option value="">blank</option>
+                    {availableAttributeTypes.map(type => (
+                      <option key={type} value={type}>{type}</option>
+                    ))}
+                  </select>
                 </div>
               </div>
 

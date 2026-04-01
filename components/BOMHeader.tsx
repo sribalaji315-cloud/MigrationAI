@@ -11,10 +11,11 @@ interface BOMHeaderProps {
   currentUser: User;
   onLogout: () => void;
   onClearCache: () => void;
+  onExportBomCsv: () => void;
   onOpenDashboard: () => void;
 }
 
-const BOMHeader: React.FC<BOMHeaderProps> = ({ onRegenerate, isRefreshing, onInspectData, onCommit, currentUser, onLogout, onClearCache, onOpenDashboard }) => {
+const BOMHeader: React.FC<BOMHeaderProps> = ({ onRegenerate, isRefreshing, onInspectData, onCommit, currentUser, onLogout, onClearCache, onExportBomCsv, onOpenDashboard }) => {
   const uploadOptions: { label: string; id: DataCategory; icon: string; adminOnly?: boolean }[] = [
     { label: 'Global Mapping', id: 'mapping', icon: 'M8 7v8a2 2 0 002 2h6M8 7V5a2 2 0 012-2h4.586a1 1 0 01.707.293l4.414 4.414a1 1 0 01.293.707V15a2 2 0 01-2 2h-2' },
     { label: 'Classifications', id: 'classification', icon: 'M4 6h16M4 10h16M4 14h16M4 18h16' },
@@ -133,6 +134,17 @@ const BOMHeader: React.FC<BOMHeaderProps> = ({ onRegenerate, isRefreshing, onIns
                       <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M11 3.055A9.001 9.001 0 1020.945 13H11V3.055z" />
                     </svg>
                     Mapping Dashboard
+                  </button>
+
+                  <button 
+                    type="button"
+                    onClick={onExportBomCsv}
+                    className="flex items-center gap-1.5 px-2.5 py-1.5 bg-emerald-50 text-emerald-700 border border-emerald-100 hover:bg-emerald-100 rounded-md text-[9px] font-black transition-all whitespace-nowrap uppercase tracking-wider"
+                  >
+                    <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+                    </svg>
+                    Export BOM CSV
                   </button>
 
                   <button 

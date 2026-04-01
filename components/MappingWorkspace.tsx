@@ -1,6 +1,6 @@
 
 import React, { useState, useEffect, useMemo, useRef } from 'react';
-import { LegacyItem, NewClassification, GlobalMapping, LocalItemMappings, NewAttribute, ItemLock, User, FeatureFlags } from '../types';
+import { LegacyItem, NewClassification, GlobalMapping, LocalItemMappings, NewAttribute, ItemLock, User, FeatureFlags, MappingTypeConfig } from '../types';
 
 type Tone = 'mapped' | 'unmapped' | 'notRequired';
 
@@ -423,6 +423,7 @@ interface MappingWorkspaceProps {
   item: LegacyItem | null;
   classes: NewClassification[];
   globalMappings: GlobalMapping[];
+  mappingTypeConfig?: MappingTypeConfig;
   localItemMappings: LocalItemMappings;
   classAttributeValues: Record<string, Record<string, string>>;
   assignedClassId?: string | null;
@@ -441,6 +442,7 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
   item, 
   classes, 
   globalMappings, 
+  mappingTypeConfig,
   localItemMappings, 
   classAttributeValues,
   assignedClassId,
@@ -456,6 +458,55 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
 }) => {
   const { useNewClassTargetMapping } = featureFlags;
   const normalizeAttrId = (id: string) => (id || '').replace(/[^A-Za-z0-9]/g, '').toUpperCase();
+  const normalizeMappingType = (value?: string | null) => (value || '').trim().toLowerCase();
+
+  // Resolve a legacy value against a valueMappings dictionary.
+  // Tries the exact key first; if that yields an empty/missing result, falls back
+  // to the short-code prefix (text before the first space) which may carry a real
+  // target value (e.g. "TR00F" -> "MET0073" when the BOM value is "TR00F Black").
+  const resolveValueMapping = (valueMappings: Record<string, string> | undefined, legacyValue: string): string | undefined => {
+    if (!valueMappings) return undefined;
+    const exact = valueMappings[legacyValue];
+    if (exact !== undefined && exact !== '') return exact;
+    const spaceIdx = legacyValue.indexOf(' ');
+    if (spaceIdx > 0) {
+      const prefix = legacyValue.substring(0, spaceIdx);
+      const prefixVal = valueMappings[prefix];
+      if (prefixVal !== undefined && prefixVal !== '') return prefixVal;
+    }
+    return exact; // may be '' or undefined
+  };
+
+  const includedMappingTypeSet = useMemo(() => {
+    const available = (mappingTypeConfig?.availableTypes || []).map(normalizeMappingType).filter(Boolean);
+    const included = (mappingTypeConfig?.includedTypes || []).map(normalizeMappingType).filter(Boolean);
+    if (!available.length) return null;
+    return new Set(included.length ? included : available);
+  }, [mappingTypeConfig]);
+  const allGlobalMappingsByFeature = useMemo(() => {
+    const byFeature: Record<string, GlobalMapping> = {};
+    (globalMappings || []).forEach(m => {
+      (m.legacyFeatureIds || []).forEach(fid => {
+        if (fid && !byFeature[fid]) {
+          byFeature[fid] = m;
+        }
+      });
+    });
+    return byFeature;
+  }, [globalMappings]);
+  const engineeringGlobalMappings = useMemo(
+    () => {
+      const includedSet = includedMappingTypeSet;
+      return (globalMappings || []).filter(m => {
+        const attrType = normalizeMappingType(m.attributeType);
+        if (!includedSet) {
+          return !!attrType;
+        }
+        return includedSet.has(attrType);
+      });
+    },
+    [globalMappings, includedMappingTypeSet]
+  );
   const [manualInputs, setManualInputs] = useState<Record<string, string>>({});
   const [stagedLocalMappings, setStagedLocalMappings] = useState<GlobalMapping[]>([]);
   const [stagedClassId, setStagedClassId] = useState<string | null>(null);
@@ -471,7 +522,12 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
       // Always re-initialize view state when the selected item or backing data changes.
       isEditingRef.current = false;
       setStagedClassId(assignedClassId || 'UNCLASSIFIED');
-      setStagedLocalMappings(JSON.parse(JSON.stringify(localItemMappings[item.itemId] || [])));
+      setStagedLocalMappings(
+        JSON.parse(JSON.stringify(localItemMappings[item.itemId] || [])).map((m: GlobalMapping) => ({
+          ...m,
+          attributeType: m.attributeType || '',
+        }))
+      );
       const existingAttrValues = classAttributeValues[item.itemId] || {};
       const nextManual: Record<string, string> = {};
       Object.entries(existingAttrValues).forEach(([attrId, val]) => {
@@ -537,7 +593,12 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
     if (confirm("Discard all unsaved changes for this session?")) {
       isEditingRef.current = false;
       setStagedClassId(assignedClassId || 'UNCLASSIFIED');
-      setStagedLocalMappings(JSON.parse(JSON.stringify(localItemMappings[item.itemId] || [])));
+      setStagedLocalMappings(
+        JSON.parse(JSON.stringify(localItemMappings[item.itemId] || [])).map((m: GlobalMapping) => ({
+          ...m,
+          attributeType: m.attributeType || '',
+        }))
+      );
       const existingAttrValues = classAttributeValues[item.itemId] || {};
       const nextManual: Record<string, string> = {};
       Object.entries(existingAttrValues).forEach(([attrId, val]) => {
@@ -600,7 +661,7 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
     const byAttr: Record<string, string[]> = {};
 
     // Collect values from global mappings (target-side values)
-    globalMappings.forEach(m => {
+    engineeringGlobalMappings.forEach(m => {
       const attrId = m.newAttributeId;
       if (!attrId) return;
       if (!byAttr[attrId]) byAttr[attrId] = [];
@@ -622,7 +683,7 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
     });
 
     return byAttr;
-  }, [globalMappings, classes]);
+  }, [engineeringGlobalMappings, classes]);
 
   const legacyFilterOptions = useMemo(() => {
     if (!item) return [] as string[];
@@ -643,10 +704,11 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
     let totalAttrCount = 0;
     let totalValueCount = 0;
 
-    const globalByFeature: Record<string, GlobalMapping> = {};
-    globalMappings.forEach(m => {
+    const globalByFeature: Record<string, GlobalMapping[]> = {};
+    engineeringGlobalMappings.forEach(m => {
       m.legacyFeatureIds.forEach(fid => {
-        globalByFeature[fid] = m;
+        if (!globalByFeature[fid]) globalByFeature[fid] = [];
+        globalByFeature[fid].push(m);
       });
     });
 
@@ -658,19 +720,26 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
     });
 
     item.features.forEach(f => {
+      const globalMappingsForFeature = globalByFeature[f.featureId] || [];
+      const globalMapping = globalMappingsForFeature[0] || null;
+      const localOverride = localByFeature[f.featureId];
+      const fallbackGlobal = allGlobalMappingsByFeature[f.featureId];
+      const effectiveForType = localOverride || fallbackGlobal;
+      const effectiveType = normalizeMappingType(effectiveForType?.attributeType);
+      if (includedMappingTypeSet && effectiveType && !includedMappingTypeSet.has(effectiveType)) {
+        return;
+      }
+
       totalAttrCount += 1;
       totalValueCount += f.values.length;
 
-      const globalMapping = globalByFeature[f.featureId];
-      const localOverride = localByFeature[f.featureId];
-
-      const baseTargetAttributeId = globalMapping?.newAttributeId
-        ? globalMapping.newAttributeId.replace(/\s+/g, '')
-        : 'UNMAPPED';
-      let attributeOptions = baseTargetAttributeId
-        .split(';')
-        .map(a => a.trim())
-        .filter(a => a && a !== 'UNMAPPED');
+      // Collect target attributes from ALL global mappings for this feature
+      let attributeOptions: string[] = [];
+      globalMappingsForFeature.forEach(gm => {
+        const parts = (gm.newAttributeId || '').replace(/\s+/g, '').split(';').map(a => a.trim()).filter(a => a && a !== 'UNMAPPED');
+        attributeOptions.push(...parts);
+      });
+      attributeOptions = Array.from(new Set(attributeOptions));
 
       const defaultGlobalAttribute = attributeOptions.length > 0 ? attributeOptions[0] : 'UNMAPPED';
 
@@ -725,14 +794,20 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
           selectedAttribute = 'UNMAPPED';
         }
       }
-      const effectiveMapping = localOverride || globalMapping;
+      const effectiveMapping = localOverride
+        || globalMappingsForFeature.find(gm => {
+             const parts = (gm.newAttributeId || '').replace(/\s+/g, '').split(';').map(a => a.trim());
+             return parts.some(p => normalizeAttrId(p) === normalizeAttrId(selectedAttribute));
+           })
+        || globalMapping;
 
       if (selectedAttribute === 'UNMAPPED') {
         attrCount += 1;
       }
 
       f.values.forEach(v => {
-        const isValueMapped = selectedAttribute !== 'UNMAPPED' && effectiveMapping?.valueMappings?.[v] !== undefined;
+        const resolved = resolveValueMapping(effectiveMapping?.valueMappings, v);
+        const isValueMapped = selectedAttribute !== 'UNMAPPED' && resolved !== undefined;
         if (!isValueMapped) {
           valueCount += 1;
         }
@@ -745,7 +820,34 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
       totalAttributes: totalAttrCount,
       totalValues: totalValueCount,
     };
-  }, [item, globalMappings, stagedLocalMappings, targetAttributes]);
+  }, [item, engineeringGlobalMappings, stagedLocalMappings, targetAttributes, includedMappingTypeSet, allGlobalMappingsByFeature]);
+
+  const ignoredFeatureIds = useMemo(() => {
+    const ignored = new Set<string>();
+    if (!item || !includedMappingTypeSet) return ignored;
+
+    const localByFeature: Record<string, GlobalMapping> = {};
+    stagedLocalMappings.forEach(m => {
+      (m.legacyFeatureIds || []).forEach(fid => {
+        localByFeature[fid] = m;
+      });
+    });
+
+    item.features.forEach(feature => {
+      const effective = localByFeature[feature.featureId] || allGlobalMappingsByFeature[feature.featureId];
+      const attrType = normalizeMappingType(effective?.attributeType);
+      if (attrType && !includedMappingTypeSet.has(attrType)) {
+        ignored.add(feature.featureId);
+      }
+    });
+
+    return ignored;
+  }, [item, stagedLocalMappings, allGlobalMappingsByFeature, includedMappingTypeSet]);
+
+  const ignoredFeatures = useMemo(() => {
+    if (!item) return [] as LegacyItem['features'];
+    return item.features.filter(feature => ignoredFeatureIds.has(feature.featureId));
+  }, [item, ignoredFeatureIds]);
 
   const attributeBadgeClasses = unmappedStats.attributes > 0
     ? 'bg-rose-50 text-rose-600 border border-rose-100'
@@ -762,10 +864,11 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
 
     const usedKeys = new Set<string>();
 
-    const globalByFeature: Record<string, GlobalMapping> = {};
-    globalMappings.forEach(m => {
+    const globalByFeature: Record<string, GlobalMapping[]> = {};
+    engineeringGlobalMappings.forEach(m => {
       m.legacyFeatureIds.forEach(fid => {
-        globalByFeature[fid] = m;
+        if (!globalByFeature[fid]) globalByFeature[fid] = [];
+        globalByFeature[fid].push(m);
       });
     });
 
@@ -777,16 +880,15 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
     });
 
     item.features.forEach(f => {
-      const globalMapping = globalByFeature[f.featureId];
+      const globalMappingsForFeature = globalByFeature[f.featureId] || [];
       const localOverride = localByFeature[f.featureId];
 
-      const baseTargetAttributeId = globalMapping?.newAttributeId
-        ? globalMapping.newAttributeId.replace(/\s+/g, '')
-        : 'UNMAPPED';
-      const parts = baseTargetAttributeId
-        .split(';')
-        .map(a => a.trim())
-        .filter(a => a && a !== 'UNMAPPED');
+      let parts: string[] = [];
+      globalMappingsForFeature.forEach(gm => {
+        const p = (gm.newAttributeId || '').replace(/\s+/g, '').split(';').map(a => a.trim()).filter(a => a && a !== 'UNMAPPED');
+        parts.push(...p);
+      });
+      parts = Array.from(new Set(parts));
       const defaultGlobalAttribute = parts.length > 0 ? parts[0] : 'UNMAPPED';
       const selectedAttribute = localOverride?.newAttributeId || defaultGlobalAttribute;
       const key = normalizeAttrId(selectedAttribute);
@@ -804,7 +906,7 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
       const key = normalizeAttrId(attr.attributeId);
       return key && !usedKeys.has(key);
     });
-  }, [item, useNewClassTargetMapping, stagedClassId, globalMappings, stagedLocalMappings, targetAttributes]);
+  }, [item, useNewClassTargetMapping, stagedClassId, engineeringGlobalMappings, stagedLocalMappings, targetAttributes]);
 
   const unmappedTargetGroupTone: Tone = useMemo(() => {
     if (unmappedTargetAttributes.length === 0) return 'mapped';
@@ -842,7 +944,7 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
 
     setStagedLocalMappings(prev => {
       const filtered = prev.filter(m => !m.legacyFeatureIds.includes(featureId));
-      const globalRef = globalMappings.find(m => m.legacyFeatureIds.includes(featureId));
+      const globalRef = engineeringGlobalMappings.find(m => m.legacyFeatureIds.includes(featureId));
 
       if (attrId === 'UNMAPPED' && !globalRef) {
         return filtered;
@@ -867,6 +969,7 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
         {
           legacyFeatureIds: [featureId],
           newAttributeId: attrId,
+          attributeType: globalRef?.attributeType || '',
           valueMappings: nextValueMappings,
         },
       ];
@@ -880,10 +983,11 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
       const next = [...prev];
       let idx = next.findIndex(m => m.legacyFeatureIds.includes(featureId));
       if (idx === -1) {
-        const globalRef = globalMappings.find(m => m.legacyFeatureIds.includes(featureId));
+        const globalRef = engineeringGlobalMappings.find(m => m.legacyFeatureIds.includes(featureId));
         next.push({
           legacyFeatureIds: [featureId],
           newAttributeId: globalRef?.newAttributeId || '',
+          attributeType: globalRef?.attributeType || '',
           valueMappings: globalRef ? { ...globalRef.valueMappings, [legacyVal]: newVal } : { [legacyVal]: newVal }
         });
       } else {
@@ -894,6 +998,7 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
           next.push({
             legacyFeatureIds: [featureId],
             newAttributeId: existingMapping.newAttributeId,
+            attributeType: existingMapping.attributeType || '',
             valueMappings: { ...existingMapping.valueMappings, [legacyVal]: newVal }
           });
         } else {
@@ -1096,10 +1201,11 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
           </div>
 
           {(() => {
-            const globalByFeature: Record<string, GlobalMapping> = {};
-            globalMappings.forEach(m => {
+            const globalByFeature: Record<string, GlobalMapping[]> = {};
+            engineeringGlobalMappings.forEach(m => {
               m.legacyFeatureIds.forEach(fid => {
-                globalByFeature[fid] = m;
+                if (!globalByFeature[fid]) globalByFeature[fid] = [];
+                globalByFeature[fid].push(m);
               });
             });
 
@@ -1111,21 +1217,21 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
             });
 
             return item.features.map((f, idx) => {
-              // Find global mapping for this feature
-              const globalMapping = globalByFeature[f.featureId];
+              if (ignoredFeatureIds.has(f.featureId)) {
+                return null;
+              }
+              // Find ALL global mappings for this feature
+              const globalMappingsForFeature = globalByFeature[f.featureId] || [];
+              const globalMapping = globalMappingsForFeature[0] || null;
               const localOverride = localByFeature[f.featureId];
-            const effectiveMapping = localOverride || globalMapping;
 
-            // The base target attribute comes from global mapping if it exists
-            const baseTargetAttributeId = globalMapping?.newAttributeId
-              ? globalMapping.newAttributeId.replace(/\s+/g, '')
-              : 'UNMAPPED';
-
-            // Parse semicolon-separated attributes from the GLOBAL mapping to preserve the options
-            let attributeOptions = baseTargetAttributeId
-              .split(';')
-              .map(a => a.trim())
-              .filter(a => a && a !== 'UNMAPPED');
+            // Collect target attributes from ALL global mappings for this feature
+            let attributeOptions: string[] = [];
+            globalMappingsForFeature.forEach(gm => {
+              const parts = (gm.newAttributeId || '').replace(/\s+/g, '').split(';').map(a => a.trim()).filter(a => a && a !== 'UNMAPPED');
+              attributeOptions.push(...parts);
+            });
+            attributeOptions = Array.from(new Set(attributeOptions));
 
             const usingClassScope = useNewClassTargetMapping && (stagedClassId || 'UNCLASSIFIED') !== 'UNCLASSIFIED';
 
@@ -1192,13 +1298,14 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
             if (usingClassScope) {
               const usedAttributeKeys = new Set<string>();
               item.features.forEach(otherFeature => {
-                const gm = globalByFeature[otherFeature.featureId];
+                const otherGms = globalByFeature[otherFeature.featureId] || [];
                 const lo = localByFeature[otherFeature.featureId];
-                const baseId = gm?.newAttributeId || 'UNMAPPED';
-                let baseOptions = baseId
-                  .split(';')
-                  .map(a => a.trim())
-                  .filter(a => a && a !== 'UNMAPPED');
+                let baseOptions: string[] = [];
+                otherGms.forEach(gm => {
+                  const parts = (gm.newAttributeId || '').replace(/\s+/g, '').split(';').map(a => a.trim()).filter(a => a && a !== 'UNMAPPED');
+                  baseOptions.push(...parts);
+                });
+                baseOptions = Array.from(new Set(baseOptions));
                 const defaultAttr = baseOptions.length > 0 ? baseOptions[0] : 'UNMAPPED';
                 const sel = lo?.newAttributeId || defaultAttr;
 
@@ -1255,6 +1362,15 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
             // It has a mapping if the selected attribute is not 'UNMAPPED'
             const hasMapping = selectedAttribute !== 'UNMAPPED';
 
+            // Find the effective mapping for value resolution: local override takes priority,
+            // otherwise find the global mapping whose target matches the selected attribute.
+            const effectiveMapping = localOverride
+              || globalMappingsForFeature.find(gm => {
+                   const parts = (gm.newAttributeId || '').replace(/\s+/g, '').split(';').map(a => a.trim());
+                   return parts.some(p => normalizeAttrId(p) === normalizeAttrId(selectedAttribute));
+                 })
+              || globalMapping;
+
             if (legacyFilter.trim()) {
               const q = legacyFilter.toLowerCase();
               const matchesFeatureId = f.featureId.toLowerCase().includes(q);
@@ -1265,7 +1381,7 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
               }
             }
             const featureHasUnmappedAttribute = selectedAttribute === 'UNMAPPED';
-            const featureHasUnmappedValues = f.values.some(v => effectiveMapping?.valueMappings?.[v] === undefined);
+            const featureHasUnmappedValues = f.values.some(v => resolveValueMapping(effectiveMapping?.valueMappings, v) === undefined);
 
             if (showUnmappedOnly && !featureHasUnmappedAttribute && !featureHasUnmappedValues) {
               return null;
@@ -1367,8 +1483,9 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
                   {isExpanded && (
                     <div className="mt-4 space-y-2">
                       {f.values.map((v, vidx) => {
-                        const isValueMapped = selectedAttribute !== 'UNMAPPED' && effectiveMapping?.valueMappings?.[v] !== undefined;
-                        const mappedValue = isValueMapped ? effectiveMapping!.valueMappings![v] : '';
+                        const resolvedVal = resolveValueMapping(effectiveMapping?.valueMappings, v);
+                        const isValueMapped = selectedAttribute !== 'UNMAPPED' && resolvedVal !== undefined;
+                        const mappedValue = isValueMapped ? resolvedVal! : '';
                         const valueTone: Tone = attributeTone === 'notRequired'
                           ? 'notRequired'
                           : isValueMapped
@@ -1454,6 +1571,39 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
               </div>
             );
           })})()}
+
+          {ignoredFeatures.length > 0 && (
+            <div className="mt-4 rounded-xl border border-amber-200 bg-amber-50/50 p-4">
+              <div className="flex items-center justify-between mb-2">
+                <p className="text-[9px] font-black text-amber-700 uppercase tracking-widest">Ignore</p>
+                <span className="px-2 py-0.5 rounded-full bg-amber-100 text-amber-700 text-[8px] font-black uppercase tracking-widest">
+                  {ignoredFeatures.length} Source Attribute{ignoredFeatures.length === 1 ? '' : 's'}
+                </span>
+              </div>
+              <p className="text-[9px] text-amber-700/80 mb-3">These attributes are grouped here because their mapping type is currently unchecked in Attribute Type Configuration.</p>
+              <div className="space-y-2">
+                {ignoredFeatures.map((f, idx) => {
+                  const localOverride = stagedLocalMappings.find(m => (m.legacyFeatureIds || []).includes(f.featureId));
+                  const globalOverride = allGlobalMappingsByFeature[f.featureId];
+                  const effective = localOverride || globalOverride;
+                  const target = effective?.newAttributeId || 'UNMAPPED';
+                  const type = normalizeMappingType(effective?.attributeType) || 'blank';
+                  return (
+                    <div key={`ignore-${f.featureId}-${idx}`} className="rounded-lg border border-amber-200 bg-white px-3 py-2 flex items-start justify-between gap-3">
+                      <div>
+                        <p className="text-[11px] font-black text-amber-900">{f.featureId}</p>
+                        <p className="text-[9px] font-bold uppercase tracking-wider text-amber-700/80">{f.description || 'No description'}</p>
+                      </div>
+                      <div className="text-right">
+                        <p className="text-[8px] font-black uppercase tracking-widest text-amber-600">{type}</p>
+                        <p className="text-[10px] font-black text-amber-900">{target}</p>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
 
           {useNewClassTargetMapping && unmappedTargetAttributes.length > 0 && (
             <div className="mt-4">

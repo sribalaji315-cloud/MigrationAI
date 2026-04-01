@@ -41,10 +41,18 @@ export interface NewClassification {
   attributes: NewAttribute[];
 }
 
+export type MappingAttributeType = string;
+
+export interface MappingTypeConfig {
+  availableTypes: string[];
+  includedTypes: string[];
+}
+
 export interface GlobalMapping {
   legacyFeatureIds: string[];
   newAttributeId: string;
   valueMappings: Record<string, string>;
+  attributeType: MappingAttributeType;
 }
 
 export interface ItemLock {
@@ -65,6 +73,7 @@ export interface DatabaseState {
   bom: LegacyItem[];
   mappings: GlobalMapping[];
   classifications: NewClassification[];
+  mappingTypeConfig?: MappingTypeConfig;
   localMappings: LocalItemMappings;
   classAttributeValues?: ClassAttributeValues;
   itemClassifications: Record<string, string>;

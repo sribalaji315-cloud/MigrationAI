@@ -8,6 +8,27 @@ from ..core.security import get_current_user
 
 router = APIRouter(tags=["state"])
 
+
+def _prune_placeholder_global_mappings(mappings_payload: List[Dict]) -> List[Dict]:
+    real_mapping_features = set()
+    for mapping in mappings_payload or []:
+        target_attr = str(mapping.get("newAttributeId") or "").strip()
+        if not target_attr:
+            continue
+        for feature_id in mapping.get("legacyFeatureIds") or []:
+            normalized = str(feature_id or "").strip()
+            if normalized:
+                real_mapping_features.add(normalized)
+
+    pruned: List[Dict] = []
+    for mapping in mappings_payload or []:
+        target_attr = str(mapping.get("newAttributeId") or "").strip()
+        feature_ids = [str(fid or "").strip() for fid in (mapping.get("legacyFeatureIds") or []) if str(fid or "").strip()]
+        if not target_attr and len(feature_ids) == 1 and feature_ids[0] in real_mapping_features:
+            continue
+        pruned.append(mapping)
+    return pruned
+
 @router.get("/health")
 def health():
     return {"ok": True}
@@ -118,6 +139,7 @@ def get_state(include_bom: bool = Query(True), db: Session = Depends(get_db)):
             {
                 "legacyFeatureIds": getattr(m, "legacy_feature_ids", []) or [],
                 "newAttributeId": getattr(m, "new_attribute_id", ""),
+                "attributeType": getattr(m, "attribute_type", "") or "",
                 "valueMappings": getattr(m, "value_mappings", {}) or {},
             }
         )
@@ -143,6 +165,7 @@ def get_state(include_bom: bool = Query(True), db: Session = Depends(get_db)):
             mapping_obj = {
                 "legacyFeatureIds": [legacy_attr],
                 "newAttributeId": new_attr,
+                "attributeType": "",
                 "valueMappings": {},
             }
             bucket[key] = mapping_obj
@@ -281,7 +304,7 @@ def sync_state(payload: StateIn, db: Session = Depends(get_db), current_user: mo
     # Workspace saves don't include the full BOM, so we must not wipe the table for those.
     bom_key_present = "bom" in incoming
     bom_payload = incoming.pop("bom", None)
-    mappings_payload = incoming.pop("mappings", []) or []
+    mappings_payload = _prune_placeholder_global_mappings(incoming.pop("mappings", []) or [])
     local_mappings_payload = incoming.pop("localMappings", {}) or {}
 
     # Replace BOM & features ONLY when the caller explicitly sent a bom list
@@ -340,9 +363,12 @@ def sync_state(payload: StateIn, db: Session = Depends(get_db), current_user: mo
     db.query(models.GlobalMapping).delete()
     global_mappings_to_add = []
     for m in mappings_payload:
+        raw_attr_type = m.get("attributeType")
+        attr_type = str(raw_attr_type).strip().lower() if raw_attr_type is not None else ""
         db_mapping = models.GlobalMapping(
             legacy_feature_ids=m.get("legacyFeatureIds") or [],
             new_attribute_id=m.get("newAttributeId") or "",
+            attribute_type=attr_type,
             value_mappings=m.get("valueMappings") or {},
         )
         global_mappings_to_add.append(db_mapping)
