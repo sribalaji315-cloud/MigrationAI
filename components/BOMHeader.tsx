@@ -1,6 +1,6 @@
 
 import React from 'react';
-import { DataCategory, User } from '../types';
+import { DataCategory, User, MappingGenerationProgress } from '../types';
 import { dbService } from '../services/dbService';
 
 interface BOMHeaderProps {
@@ -13,9 +13,10 @@ interface BOMHeaderProps {
   onClearCache: () => void;
   onExportBomCsv: () => void;
   onOpenDashboard: () => void;
+  mappingGenerationProgress?: MappingGenerationProgress | null;
 }
 
-const BOMHeader: React.FC<BOMHeaderProps> = ({ onRegenerate, isRefreshing, onInspectData, onCommit, currentUser, onLogout, onClearCache, onExportBomCsv, onOpenDashboard }) => {
+const BOMHeader: React.FC<BOMHeaderProps> = ({ onRegenerate, isRefreshing, onInspectData, onCommit, currentUser, onLogout, onClearCache, onExportBomCsv, onOpenDashboard, mappingGenerationProgress }) => {
   const uploadOptions: { label: string; id: DataCategory; icon: string; adminOnly?: boolean }[] = [
     { label: 'Global Mapping', id: 'mapping', icon: 'M8 7v8a2 2 0 002 2h6M8 7V5a2 2 0 012-2h4.586a1 1 0 01.707.293l4.414 4.414a1 1 0 01.293.707V15a2 2 0 01-2 2h-2' },
     { label: 'Classifications', id: 'classification', icon: 'M4 6h16M4 10h16M4 14h16M4 18h16' },
@@ -30,6 +31,16 @@ const BOMHeader: React.FC<BOMHeaderProps> = ({ onRegenerate, isRefreshing, onIns
       onRegenerate();
     }
   };
+
+  const generationPercent = Math.round(((mappingGenerationProgress?.progress || 0) * 100));
+  const generationStatus = mappingGenerationProgress?.status || 'idle';
+  const generationTone = generationStatus === 'failed'
+    ? 'bg-rose-50 border-rose-200 text-rose-700'
+    : generationStatus === 'completed'
+      ? 'bg-emerald-50 border-emerald-200 text-emerald-700'
+      : generationStatus === 'running' || generationStatus === 'queued'
+        ? 'bg-amber-50 border-amber-200 text-amber-700'
+        : 'bg-slate-50 border-slate-200 text-slate-500';
 
   return (
     <div className="flex flex-col border-b border-slate-200 shrink-0 relative z-20">
@@ -51,6 +62,12 @@ const BOMHeader: React.FC<BOMHeaderProps> = ({ onRegenerate, isRefreshing, onIns
                  </span>
                  <p className="text-[9px] text-blue-600 font-black uppercase">{currentUser.userName}</p>
               </div>
+              {mappingGenerationProgress && generationStatus !== 'idle' && (
+                <div className={`ml-2 inline-flex items-center gap-1 px-2 py-0.5 border rounded-full text-[8px] font-black uppercase tracking-widest ${generationTone}`}>
+                  <span>Mapping Gen</span>
+                  <span>{generationStatus === 'running' || generationStatus === 'queued' ? `${generationPercent}%` : generationStatus}</span>
+                </div>
+              )}
             </div>
           </div>
         </div>

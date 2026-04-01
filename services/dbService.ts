@@ -1,5 +1,34 @@
 
-import { GlobalMapping, DatabaseState, User, ConnectionMode, NewAttribute } from '../types';
+import { GlobalMapping, DatabaseState, User, ConnectionMode, NewAttribute, WorkspaceMappingRow, MappingGenerationProgress } from '../types';
+
+export interface SaveAllResult {
+  mode: ConnectionMode;
+  mappingGenerationJobId?: number | null;
+}
+
+export interface DashboardItemMetrics {
+  itemId: string;
+  description: string;
+  category: string;
+  productType: string;
+  totalFeatures: number;
+  mappedFeatures: number;
+  notRequiredFeatures: number;
+  excludedFeatures: number;
+  totalValues: number;
+  mappedValues: number;
+  excludedValues: number;
+  fullyMapped: boolean;
+}
+
+export interface DashboardMetricsResponse {
+  totals: { items: number; features: number; values: number };
+  mapped: { features: number; values: number; items: number; notRequiredFeatures: number };
+  excluded: { features: number; values: number };
+  coverage: { attribute: number; value: number; item: number };
+  includeExcluded: boolean;
+  items: DashboardItemMetrics[];
+}
 
 // Backend API endpoint: in production use Vite env `VITE_SQL_API_ENDPOINT`,
 // otherwise fall back to local FastAPI for development.
@@ -192,7 +221,115 @@ export const dbService = {
     return resp.json();
   },
 
-  async saveAll(data: DatabaseState, userRole: 'admin' | 'user' | undefined = 'user'): Promise<ConnectionMode> {
+  async fetchBomCount(category?: string, productType?: string): Promise<number> {
+    if (!SQL_ENDPOINT) {
+      throw new Error('Database connection not available.');
+    }
+    const params = new URLSearchParams();
+    if (category) params.set('category', category);
+    if (productType) params.set('productType', productType);
+    const query = params.toString();
+    const resp = await fetch(`${SQL_ENDPOINT}/bom/count${query ? `?${query}` : ''}`, { headers: this._authHeaders() });
+    if (!resp.ok) {
+      const errText = await resp.text();
+      throw new Error(`Failed to fetch BOM count: ${resp.status} ${errText}`);
+    }
+    const data = await resp.json();
+    return data?.total ?? 0;
+  },
+
+  async fetchWorkspaceMappings(itemId: string): Promise<WorkspaceMappingRow[]> {
+    if (!SQL_ENDPOINT) {
+      throw new Error('Database connection not available.');
+    }
+    const resp = await fetch(`${SQL_ENDPOINT}/workspace-mappings/${encodeURIComponent(itemId)}`, {
+      headers: this._authHeaders(),
+    });
+    if (!resp.ok) {
+      const errText = await resp.text();
+      throw new Error(`Failed to fetch workspace mappings: ${resp.status} ${errText}`);
+    }
+    return resp.json();
+  },
+
+  async saveWorkspaceMappings(itemId: string, rows: WorkspaceMappingRow[]): Promise<{ ok: boolean; rowsSaved: number }> {
+    if (!SQL_ENDPOINT) {
+      throw new Error('Database connection not available.');
+    }
+    const resp = await fetch(`${SQL_ENDPOINT}/workspace-mappings/${encodeURIComponent(itemId)}`, {
+      method: 'PUT',
+      headers: { ...this._authHeaders(), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ rows }),
+    });
+    if (!resp.ok) {
+      const errText = await resp.text();
+      throw new Error(`Failed to save workspace mappings: ${resp.status} ${errText}`);
+    }
+    return resp.json();
+  },
+
+  async fetchMappingGenerationProgress(): Promise<MappingGenerationProgress> {
+    if (!SQL_ENDPOINT) {
+      throw new Error('Database connection not available.');
+    }
+    const resp = await fetch(`${SQL_ENDPOINT}/mapping-generation/progress`, {
+      headers: this._authHeaders(),
+    });
+    if (!resp.ok) {
+      const errText = await resp.text();
+      throw new Error(`Failed to fetch mapping generation progress: ${resp.status} ${errText}`);
+    }
+    return resp.json();
+  },
+
+  async fetchDashboardMetrics(options?: { category?: string; productLine?: string; includeExcluded?: boolean; forceRecompute?: boolean }): Promise<DashboardMetricsResponse> {
+    if (!SQL_ENDPOINT) {
+      throw new Error('Database connection not available.');
+    }
+    const params = new URLSearchParams();
+    if (options?.category) params.set('category', options.category);
+    if (options?.productLine) params.set('productLine', options.productLine);
+    if (options?.includeExcluded) params.set('includeExcluded', 'true');
+    if (options?.forceRecompute) params.set('forceRecompute', 'true');
+    const query = params.toString();
+    const resp = await fetch(`${SQL_ENDPOINT}/dashboard/metrics${query ? `?${query}` : ''}`, { headers: this._authHeaders() });
+    if (!resp.ok) {
+      const errText = await resp.text();
+      throw new Error(`Failed to fetch dashboard metrics: ${resp.status} ${errText}`);
+    }
+    return resp.json();
+  },
+
+  async fetchItemStatuses(): Promise<Record<string, 'mapped' | 'unmapped' | 'notRequired'>> {
+    if (!SQL_ENDPOINT) {
+      throw new Error('Database connection not available.');
+    }
+    const resp = await fetch(`${SQL_ENDPOINT}/item-statuses`, { headers: this._authHeaders() });
+    if (!resp.ok) {
+      const errText = await resp.text();
+      throw new Error(`Failed to fetch item statuses: ${resp.status} ${errText}`);
+    }
+    const data = await resp.json();
+    return data?.statuses || {};
+  },
+
+  async exportBomCsv(): Promise<Blob> {
+    if (!SQL_ENDPOINT) {
+      throw new Error('Database connection not available.');
+    }
+    const resp = await fetch(`${SQL_ENDPOINT}/export/bom-csv`, { headers: this._authHeaders() });
+    if (!resp.ok) {
+      const errText = await resp.text();
+      throw new Error(`Failed to export BOM CSV: ${resp.status} ${errText}`);
+    }
+    return resp.blob();
+  },
+
+  async saveAll(
+    data: DatabaseState,
+    userRole: 'admin' | 'user' | undefined = 'user',
+    _options?: { includeBom?: boolean }
+  ): Promise<SaveAllResult> {
     const mode = await this.getConnectionMode();
     
     if (mode !== 'REMOTE_SQL' || !SQL_ENDPOINT) {
@@ -212,6 +349,11 @@ export const dbService = {
       throw new Error(`Failed to save to database: ${errText}`);
     }
 
+    const syncResult = await response.json().catch(() => ({}));
+    const mappingGenerationJobId = typeof syncResult?.mappingGenerationJobId === 'number'
+      ? syncResult.mappingGenerationJobId
+      : null;
+
     // After syncing the generic state, push classification list separately
     // but only when the current user is an administrator. Non-admin users
     // should still be able to save BOM and mappings without hitting the
@@ -227,7 +369,7 @@ export const dbService = {
         
         if (clsResp.status === 403) {
           alert('Only administrators are allowed to modify shared classifications.');
-          return 'REMOTE_SQL';
+          return { mode: 'REMOTE_SQL', mappingGenerationJobId };
         }
         
         if (!clsResp.ok) {
@@ -245,7 +387,7 @@ export const dbService = {
       console.log('Skipping classifications sync for non-admin user');
     }
     
-    return 'REMOTE_SQL';
+    return { mode: 'REMOTE_SQL', mappingGenerationJobId };
   },
 
   async acquireLock(itemId: string, userId: string, userName: string): Promise<{ acquired: boolean; reason?: string }> {

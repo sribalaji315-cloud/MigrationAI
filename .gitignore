@@ -19,6 +19,10 @@ __pycache__/
 # Local databases
 *.db
 
+# State snapshots
+state_before.json
+state_after.json
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json

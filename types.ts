@@ -90,3 +90,33 @@ export interface AIClassificationSuggestion {
 export interface FeatureFlags {
   useNewClassTargetMapping: boolean;
 }
+
+export interface WorkspaceMappingRow {
+  itemId: string;
+  legacyFeatureId: string;
+  legacyValue: string;
+  newAttributeId: string;
+  newValue: string;
+  signedOnByUserId?: string | null;
+  signedOnByUsername?: string | null;
+  signedOnAt?: number | null;
+  updatedAt?: number | null;
+}
+
+export interface MappingGenerationProgress {
+  id?: number;
+  status: 'idle' | 'queued' | 'running' | 'completed' | 'failed';
+  isActive: boolean;
+  progress: number;
+  totalFeatures: number;
+  processedFeatures: number;
+  totalValues: number;
+  processedValues: number;
+  generatedRows: number;
+  triggeredByUserId?: string | null;
+  triggeredByUsername?: string | null;
+  startedAt?: number | null;
+  finishedAt?: number | null;
+  updatedAt?: number | null;
+  error?: string | null;
+}

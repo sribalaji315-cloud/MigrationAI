@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, JSON, String, ForeignKey
+from sqlalchemy import Column, Integer, JSON, String, ForeignKey, Float, UniqueConstraint, Index
 from sqlalchemy.orm import relationship
 from .session import Base
 
@@ -98,3 +98,56 @@ class LocalAttributeMapping(Base):
     legacy_value = Column(String, nullable=False)
     new_attribute_id = Column(String, nullable=False)
     new_value = Column(String, nullable=False)
+
+
+class WorkspaceMapping(Base):
+    """Workspace-level mapping rows used by Mapping Workspace.
+
+    One row represents a concrete mapping of one legacy item/feature/value
+    to one target attribute/value. The unique key keeps latest-only semantics.
+    """
+
+    __tablename__ = "workspace_mappings"
+    __table_args__ = (
+        UniqueConstraint(
+            "legacy_item_id",
+            "legacy_feature_id",
+            "legacy_value",
+            name="uq_workspace_mappings_item_feature_value",
+        ),
+        Index("ix_workspace_mappings_item_feature", "legacy_item_id", "legacy_feature_id"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    legacy_item_id = Column(String, index=True, nullable=False)
+    legacy_feature_id = Column(String, index=True, nullable=False)
+    legacy_value = Column(String, nullable=False, default="")
+    new_attribute_id = Column(String, nullable=False)
+    new_value = Column(String, nullable=False, default="")
+    signed_on_by_user_id = Column(String, index=True, nullable=True)
+    signed_on_by_username = Column(String, nullable=True)
+    signed_on_at = Column(Float, nullable=True)
+    updated_at = Column(Float, nullable=False, default=0)
+
+
+class MappingGenerationJob(Base):
+    """Tracks async generation state for workspace mapping auto-population."""
+
+    __tablename__ = "mapping_generation_jobs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    status = Column(String, index=True, nullable=False)  # queued|running|completed|failed
+    triggered_by_user_id = Column(String, index=True, nullable=True)
+    triggered_by_username = Column(String, nullable=True)
+    trigger_source = Column(String, nullable=True)
+
+    total_features = Column(Integer, nullable=False, default=0)
+    processed_features = Column(Integer, nullable=False, default=0)
+    total_values = Column(Integer, nullable=False, default=0)
+    processed_values = Column(Integer, nullable=False, default=0)
+    generated_rows = Column(Integer, nullable=False, default=0)
+
+    started_at = Column(Float, nullable=True)
+    finished_at = Column(Float, nullable=True)
+    updated_at = Column(Float, nullable=False, default=0)
+    error_message = Column(String, nullable=True)

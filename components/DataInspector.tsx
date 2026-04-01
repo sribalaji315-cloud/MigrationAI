@@ -1,6 +1,6 @@
 
-import React, { useState, useEffect, useRef, useMemo } from 'react';
-import { DataCategory, GlobalMapping, NewClassification, NewAttribute, LegacyItem, LegacyFeature, User, ItemLock, MappingTypeConfig } from '../types';
+import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
+import { DataCategory, GlobalMapping, NewClassification, NewAttribute, LegacyItem, LegacyFeature, User, ItemLock, MappingTypeConfig, MappingGenerationProgress } from '../types';
 import { dbService } from '../services/dbService';
 
 interface DataInspectorProps {
@@ -14,13 +14,18 @@ interface DataInspectorProps {
     users: User[];
   };
   mappingTypeConfig?: MappingTypeConfig;
-  onSave: (category: DataCategory, updatedData: any) => void | Promise<void>;
+  onSave: (
+    category: DataCategory,
+    updatedData: any,
+    options?: { closeInspector?: boolean; source?: 'manual' | 'auto' }
+  ) => void | Promise<void>;
   onSwitchUser?: (user: User) => void;
   currentUser: User; // used to determine admin privileges
   bomFilters?: { categories: string[]; productTypes: string[] };
   onFetchBomItems?: (category?: string, productType?: string) => Promise<LegacyItem[]>;
   locks?: Record<string, ItemLock>;
   onSignOnItem?: (itemId: string) => Promise<void>;
+  mappingGenerationProgress?: MappingGenerationProgress | null;
 }
 
 interface LegacyValueSelectorProps {
@@ -117,7 +122,7 @@ const LegacyValueSelector: React.FC<LegacyValueSelectorProps> = ({ value, option
   );
 };
 
-const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, mappingTypeConfig, onSave, onSwitchUser, currentUser, bomFilters, onFetchBomItems, locks, onSignOnItem }) => {
+const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, mappingTypeConfig, onSave, onSwitchUser, currentUser, bomFilters, onFetchBomItems, locks, onSignOnItem, mappingGenerationProgress }) => {
   const normalizeKey = (value?: string | null) => (value || '').trim().toLowerCase();
   const normalizeAttributeType = (value?: string | null): string => (value || '').trim().toLowerCase();
   const [localMapping, setLocalMapping] = useState<GlobalMapping[]>([]);
@@ -149,7 +154,12 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
   const [isCsvImporting, setIsCsvImporting] = useState(false);
   const [csvImportProgress, setCsvImportProgress] = useState(0);
   const [isSaving, setIsSaving] = useState(false);
+  const [isAutoSaving, setIsAutoSaving] = useState(false);
+  const [suspendHydration, setSuspendHydration] = useState(false);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const autoSaveTimerRef = useRef<number | null>(null);
+  const hydrationCategoryRef = useRef<DataCategory | null>(null);
+  const mappingProgressPct = Math.round((mappingGenerationProgress?.progress || 0) * 100);
 
   const cloneData = <T,>(value: T): T => {
     if (typeof structuredClone === 'function') {
@@ -263,7 +273,112 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
     return changed ? pruned : mappings;
   };
 
+  const persistInspectorData = useCallback(async (opts?: {
+    closeInspector?: boolean;
+    source?: 'manual' | 'auto';
+    mappingData?: GlobalMapping[];
+    mappingTypeData?: MappingTypeConfig;
+    bomData?: LegacyItem[];
+  }) => {
+    const source = opts?.source || 'manual';
+    const closeInspector = opts?.closeInspector ?? source === 'manual';
+    if (source === 'auto') {
+      setIsAutoSaving(true);
+      setSuspendHydration(true);
+    }
+
+    setIsSaving(true);
+    try {
+      if (category === 'mapping') {
+        const mappingPayload = prunePlaceholderMappings(opts?.mappingData || localMapping);
+        const mappingTypePayload = opts?.mappingTypeData || {
+          availableTypes: availableAttributeTypes,
+          includedTypes: includedAttributeTypes.filter(type => availableAttributeTypes.includes(type)),
+        };
+        setLocalMapping(mappingPayload);
+        await onSave('mapping', {
+          mappings: mappingPayload,
+          mappingTypeConfig: mappingTypePayload,
+        }, {
+          closeInspector,
+          source,
+        });
+      }
+      if (category === 'classification' || category === 'values') {
+        await onSave('classification', localClassification, { closeInspector, source });
+      }
+      if (category === 'bom') {
+        await onSave('bom', opts?.bomData || localBom, { closeInspector, source });
+      }
+      if (category === 'users') {
+        await onSave('users', localUsers, { closeInspector, source });
+      }
+    } catch (err: any) {
+      console.error('Failed to synchronize data', err);
+      alert(`Synchronize failed: ${err?.message || String(err)}`);
+    } finally {
+      setIsSaving(false);
+      if (source === 'auto') {
+        setIsAutoSaving(false);
+        setSuspendHydration(false);
+      }
+    }
+  }, [
+    availableAttributeTypes,
+    category,
+    includedAttributeTypes,
+    localBom,
+    localClassification,
+    localMapping,
+    localUsers,
+    onSave,
+  ]);
+
+  const scheduleMappingAutoSave = useCallback((payload?: {
+    mappings?: GlobalMapping[];
+    availableTypes?: string[];
+    includedTypes?: string[];
+  }) => {
+    if (category !== 'mapping') return;
+    if (autoSaveTimerRef.current) {
+      window.clearTimeout(autoSaveTimerRef.current);
+    }
+    autoSaveTimerRef.current = window.setTimeout(() => {
+      autoSaveTimerRef.current = null;
+      const availableTypes = payload?.availableTypes || availableAttributeTypes;
+      const includedTypes = (payload?.includedTypes || includedAttributeTypes).filter(type => availableTypes.includes(type));
+      void persistInspectorData({
+        source: 'auto',
+        closeInspector: false,
+        mappingData: payload?.mappings || localMapping,
+        mappingTypeData: {
+          availableTypes,
+          includedTypes,
+        },
+      });
+    }, 600);
+  }, [
+    availableAttributeTypes,
+    category,
+    includedAttributeTypes,
+    localMapping,
+    persistInspectorData,
+  ]);
+
   useEffect(() => {
+    return () => {
+      if (autoSaveTimerRef.current) {
+        window.clearTimeout(autoSaveTimerRef.current);
+      }
+    };
+  }, []);
+
+  useEffect(() => {
+    const categoryChanged = hydrationCategoryRef.current !== category;
+    if (!categoryChanged && (suspendHydration || isAutoSaving)) {
+      return;
+    }
+
     const needsMapping = category === 'mapping';
     const needsClassification = category === 'classification' || category === 'values';
     const needsBom = category === 'bom' || category === 'mapping';
@@ -317,7 +432,8 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
     setSelectedAttributeId(null);
     setRemoteAttribute(null);
     setIsAttributeLoading(false);
-  }, [data, category, bomFilters, mappingTypeConfig, currentUser.role]);
+    hydrationCategoryRef.current = category;
+  }, [data, category, bomFilters, mappingTypeConfig, currentUser.role, suspendHydration, isAutoSaving]);
 
   const refreshBomFilters = async (nextCategory: string, nextProductType: string) => {
     try {
@@ -348,7 +464,7 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
   };
 
   const PAGE_SIZE_MAPPING = 100;
-  const PAGE_SIZE_BOM = 40;
+  const PAGE_SIZE_BOM = 20;
 
   const filteredClasses = useMemo(() => {
     const q = classSearch.trim().toLowerCase();
@@ -758,18 +874,28 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
       setNewAttributeType('');
       return;
     }
-    setAvailableAttributeTypes(prev => [...prev, nextType]);
-    setIncludedAttributeTypes(prev => [...prev, nextType]);
+    const nextAvailableTypes = [...availableAttributeTypes, nextType];
+    const nextIncludedTypes = [...includedAttributeTypes, nextType];
+    setAvailableAttributeTypes(nextAvailableTypes);
+    setIncludedAttributeTypes(nextIncludedTypes);
     setNewAttributeType('');
     setHasCsvUploaded(true);
+    scheduleMappingAutoSave({
+      availableTypes: nextAvailableTypes,
+      includedTypes: nextIncludedTypes,
+    });
   };
 
   const toggleIncludedAttributeType = (type: string) => {
-    setIncludedAttributeTypes(prev => {
-      if (prev.includes(type)) return prev.filter(t => t !== type);
-      return [...prev, type];
-    });
+    const nextIncludedTypes = includedAttributeTypes.includes(type)
+      ? includedAttributeTypes.filter(t => t !== type)
+      : [...includedAttributeTypes, type];
+    setIncludedAttributeTypes(nextIncludedTypes);
     setHasCsvUploaded(true);
+    scheduleMappingAutoSave({
+      includedTypes: nextIncludedTypes,
+      availableTypes: availableAttributeTypes,
+    });
   };
 
   const handleDownloadTemplate = () => {
@@ -1022,8 +1148,18 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
           });
         });
 
-        setLocalMapping(prunePlaceholderMappings(existing));
+        const nextMapping = prunePlaceholderMappings(existing);
+        setLocalMapping(nextMapping);
         setHasCsvUploaded(true);
+        await persistInspectorData({
+          source: 'auto',
+          closeInspector: false,
+          mappingData: nextMapping,
+          mappingTypeData: {
+            availableTypes: availableAttributeTypes,
+            includedTypes: includedAttributeTypes.filter(type => availableAttributeTypes.includes(type)),
+          },
+        });
       } else if (category === 'classification' || category === 'values') {
         // --- Optimised path: Map-based O(1) lookups + no intermediate row objects + async batching ---
         const BATCH = 2000; // yield to UI every N rows
@@ -1199,8 +1335,14 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
           });
         });
 
-        setLocalBom(Object.values(byItem));
+        const nextBom = Object.values(byItem);
+        setLocalBom(nextBom);
         setHasCsvUploaded(true);
+        await persistInspectorData({
+          source: 'auto',
+          closeInspector: false,
+          bomData: nextBom,
+        });
       }
       setCsvImportProgress(100);
     } catch (err) {
@@ -1238,28 +1380,7 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
   };
 
   const handleSave = async () => {
-    setIsSaving(true);
-    try {
-      if (category === 'mapping') {
-        const sanitizedMappings = prunePlaceholderMappings(localMapping);
-        setLocalMapping(sanitizedMappings);
-        await onSave('mapping', {
-          mappings: sanitizedMappings,
-          mappingTypeConfig: {
-            availableTypes: availableAttributeTypes,
-            includedTypes: includedAttributeTypes.filter(type => availableAttributeTypes.includes(type)),
-          },
-        });
-      }
-      if (category === 'classification' || category === 'values') await onSave('classification', localClassification);
-      if (category === 'bom') await onSave('bom', localBom);
-      if (category === 'users') await onSave('users', localUsers);
-    } catch (err: any) {
-      console.error('Failed to synchronize data', err);
-      alert(`Synchronize failed: ${err?.message || String(err)}`);
-    } finally {
-      setIsSaving(false);
-    }
+    await persistInspectorData({ source: 'manual', closeInspector: true });
   };
 
   const addRootRow = () => {
@@ -1499,6 +1620,35 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
                 >
                   {isBomSyncing ? 'Syncing…' : 'Sync Items'}
                 </button>
+              </div>
+            )}
+
+            {category === 'bom' && mappingGenerationProgress && (
+              <div className="w-full mt-3 rounded-lg border border-slate-200 bg-white px-3 py-2 flex flex-wrap items-center gap-3">
+                <span className="text-[9px] font-black uppercase tracking-widest text-slate-500">Mapping Generation</span>
+                <span className={`px-2 py-0.5 rounded-full text-[8px] font-black uppercase tracking-widest ${
+                  mappingGenerationProgress.status === 'failed'
+                    ? 'bg-rose-100 text-rose-700'
+                    : mappingGenerationProgress.status === 'completed'
+                      ? 'bg-emerald-100 text-emerald-700'
+                      : mappingGenerationProgress.status === 'running' || mappingGenerationProgress.status === 'queued'
+                        ? 'bg-amber-100 text-amber-700'
+                        : 'bg-slate-100 text-slate-600'
+                }`}>
+                  {mappingGenerationProgress.status}
+                </span>
+                <span className="text-[10px] font-bold text-slate-600">
+                  {mappingProgressPct}% ({mappingGenerationProgress.processedFeatures}/{mappingGenerationProgress.totalFeatures} features)
+                </span>
+                <span className="text-[10px] font-bold text-slate-500">
+                  {mappingGenerationProgress.generatedRows} rows generated
+                </span>
+                {mappingGenerationProgress.triggeredByUsername && (
+                  <span className="text-[10px] text-slate-400">by {mappingGenerationProgress.triggeredByUsername}</span>
+                )}
+                {mappingGenerationProgress.error && (
+                  <span className="text-[10px] font-bold text-rose-600">{mappingGenerationProgress.error}</span>
+                )}
               </div>
             )}
 
@@ -2588,7 +2738,7 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
         <div className="px-6 py-4 bg-white border-t border-slate-100 flex items-center gap-3 shrink-0">
           {isSaving && (
             <div className="flex-1 mr-auto">
-              <div className="text-[9px] font-bold uppercase text-slate-500 tracking-widest mb-1">Synchronizing...</div>
+              <div className="text-[9px] font-bold uppercase text-slate-500 tracking-widest mb-1">{isAutoSaving ? 'Auto-synchronizing...' : 'Synchronizing...'}</div>
               <div className="h-1.5 w-full bg-slate-100 rounded-full overflow-hidden">
                 <div className="h-full w-2/3 bg-blue-600 animate-pulse rounded-full" />
               </div>

@@ -436,6 +436,7 @@ interface MappingWorkspaceProps {
   onSignOff: () => Promise<void>;
   onSaveChanges: (updates: any) => Promise<void>;
   onSyncFromDB: () => void;
+  isGenerationActive: boolean;
 }
 
 const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({ 
@@ -454,11 +455,13 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
   onSignOn,
   onSignOff,
   onSaveChanges,
-  onSyncFromDB
+  onSyncFromDB,
+  isGenerationActive
 }) => {
   const { useNewClassTargetMapping } = featureFlags;
   const normalizeAttrId = (id: string) => (id || '').replace(/[^A-Za-z0-9]/g, '').toUpperCase();
   const normalizeMappingType = (value?: string | null) => (value || '').trim().toLowerCase();
+  const canEdit = isLockedByMe && !isGenerationActive;
 
   // Resolve a legacy value against a valueMappings dictionary.
   // Tries the exact key first; if that yields an empty/missing result, falls back
@@ -551,13 +554,17 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
   }, [item, assignedClassId, localItemMappings]);
 
   const handleManualInputChange = (key: string, value: string) => {
-    if (!isLockedByMe) return;
+    if (!canEdit) return;
     isEditingRef.current = true;
     setManualInputs(prev => ({ ...prev, [key]: value }));
   };
 
   const commitToSystem = async () => {
     if (!item) return;
+    if (!canEdit) {
+      alert('Mapping generation is running. Editing and save are temporarily disabled.');
+      return;
+    }
     const manualForItem: Record<string, string> = {};
     Object.entries(manualInputs).forEach(([key, value]) => {
       if (!key.startsWith('UNMAPPED::')) return;
@@ -611,7 +618,7 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
   };
 
   const handleResetToGlobal = (featureId: string) => {
-    if (!isLockedByMe) return;
+    if (!canEdit) return;
     isEditingRef.current = true;
     setStagedLocalMappings(prev => prev.filter(m => !m.legacyFeatureIds.includes(featureId)));
   };
@@ -934,7 +941,7 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
   const unmappedTargetPalette = toneTheme[unmappedTargetGroupTone];
 
   const handleUpdateLinkage = (featureId: string, attrId: string) => {
-    if (!isLockedByMe) return;
+    if (!canEdit) return;
     if (!item) return;
     isEditingRef.current = true;
 
@@ -977,7 +984,7 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
   };
 
   const handleUpdateValue = (featureId: string, legacyVal: string, newVal: string) => {
-    if (!isLockedByMe) return;
+    if (!canEdit) return;
     isEditingRef.current = true;
     setStagedLocalMappings(prev => {
       const next = [...prev];
@@ -1023,7 +1030,8 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
     );
   }
 
-  const isReadOnly = !isLockedByMe;
+  const isReadOnly = !canEdit;
+  const isGenerationBlocked = isGenerationActive && isLockedByMe;
   const isDirty = isEditingRef.current;
 
   return (
@@ -1049,7 +1057,7 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
                    {isLockedByMe ? 'ACTIVE SESSION' : lockOwner ? `LOCKED BY ${lockOwner.userName.toUpperCase()}` : 'READ-ONLY VIEW'}
                 </p>
                 <p className={`text-[9px] font-bold opacity-80 mt-0.5 ${isLockedByMe || lockOwner ? 'text-white/80' : 'text-slate-500'}`}>
-                   {isLockedByMe ? (isDirty ? 'Unsaved overrides detected' : 'Synchronized with defaults') : lockOwner ? 'Wait for release to modify' : 'Sign on to enable edits'}
+                   {isGenerationBlocked ? 'Mapping generation in progress - editing temporarily disabled' : isLockedByMe ? (isDirty ? 'Unsaved overrides detected' : 'Synchronized with defaults') : lockOwner ? 'Wait for release to modify' : 'Sign on to enable edits'}
                 </p>
              </div>
           </div>
@@ -1109,10 +1117,19 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
              )}
              {isLockedByMe && (
                 <>
-                  <button type="button" onClick={handleDiscardSessionChanges} disabled={!isDirty} className={`px-3 py-1.5 text-[9px] font-black rounded-lg transition-all uppercase tracking-widest ${isDirty ? 'bg-white/10 border border-white/20 text-white hover:bg-white/20' : 'bg-white/5 text-white/30 cursor-not-allowed'}`}>
+                  <button type="button" onClick={handleDiscardSessionChanges} disabled={!isDirty || isGenerationBlocked} className={`px-3 py-1.5 text-[9px] font-black rounded-lg transition-all uppercase tracking-widest ${isDirty && !isGenerationBlocked ? 'bg-white/10 border border-white/20 text-white hover:bg-white/20' : 'bg-white/5 text-white/30 cursor-not-allowed'}`}>
                     Reset
                   </button>
-                  <button type="button" onClick={() => commitToSystem().catch(e => console.error("Save failed:", e))} className="px-4 py-1.5 bg-white text-indigo-700 text-[9px] font-black rounded-lg hover:bg-indigo-50 transition-all shadow-md uppercase tracking-widest">
+                  <button
+                    type="button"
+                    disabled={isGenerationBlocked}
+                    onClick={() => commitToSystem().catch(e => console.error("Save failed:", e))}
+                    className={`px-4 py-1.5 text-[9px] font-black rounded-lg transition-all shadow-md uppercase tracking-widest ${
+                      isGenerationBlocked
+                        ? 'bg-slate-200 text-slate-500 cursor-not-allowed shadow-none'
+                        : 'bg-white text-indigo-700 hover:bg-indigo-50'
+                    }`}
+                  >
                     Save
                   </button>
                   <button type="button" onClick={() => handleExitSession().catch(e => console.error("Exit failed:", e))} className="px-4 py-1.5 bg-indigo-800 text-white text-[9px] font-black rounded-lg hover:bg-indigo-900 transition-all border border-indigo-400 uppercase tracking-widest">

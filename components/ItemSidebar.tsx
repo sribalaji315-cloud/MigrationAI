@@ -4,6 +4,8 @@ import { LegacyItem, ItemLock } from '../types';
 
 type ItemStatus = 'mapped' | 'unmapped' | 'notRequired';
 
+const PAGE_SIZE = 20;
+
 interface ItemSidebarProps {
   items: LegacyItem[];
   selectedId: string | null;
@@ -13,6 +15,12 @@ interface ItemSidebarProps {
   itemStatuses?: Record<string, ItemStatus>;
   showUnmappedOnly?: boolean;
   onToggleUnmappedOnly?: () => void;
+  /** Total count of items on the server (for server-paged admin view). */
+  totalServerCount?: number;
+  /** Current page (0-based) driven by parent. */
+  currentPage?: number;
+  /** Called when the user clicks prev/next in the sidebar. */
+  onPageChange?: (page: number) => void;
 }
 
 const statusPalette: Record<ItemStatus, { wrapper: string; badge: string; indicator: string; text: string }> = {
@@ -36,7 +44,7 @@ const statusPalette: Record<ItemStatus, { wrapper: string; badge: string; indica
   },
 };
 
-const ItemSidebar: React.FC<ItemSidebarProps> = ({ items, selectedId, onSelect, locks, currentUserId, itemStatuses, showUnmappedOnly = false, onToggleUnmappedOnly }) => {
+const ItemSidebar: React.FC<ItemSidebarProps> = ({ items, selectedId, onSelect, locks, currentUserId, itemStatuses, showUnmappedOnly = false, onToggleUnmappedOnly, totalServerCount, currentPage, onPageChange }) => {
   const [search, setSearch] = useState('');
 
   const filteredItems = useMemo(() => {
@@ -53,11 +61,16 @@ const ItemSidebar: React.FC<ItemSidebarProps> = ({ items, selectedId, onSelect, 
     });
   }, [items, itemStatuses, showUnmappedOnly, search]);
 
+  // Server-paged mode: parent controls pages
+  const isServerPaged = typeof totalServerCount === 'number' && totalServerCount > 0 && onPageChange;
+  const totalPages = isServerPaged ? Math.max(1, Math.ceil(totalServerCount / PAGE_SIZE)) : 1;
+  const activePage = currentPage ?? 0;
+
   return (
     <div className="w-64 bg-white border-r border-slate-200 flex flex-col h-full shrink-0">
       <div className="p-4 border-b border-slate-100 bg-slate-50/30">
         <div className="flex items-center justify-between mb-3">
-          <h2 className="text-[10px] font-black text-slate-400 uppercase tracking-[0.2em]">BOM Index ({filteredItems.length})</h2>
+          <h2 className="text-[10px] font-black text-slate-400 uppercase tracking-[0.2em]">BOM Index ({isServerPaged ? `${filteredItems.length}/${totalServerCount}` : filteredItems.length})</h2>
           <button
             type="button"
             onClick={() => onToggleUnmappedOnly?.()}
@@ -139,6 +152,29 @@ const ItemSidebar: React.FC<ItemSidebarProps> = ({ items, selectedId, onSelect, 
           );
         })}
       </div>
+      {isServerPaged && totalPages > 1 && (
+        <div className="px-3 py-2 border-t border-slate-100 bg-slate-50/30 flex items-center justify-between shrink-0">
+          <button
+            type="button"
+            disabled={activePage <= 0}
+            onClick={() => onPageChange(activePage - 1)}
+            className="px-2 py-1 rounded text-[9px] font-black uppercase tracking-widest border border-slate-200 bg-white text-slate-600 hover:bg-slate-100 disabled:opacity-40 disabled:cursor-not-allowed transition-all"
+          >
+            Prev
+          </button>
+          <span className="text-[9px] font-black text-slate-400 uppercase tracking-widest">
+            {activePage + 1} / {totalPages}
+          </span>
+          <button
+            type="button"
+            disabled={activePage >= totalPages - 1}
+            onClick={() => onPageChange(activePage + 1)}
+            className="px-2 py-1 rounded text-[9px] font-black uppercase tracking-widest border border-slate-200 bg-white text-slate-600 hover:bg-slate-100 disabled:opacity-40 disabled:cursor-not-allowed transition-all"
+          >
+            Next
+          </button>
+        </div>
+      )}
     </div>
   );
 };
