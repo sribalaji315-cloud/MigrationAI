@@ -16,8 +16,16 @@ dist-ssr
 __pycache__/
 *.pyc
 
+# Virtual environment
+.venv/
+
+# Environment variables / secrets
+.env
+
 # Local databases
 *.db
+*.db-shm
+*.db-wal
 
 # State snapshots
 state_before.json
