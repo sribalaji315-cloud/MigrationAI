@@ -41,6 +41,22 @@ export interface NewClassification {
   attributes: NewAttribute[];
 }
 
+export interface ValueListRow {
+  id?: number;
+  valuelistId: string;
+  valuelistIdDescription?: string;
+  unit?: string;
+  value: string;
+  valueDescription?: string;
+}
+
+export interface ValueListGroup {
+  valuelistId: string;
+  valuelistIdDescription?: string;
+  unit?: string;
+  valueCount: number;
+}
+
 export type MappingAttributeType = string;
 
 export interface MappingTypeConfig {
@@ -53,6 +69,7 @@ export interface GlobalMapping {
   newAttributeId: string;
   valueMappings: Record<string, string>;
   attributeType: MappingAttributeType;
+  mappedFrom?: 'global' | 'local';
 }
 
 export interface ItemLock {
@@ -97,6 +114,8 @@ export interface WorkspaceMappingRow {
   legacyValue: string;
   newAttributeId: string;
   newValue: string;
+  attributeType?: string;
+  mappedFrom?: string;
   signedOnByUserId?: string | null;
   signedOnByUsername?: string | null;
   signedOnAt?: number | null;

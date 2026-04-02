@@ -1,5 +1,5 @@
 
-import { GlobalMapping, DatabaseState, User, ConnectionMode, NewAttribute, WorkspaceMappingRow, MappingGenerationProgress } from '../types';
+import { GlobalMapping, DatabaseState, User, ConnectionMode, NewAttribute, WorkspaceMappingRow, MappingGenerationProgress, ValueListGroup, ValueListRow, NewClassification } from '../types';
 
 export interface SaveAllResult {
   mode: ConnectionMode;
@@ -30,9 +30,21 @@ export interface DashboardMetricsResponse {
   items: DashboardItemMetrics[];
 }
 
-// Backend API endpoint: in production use Vite env `VITE_SQL_API_ENDPOINT`,
-// otherwise fall back to local FastAPI for development.
-const SQL_ENDPOINT = import.meta.env.VITE_SQL_API_ENDPOINT || 'http://localhost:8000';
+function resolveSqlEndpoint() {
+  const configuredEndpoint = (import.meta as any).env?.VITE_SQL_API_ENDPOINT;
+  if (configuredEndpoint) {
+    return configuredEndpoint;
+  }
+
+  if (typeof window !== 'undefined') {
+    const protocol = window.location.protocol === 'https:' ? 'https:' : 'http:';
+    return `${protocol}//${window.location.hostname}:8000`;
+  }
+
+  return 'http://localhost:8000';
+}
+
+const SQL_ENDPOINT = resolveSqlEndpoint();
 const MODE_CACHE_TTL_MS = 15000;
 
 const DEFAULT_ADMIN: User = {
@@ -43,11 +55,69 @@ const DEFAULT_ADMIN: User = {
 };
 
 const TOKEN_KEY = 'erp_migrator_token';
+const REFRESH_TOKEN_KEY = 'erp_migrator_refresh_token';
 
 export const dbService = {
   _modeCache: null as ConnectionMode | null,
   _modeCacheExpiresAt: 0,
   _modePromise: null as Promise<ConnectionMode> | null,
+
+  // --- Request caching & deduplication ---
+  _cache: new Map<string, { data: any; expiresAt: number }>(),
+  _inflight: new Map<string, Promise<any>>(),
+
+  async _cachedFetch(url: string, options?: RequestInit & { _ttlMs?: number; _timeoutMs?: number }): Promise<any> {
+    const ttlMs = options?._ttlMs ?? 30000;
+    const timeoutMs = options?._timeoutMs ?? 15000;
+    const cacheKey = `${options?.method || 'GET'}:${url}`;
+    const now = Date.now();
+
+    // Return cached data if still valid
+    const cached = this._cache.get(cacheKey);
+    if (cached && cached.expiresAt > now) {
+      return cached.data;
+    }
+
+    // Deduplicate in-flight requests
+    const inflight = this._inflight.get(cacheKey);
+    if (inflight) {
+      return inflight;
+    }
+
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort('Request timed out'), timeoutMs);
+
+    const promise = (async () => {
+      try {
+        const { _ttlMs: _, _timeoutMs: _t, ...fetchOpts } = options || {} as any;
+        const resp = await fetch(url, { ...fetchOpts, signal: controller.signal });
+        clearTimeout(timeoutId);
+        if (!resp.ok) {
+          const errText = await resp.text();
+          throw new Error(`${resp.status} ${errText}`);
+        }
+        const data = await resp.json();
+        this._cache.set(cacheKey, { data, expiresAt: Date.now() + ttlMs });
+        return data;
+      } catch (err: any) {
+        clearTimeout(timeoutId);
+        if (err.name === 'AbortError') {
+          throw new Error(`Request timed out after ${timeoutMs / 1000}s`);
+        }
+        throw err;
+      } finally {
+        this._inflight.delete(cacheKey);
+      }
+    })();
+
+    this._inflight.set(cacheKey, promise);
+    return promise;
+  },
+
+  /** Invalidate all cached GET responses (call after mutations). */
+  _invalidateCache() {
+    this._cache.clear();
+  },
 
   async getConnectionMode(): Promise<ConnectionMode> {
     if (!SQL_ENDPOINT) return 'LOCAL_MOCK';
@@ -110,11 +180,47 @@ export const dbService = {
     if (!resp.ok) throw new Error('Login failed');
     const data = await resp.json();
     if (data?.access_token) localStorage.setItem(TOKEN_KEY, data.access_token);
+    if (data?.refresh_token) localStorage.setItem(REFRESH_TOKEN_KEY, data.refresh_token);
     return data;
   },
 
+  async refreshAccessToken(): Promise<boolean> {
+    const refreshToken = localStorage.getItem(REFRESH_TOKEN_KEY);
+    if (!refreshToken) return false;
+    try {
+      const resp = await fetch(`${SQL_ENDPOINT}/auth/refresh`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ refresh_token: refreshToken }),
+      });
+      if (!resp.ok) {
+        localStorage.removeItem(REFRESH_TOKEN_KEY);
+        return false;
+      }
+      const data = await resp.json();
+      if (data?.access_token) localStorage.setItem(TOKEN_KEY, data.access_token);
+      if (data?.refresh_token) localStorage.setItem(REFRESH_TOKEN_KEY, data.refresh_token);
+      return true;
+    } catch {
+      return false;
+    }
+  },
+
+  async _fetchWithRefresh(url: string, init?: RequestInit): Promise<Response> {
+    let resp = await fetch(url, init);
+    if (resp.status === 401) {
+      const refreshed = await this.refreshAccessToken();
+      if (refreshed) {
+        // Retry with new token
+        const newInit = { ...init, headers: { ...((init?.headers as Record<string,string>) || {}), ...this._authHeaders() } };
+        resp = await fetch(url, newInit);
+      }
+    }
+    return resp;
+  },
+
   async me() {
-    const resp = await fetch(`${SQL_ENDPOINT}/auth/me`, { headers: this._authHeaders() });
+    const resp = await this._fetchWithRefresh(`${SQL_ENDPOINT}/auth/me`, { headers: this._authHeaders() });
     if (!resp.ok) throw new Error('Failed to retrieve current user');
     return resp.json();
   },
@@ -131,20 +237,49 @@ export const dbService = {
       
       const state = await response.json();
       
-      // classifications are now stored in a dedicated table
-      try {
-        const clsResp = await fetch(`${SQL_ENDPOINT}/classifications`, { headers: this._authHeaders() });
-        if (clsResp.ok) {
-          state.classifications = await clsResp.json();
-        }
-      } catch (e) {
-        console.warn("Failed to fetch classifications, using empty array", e);
-      }
-      
       return { state, mode: 'REMOTE_SQL' };
     }
 
     throw new Error('Database connection not available. Please ensure backend is running.');
+  },
+
+  async fetchInit(): Promise<{
+    locks: Record<string, import('../types').ItemLock>;
+    users: import('../types').User[];
+    mappingTypeConfig?: import('../types').MappingTypeConfig;
+    itemClassifications: Record<string, string>;
+  }> {
+    if (!SQL_ENDPOINT) {
+      throw new Error('Database connection not available.');
+    }
+    const resp = await fetch(`${SQL_ENDPOINT}/init`, { headers: this._authHeaders() });
+    if (!resp.ok) {
+      throw new Error(`Failed to fetch init: ${resp.status}`);
+    }
+    return resp.json();
+  },
+
+  async fetchSignedOnBomItems(options?: {
+    category?: string;
+    productType?: string;
+    userId?: string;
+    limit?: number;
+    offset?: number;
+  }): Promise<{ items: DatabaseState['bom']; signedOnCount: number }> {
+    if (!SQL_ENDPOINT) {
+      throw new Error('Database connection not available.');
+    }
+    const params = new URLSearchParams();
+    if (options?.category) params.set('category', options.category);
+    if (options?.productType) params.set('productType', options.productType);
+    if (options?.userId) params.set('userId', options.userId);
+    if (options?.limit != null) params.set('limit', String(options.limit));
+    if (options?.offset != null) params.set('offset', String(options.offset));
+    const query = params.toString();
+    return this._cachedFetch(`${SQL_ENDPOINT}/bom/signed-on${query ? `?${query}` : ''}`, {
+      headers: this._authHeaders(),
+      _ttlMs: 10000,
+    });
   },
 
   async fetchClassificationAttribute(classId: string, attributeId: string): Promise<NewAttribute> {
@@ -178,12 +313,7 @@ export const dbService = {
     if (options?.category) params.set('category', options.category);
     if (options?.productType) params.set('productType', options.productType);
     const query = params.toString();
-    const resp = await fetch(`${SQL_ENDPOINT}/bom/filters${query ? `?${query}` : ''}`, { headers: this._authHeaders() });
-    if (!resp.ok) {
-      const errText = await resp.text();
-      throw new Error(`Failed to fetch BOM filters: ${resp.status} ${errText}`);
-    }
-    return resp.json();
+    return this._cachedFetch(`${SQL_ENDPOINT}/bom/filters${query ? `?${query}` : ''}`, { headers: this._authHeaders() });
   },
 
   async fetchBomItemsByIds(itemIds: string[]): Promise<DatabaseState['bom']> {
@@ -203,7 +333,7 @@ export const dbService = {
     return resp.json();
   },
 
-  async fetchBomItems(category?: string, productType?: string, options?: { limit?: number; offset?: number }): Promise<DatabaseState['bom']> {
+  async fetchBomItems(category?: string, productType?: string, options?: { limit?: number; offset?: number; search?: string }): Promise<DatabaseState['bom']> {
     if (!SQL_ENDPOINT) {
       throw new Error('Database connection not available.');
     }
@@ -212,30 +342,57 @@ export const dbService = {
     if (productType) params.set('productType', productType);
     if (options?.limit) params.set('limit', String(options.limit));
     if (options?.offset) params.set('offset', String(options.offset));
+    if (options?.search) params.set('search', options.search);
     const query = params.toString();
-    const resp = await fetch(`${SQL_ENDPOINT}/bom/items${query ? `?${query}` : ''}`, { headers: this._authHeaders() });
-    if (!resp.ok) {
-      const errText = await resp.text();
-      throw new Error(`Failed to fetch BOM items: ${resp.status} ${errText}`);
-    }
-    return resp.json();
+    return this._cachedFetch(`${SQL_ENDPOINT}/bom/items${query ? `?${query}` : ''}`, { headers: this._authHeaders(), _ttlMs: 15000 });
   },
 
-  async fetchBomCount(category?: string, productType?: string): Promise<number> {
+  async fetchBomCount(category?: string, productType?: string, search?: string): Promise<number> {
     if (!SQL_ENDPOINT) {
       throw new Error('Database connection not available.');
     }
     const params = new URLSearchParams();
     if (category) params.set('category', category);
     if (productType) params.set('productType', productType);
+    if (search) params.set('search', search);
     const query = params.toString();
-    const resp = await fetch(`${SQL_ENDPOINT}/bom/count${query ? `?${query}` : ''}`, { headers: this._authHeaders() });
-    if (!resp.ok) {
-      const errText = await resp.text();
-      throw new Error(`Failed to fetch BOM count: ${resp.status} ${errText}`);
-    }
-    const data = await resp.json();
+    const data = await this._cachedFetch(`${SQL_ENDPOINT}/bom/count${query ? `?${query}` : ''}`, { headers: this._authHeaders() });
     return data?.total ?? 0;
+  },
+
+  async fetchGlobalMappingsPaginated(options?: { limit?: number; offset?: number; search?: string }): Promise<{ items: GlobalMapping[]; total: number }> {
+    if (!SQL_ENDPOINT) {
+      throw new Error('Database connection not available.');
+    }
+    const params = new URLSearchParams();
+    if (options?.limit != null) params.set('limit', String(options.limit));
+    if (options?.offset != null) params.set('offset', String(options.offset));
+    if (options?.search) params.set('search', options.search);
+    const query = params.toString();
+    return this._cachedFetch(`${SQL_ENDPOINT}/global-mappings${query ? `?${query}` : ''}`, { headers: this._authHeaders() });
+  },
+
+  async fetchClassificationsPaginated(options?: { limit?: number; offset?: number; search?: string }): Promise<{ items: NewClassification[]; total: number }> {
+    if (!SQL_ENDPOINT) {
+      throw new Error('Database connection not available.');
+    }
+    const params = new URLSearchParams();
+    if (options?.limit != null) params.set('limit', String(options.limit));
+    if (options?.offset != null) params.set('offset', String(options.offset));
+    if (options?.search) params.set('search', options.search);
+    const query = params.toString();
+    return this._cachedFetch(`${SQL_ENDPOINT}/classifications/paginated${query ? `?${query}` : ''}`, { headers: this._authHeaders() });
+  },
+
+  async fetchClassificationFilters(options?: { classId?: string; attributeId?: string }): Promise<{ classes: { classId: string; className: string }[]; attributes: string[] }> {
+    if (!SQL_ENDPOINT) {
+      throw new Error('Database connection not available.');
+    }
+    const params = new URLSearchParams();
+    if (options?.classId) params.set('classId', options.classId);
+    if (options?.attributeId) params.set('attributeId', options.attributeId);
+    const query = params.toString();
+    return this._cachedFetch(`${SQL_ENDPOINT}/classifications/filters${query ? `?${query}` : ''}`, { headers: this._authHeaders() });
   },
 
   async fetchWorkspaceMappings(itemId: string): Promise<WorkspaceMappingRow[]> {
@@ -265,6 +422,7 @@ export const dbService = {
       const errText = await resp.text();
       throw new Error(`Failed to save workspace mappings: ${resp.status} ${errText}`);
     }
+    this._invalidateCache();
     return resp.json();
   },
 
@@ -282,6 +440,22 @@ export const dbService = {
     return resp.json();
   },
 
+  async triggerMappingGeneration(): Promise<{ ok: boolean; mappingGenerationJobId: number | null }> {
+    if (!SQL_ENDPOINT) {
+      throw new Error('Database connection not available.');
+    }
+    const resp = await fetch(`${SQL_ENDPOINT}/mapping-generation/trigger`, {
+      method: 'POST',
+      headers: this._authHeaders(),
+    });
+    if (!resp.ok) {
+      const errText = await resp.text();
+      throw new Error(`Failed to trigger mapping generation: ${resp.status} ${errText}`);
+    }
+    this._invalidateCache();
+    return resp.json();
+  },
+
   async fetchDashboardMetrics(options?: { category?: string; productLine?: string; includeExcluded?: boolean; forceRecompute?: boolean }): Promise<DashboardMetricsResponse> {
     if (!SQL_ENDPOINT) {
       throw new Error('Database connection not available.');
@@ -292,37 +466,91 @@ export const dbService = {
     if (options?.includeExcluded) params.set('includeExcluded', 'true');
     if (options?.forceRecompute) params.set('forceRecompute', 'true');
     const query = params.toString();
-    const resp = await fetch(`${SQL_ENDPOINT}/dashboard/metrics${query ? `?${query}` : ''}`, { headers: this._authHeaders() });
-    if (!resp.ok) {
-      const errText = await resp.text();
-      throw new Error(`Failed to fetch dashboard metrics: ${resp.status} ${errText}`);
-    }
-    return resp.json();
+    return this._cachedFetch(`${SQL_ENDPOINT}/dashboard/metrics${query ? `?${query}` : ''}`, { headers: this._authHeaders(), _timeoutMs: 120000 });
   },
 
   async fetchItemStatuses(): Promise<Record<string, 'mapped' | 'unmapped' | 'notRequired'>> {
     if (!SQL_ENDPOINT) {
       throw new Error('Database connection not available.');
     }
-    const resp = await fetch(`${SQL_ENDPOINT}/item-statuses`, { headers: this._authHeaders() });
-    if (!resp.ok) {
-      const errText = await resp.text();
-      throw new Error(`Failed to fetch item statuses: ${resp.status} ${errText}`);
-    }
-    const data = await resp.json();
+    const data = await this._cachedFetch(`${SQL_ENDPOINT}/item-statuses`, { headers: this._authHeaders() });
     return data?.statuses || {};
   },
 
-  async exportBomCsv(): Promise<Blob> {
+  async logout(): Promise<void> {
+    if (!SQL_ENDPOINT) return;
+    try {
+      await fetch(`${SQL_ENDPOINT}/auth/logout`, {
+        method: 'POST',
+        headers: this._authHeaders(),
+      });
+    } catch {
+      // Best-effort; token removal happens client-side regardless
+    }
+    localStorage.removeItem(TOKEN_KEY);
+    localStorage.removeItem(REFRESH_TOKEN_KEY);
+    this._invalidateCache();
+  },
+
+  async exportBomCsv(filters?: { category?: string; productType?: string; search?: string }): Promise<Blob> {
     if (!SQL_ENDPOINT) {
       throw new Error('Database connection not available.');
     }
-    const resp = await fetch(`${SQL_ENDPOINT}/export/bom-csv`, { headers: this._authHeaders() });
+    const params = new URLSearchParams();
+    if (filters?.category) params.set('category', filters.category);
+    if (filters?.productType) params.set('productType', filters.productType);
+    if (filters?.search) params.set('search', filters.search);
+    const query = params.toString();
+    const resp = await fetch(`${SQL_ENDPOINT}/export/bom-csv${query ? `?${query}` : ''}`, { headers: this._authHeaders() });
     if (!resp.ok) {
       const errText = await resp.text();
       throw new Error(`Failed to export BOM CSV: ${resp.status} ${errText}`);
     }
     return resp.blob();
+  },
+
+  async exportClassificationsCsv(filters?: { search?: string; classId?: string }): Promise<Blob> {
+    if (!SQL_ENDPOINT) {
+      throw new Error('Database connection not available.');
+    }
+    const params = new URLSearchParams();
+    if (filters?.search) params.set('search', filters.search);
+    if (filters?.classId) params.set('classId', filters.classId);
+    const query = params.toString();
+    const resp = await fetch(`${SQL_ENDPOINT}/export/classifications-csv${query ? `?${query}` : ''}`, { headers: this._authHeaders() });
+    if (!resp.ok) {
+      const errText = await resp.text();
+      throw new Error(`Failed to export classifications CSV: ${resp.status} ${errText}`);
+    }
+    return resp.blob();
+  },
+
+  async exportValuelistsCsv(filters?: { search?: string; valuelistId?: string }): Promise<Blob> {
+    if (!SQL_ENDPOINT) {
+      throw new Error('Database connection not available.');
+    }
+    const params = new URLSearchParams();
+    if (filters?.search) params.set('search', filters.search);
+    if (filters?.valuelistId) params.set('valuelistId', filters.valuelistId);
+    const query = params.toString();
+    const resp = await fetch(`${SQL_ENDPOINT}/export/valuelists-csv${query ? `?${query}` : ''}`, { headers: this._authHeaders() });
+    if (!resp.ok) {
+      const errText = await resp.text();
+      throw new Error(`Failed to export valuelists CSV: ${resp.status} ${errText}`);
+    }
+    return resp.blob();
+  },
+
+  async wipeBom(): Promise<void> {
+    if (!SQL_ENDPOINT) {
+      throw new Error('Database connection not available.');
+    }
+    const resp = await fetch(`${SQL_ENDPOINT}/wipe-bom`, { method: 'POST', headers: this._authHeaders() });
+    if (!resp.ok) {
+      const errText = await resp.text();
+      throw new Error(`Failed to wipe BOM data: ${resp.status} ${errText}`);
+    }
+    this._invalidateCache();
   },
 
   async saveAll(
@@ -387,6 +615,7 @@ export const dbService = {
       console.log('Skipping classifications sync for non-admin user');
     }
     
+    this._invalidateCache();
     return { mode: 'REMOTE_SQL', mappingGenerationJobId };
   },
 
@@ -472,5 +701,79 @@ export const dbService = {
     });
     
     return (await this.fetchAll()).state;
-  }
+  },
+
+  // ---------------------------------------------------------------------------
+  // Value List endpoints
+  // ---------------------------------------------------------------------------
+
+  async fetchValueListsPaginated(options?: { limit?: number; offset?: number; search?: string }): Promise<{ items: ValueListGroup[]; total: number }> {
+    if (!SQL_ENDPOINT) throw new Error('Database connection not available.');
+    const params = new URLSearchParams();
+    if (options?.limit != null) params.set('limit', String(options.limit));
+    if (options?.offset != null) params.set('offset', String(options.offset));
+    if (options?.search) params.set('search', options.search);
+    const query = params.toString();
+    return this._cachedFetch(`${SQL_ENDPOINT}/valuelists/paginated${query ? `?${query}` : ''}`, { headers: this._authHeaders() });
+  },
+
+  async fetchValueListDetail(valuelistId: string): Promise<ValueListRow[]> {
+    if (!SQL_ENDPOINT) throw new Error('Database connection not available.');
+    return this._cachedFetch(`${SQL_ENDPOINT}/valuelists/${encodeURIComponent(valuelistId)}`, { headers: this._authHeaders() });
+  },
+
+  async fetchValueListFilters(options?: { valuelistId?: string; value?: string }): Promise<{ valuelists: { valuelistId: string; valuelistIdDescription: string }[]; values: string[] }> {
+    if (!SQL_ENDPOINT) throw new Error('Database connection not available.');
+    const params = new URLSearchParams();
+    if (options?.valuelistId) params.set('valuelistId', options.valuelistId);
+    if (options?.value) params.set('value', options.value);
+    const query = params.toString();
+    return this._cachedFetch(`${SQL_ENDPOINT}/valuelists/filters${query ? `?${query}` : ''}`, { headers: this._authHeaders() });
+  },
+
+  async uploadValueListCsv(file: File): Promise<{ ok: boolean; rowsInserted: number }> {
+    if (!SQL_ENDPOINT) throw new Error('Database connection not available.');
+    const formData = new FormData();
+    formData.append('file', file);
+    const headers: Record<string, string> = {};
+    const auth = this._authHeaders();
+    if (auth.Authorization) headers.Authorization = auth.Authorization;
+    const resp = await fetch(`${SQL_ENDPOINT}/valuelists/upload-csv`, {
+      method: 'POST',
+      headers,
+      body: formData,
+    });
+    if (!resp.ok) {
+      const errText = await resp.text();
+      throw new Error(`Failed to upload CSV: ${resp.status} ${errText}`);
+    }
+    return resp.json();
+  },
+
+  async deleteValueList(valuelistId: string): Promise<{ ok: boolean; rowsDeleted: number }> {
+    if (!SQL_ENDPOINT) throw new Error('Database connection not available.');
+    const resp = await fetch(`${SQL_ENDPOINT}/valuelists/${encodeURIComponent(valuelistId)}`, {
+      method: 'DELETE',
+      headers: this._authHeaders(),
+    });
+    if (!resp.ok) {
+      const errText = await resp.text();
+      throw new Error(`Failed to delete value list: ${resp.status} ${errText}`);
+    }
+    return resp.json();
+  },
+
+  async saveValueListsBulk(rows: ValueListRow[]): Promise<{ ok: boolean; rowsInserted: number }> {
+    if (!SQL_ENDPOINT) throw new Error('Database connection not available.');
+    const resp = await fetch(`${SQL_ENDPOINT}/valuelists/bulk`, {
+      method: 'POST',
+      headers: { ...this._authHeaders(), 'Content-Type': 'application/json' },
+      body: JSON.stringify(rows),
+    });
+    if (!resp.ok) {
+      const errText = await resp.text();
+      throw new Error(`Failed to save value lists: ${resp.status} ${errText}`);
+    }
+    return resp.json();
+  },
 };

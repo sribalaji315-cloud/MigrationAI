@@ -16,36 +16,36 @@ const LoginSignUp: React.FC<LoginSignUpProps> = ({ onLogin }) => {
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setError('');
+    try {
+      const modeResult = await dbService.getConnectionMode();
 
-    const modeResult = await dbService.getConnectionMode();
-
-    if (isLogin) {
-      if (modeResult === 'REMOTE_SQL') {
-        try {
-          await dbService.login(userName, password);
-          const remoteUser = await dbService.me();
-          onLogin({ userId: `USR-${remoteUser.id}`, userName: remoteUser.username, password: '', role: remoteUser.role });
-          return;
-        } catch (err: any) {
-          setError('Invalid credentials. Access Denied.');
-          return;
+      if (isLogin) {
+        if (modeResult === 'REMOTE_SQL') {
+          try {
+            await dbService.login(userName, password);
+            const remoteUser = await dbService.me();
+            onLogin({ userId: `USR-${remoteUser.id}`, userName: remoteUser.username, password: '', role: remoteUser.role });
+            return;
+          } catch {
+            setError('Invalid credentials or backend unreachable.');
+            return;
+          }
         }
+
+        const { state } = await dbService.fetchAll();
+        const users = state.users;
+        const user = users.find(u => u.userName === userName && u.password === password);
+        if (user) {
+          onLogin(user);
+        } else {
+          setError('Invalid credentials. Access Denied.');
+        }
+        return;
       }
 
-      // LOCAL_MOCK
-      const { state } = await dbService.fetchAll();
-      const users = state.users;
-      const user = users.find(u => u.userName === userName && u.password === password);
-      if (user) {
-        onLogin(user);
-      } else {
-        setError('Invalid credentials. Access Denied.');
-      }
-    } else {
       if (modeResult === 'REMOTE_SQL') {
         try {
           await dbService.register(userName, password, 'user');
-          // after register, perform login to get token and user info
           await dbService.login(userName, password);
           const remoteUser = await dbService.me();
           onLogin({ userId: `USR-${remoteUser.id}`, userName: remoteUser.username, password: '', role: remoteUser.role });
@@ -56,7 +56,6 @@ const LoginSignUp: React.FC<LoginSignUpProps> = ({ onLogin }) => {
         }
       }
 
-      // LOCAL_MOCK register
       const { state } = await dbService.fetchAll();
       const users = state.users;
       if (users.some(u => u.userName === userName)) {
@@ -74,6 +73,8 @@ const LoginSignUp: React.FC<LoginSignUpProps> = ({ onLogin }) => {
       state.users.push(newUser);
       await dbService.saveAll(state, 'user', { includeBom: false });
       onLogin(newUser);
+    } catch (err: any) {
+      setError(err?.message || 'Unable to reach backend. Check the API server and CORS settings.');
     }
   };
 

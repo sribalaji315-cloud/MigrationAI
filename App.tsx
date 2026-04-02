@@ -1,13 +1,41 @@
 
-import React, { useState, useEffect, useRef, useMemo } from 'react';
+import React, { useState, useEffect, useRef, useMemo, useCallback, Suspense, lazy } from 'react';
 import BOMHeader from './components/BOMHeader';
 import ItemSidebar from './components/ItemSidebar';
-import MappingWorkspace from './components/MappingWorkspace';
-import DataInspector from './components/DataInspector';
-import MappingDashboard from './components/MappingDashboard';
 import LoginSignUp from './components/LoginSignUp';
 import { dbService } from './services/dbService';
-import { GlobalMapping, DataCategory, DatabaseState, User, ConnectionMode, LocalItemMappings, FeatureFlags, ClassAttributeValues, MappingTypeConfig, MappingGenerationProgress } from './types';
+import { GlobalMapping, DataCategory, DatabaseState, User, ConnectionMode, LocalItemMappings, FeatureFlags, ClassAttributeValues, MappingTypeConfig, MappingGenerationProgress, WorkspaceMappingRow } from './types';
+import { useBomPagination } from './hooks/useBomPagination';
+import { useLocking } from './hooks/useLocking';
+import { useItemStatusTracking } from './hooks/useItemStatusTracking';
+import { useWebSocket, WsEvent } from './hooks/useWebSocket';
+
+const MappingWorkspace = lazy(() => import('./components/MappingWorkspace'));
+const DataInspector = lazy(() => import('./components/DataInspector'));
+const MappingDashboard = lazy(() => import('./components/MappingDashboard'));
+
+const LazyFallback = () => (
+  <div className="flex items-center justify-center p-8">
+    <div className="w-6 h-6 border-2 border-blue-600 border-t-transparent rounded-full animate-spin" />
+  </div>
+);
+
+const SectionSpinner = ({ label }: { label: string }) => (
+  <div className="flex flex-col items-center justify-center h-full w-full gap-3 py-16">
+    <div className="w-6 h-6 border-[2.5px] border-blue-600 border-t-transparent rounded-full animate-spin" />
+    <p className="text-slate-400 text-[9px] font-black uppercase tracking-widest">{label}</p>
+  </div>
+);
+
+const EMPTY_DB_STATE: DatabaseState = {
+  bom: [],
+  mappings: [],
+  classifications: [],
+  localMappings: {},
+  itemClassifications: {},
+  locks: {},
+  users: [],
+};
 
 type ItemStatus = 'mapped' | 'unmapped' | 'notRequired';
 
@@ -24,16 +52,122 @@ const App: React.FC = () => {
   const [activeInspector, setActiveInspector] = useState<DataCategory | null>(null);
   const [showDashboard, setShowDashboard] = useState(false);
   const [showUnmappedOnlyInSidebar, setShowUnmappedOnlyInSidebar] = useState(false);
-  const [bomFilters, setBomFilters] = useState<{ categories: string[]; productTypes: string[] }>({ categories: [], productTypes: [] });
-  const [itemStatuses, setItemStatuses] = useState<Record<string, ItemStatus>>({});
   const [featureFlags, setFeatureFlags] = useState<FeatureFlags>(() => ({
     useNewClassTargetMapping: import.meta.env.VITE_USE_NEW_CLASS_TARGET_MAPPING === 'true',
   }));
   const [mappingGenerationProgress, setMappingGenerationProgress] = useState<MappingGenerationProgress | null>(null);
-  const [bomPage, setBomPage] = useState(0);
-  const [bomTotalCount, setBomTotalCount] = useState(0);
-  const BOM_PAGE_SIZE = 20;
-  
+  const [mappingTotalCount, setMappingTotalCount] = useState(0);
+  const [classificationTotalCount, setClassificationTotalCount] = useState(0);
+  const [isDataLoading, setIsDataLoading] = useState(false);
+
+  const {
+    bomPage,
+    bomTotalCount,
+    setBomTotalCount,
+    bomFilters,
+    setBomFilters,
+    handleFetchBomItems,
+    handleBomPageChange,
+    BOM_PAGE_SIZE,
+  } = useBomPagination(dbState, currentUser, setDbState, setIsRefreshing);
+
+  const { itemStatuses, setItemStatuses, visibleBomItems, sidebarItems, includedMappingTypes } =
+    useItemStatusTracking(dbState, currentUser, showUnmappedOnlyInSidebar);
+
+  // --- Sidebar server search state ---
+  const [sidebarSearchResults, setSidebarSearchResults] = useState<DatabaseState['bom'] | null>(null);
+  const [sidebarSearchTotal, setSidebarSearchTotal] = useState<number>(0);
+  const sidebarSearchGenRef = useRef(0);
+
+  const handleSidebarSearch = useCallback(async (query: string) => {
+    if (!query.trim()) {
+      setSidebarSearchResults(null);
+      setSidebarSearchTotal(0);
+      return;
+    }
+    const gen = ++sidebarSearchGenRef.current;
+    try {
+      const [items, count] = await Promise.all([
+        dbService.fetchBomItems(undefined, undefined, { limit: 50, search: query }),
+        dbService.fetchBomCount(undefined, undefined, query),
+      ]);
+      if (gen !== sidebarSearchGenRef.current) return; // stale
+      setSidebarSearchResults(items);
+      setSidebarSearchTotal(count);
+    } catch (err) {
+      if (gen !== sidebarSearchGenRef.current) return;
+      console.warn('Sidebar search failed', err);
+    }
+  }, []);
+
+  const handleAdminFilterChange = useCallback(async (filters: { category?: string; productType?: string; userId?: string }) => {
+    setIsDataLoading(true);
+    try {
+      const result = await dbService.fetchSignedOnBomItems({
+        category: filters.category,
+        productType: filters.productType,
+        userId: filters.userId,
+        limit: 20,
+        offset: 0,
+      });
+      setDbState(prev => prev ? { ...prev, bom: result.items } : prev);
+    } catch (err) {
+      console.warn('Failed to fetch filtered BOM items', err);
+    } finally {
+      setIsDataLoading(false);
+    }
+  }, []);
+
+  // WebSocket: real-time collaboration events (ref avoids stale closure)
+  const fetchFromDBRef = useRef<() => void>(() => {});
+  const handleWsEvent = useCallback((event: WsEvent) => {
+    if (event.type === 'lock_change' || event.type === 'data_sync') {
+      fetchFromDBRef.current();
+    } else if (event.type === 'generation_progress') {
+      if (event.payload?.status === 'completed') {
+        fetchFromDBRef.current();
+      }
+    }
+  }, []);
+  useWebSocket(currentUser?.userId ?? null, handleWsEvent);
+
+  // --- Lazy-load workspace mappings for selected item ---
+  const localMappingsGenRef = useRef(0);
+  useEffect(() => {
+    if (!selectedItemId || !dbState) return;
+    // Already loaded for this item
+    if (dbState.localMappings[selectedItemId]) return;
+    const gen = ++localMappingsGenRef.current;
+    dbService.fetchWorkspaceMappings(selectedItemId).then((rows: WorkspaceMappingRow[]) => {
+      if (gen !== localMappingsGenRef.current) return;
+      // Convert flat rows into GlobalMapping[] grouped by (featureId, newAttributeId)
+      const grouped: Record<string, GlobalMapping> = {};
+      for (const row of rows) {
+        const key = `${row.legacyFeatureId}||${row.newAttributeId}`;
+        let m = grouped[key];
+        if (!m) {
+          m = {
+            legacyFeatureIds: [row.legacyFeatureId],
+            newAttributeId: row.newAttributeId,
+            attributeType: row.attributeType || '',
+            mappedFrom: (row.mappedFrom as GlobalMapping['mappedFrom']) || 'global',
+            valueMappings: {},
+          };
+          grouped[key] = m;
+        }
+        if (row.legacyValue !== '' || row.newValue !== '') {
+          m.valueMappings[row.legacyValue] = row.newValue;
+        }
+      }
+      setDbState(prev => prev ? {
+        ...prev,
+        localMappings: { ...prev.localMappings, [selectedItemId]: Object.values(grouped) },
+      } : prev);
+    }).catch(err => {
+      console.warn('Failed to fetch workspace mappings for', selectedItemId, err);
+    });
+  }, [selectedItemId, dbState?.localMappings]);
+
   // Initial load: restore session from token if present, then fetch DB state.
   useEffect(() => {
     const token = localStorage.getItem('erp_migrator_token');
@@ -46,87 +180,71 @@ const App: React.FC = () => {
           role: remoteUser.role,
         };
         setCurrentUser(user);
+        setDbState(prev => prev || EMPTY_DB_STATE);
         handleFetchFromDB(user);
       }).catch(() => {
         // Token expired/invalid — fall through to login screen
         localStorage.removeItem('erp_migrator_token');
-        handleFetchFromDB();
+        setConnectionMode('REMOTE_SQL');
       });
     } else {
-      handleFetchFromDB();
+      // No token — just show login screen, don't try to fetch protected data
+      setConnectionMode('REMOTE_SQL');
     }
   }, []);
 
   const handleFetchFromDB = async (user?: User | null) => {
+    setIsDataLoading(true);
     try {
-      const { state, mode } = await dbService.fetchAll({ includeBom: false });
-      const activeUser = user ?? currentUser;
-      let lockedItems: DatabaseState['bom'] = [];
-      let adminFallbackItems: DatabaseState['bom'] = [];
-      if (activeUser) {
-        const lockIds = Object.values(state.locks || {})
-          .filter(lock => activeUser.role === 'admin' || lock.userId === activeUser.userId)
-          .map(lock => lock.itemId)
-          .filter(Boolean);
+      // Step 1: Lightweight init — locks, users, config only (<200ms)
+      const init = await dbService.fetchInit();
 
-        if (lockIds.length) {
-          try {
-            lockedItems = await dbService.fetchBomItemsByIds(lockIds);
-          } catch (err) {
-            console.warn('Failed to fetch locked BOM items', err);
-          }
-        } else if (activeUser.role === 'admin') {
-          try {
-            // Admin fallback: after a hard reload there may be no active locks yet.
-            // Load an initial page so BOM data remains visible and users can sign on.
-            adminFallbackItems = await dbService.fetchBomItems(undefined, undefined, { limit: 20, offset: 0 });
-          } catch (err) {
-            console.warn('Failed to fetch admin fallback BOM items', err);
-          }
-        }
-      }
+      // Step 2: Fire ALL secondary fetches in parallel
+      const [bomResult, totalCount, statuses, mappingResult, classResult, filters] = await Promise.all([
+        dbService.fetchSignedOnBomItems({ limit: 20, offset: 0 }).catch(err => { console.warn('Failed to fetch signed-on BOM items', err); return { items: [] as DatabaseState['bom'], signedOnCount: 0 }; }),
+        dbService.fetchBomCount().catch(err => { console.warn('Failed to fetch BOM count', err); return 0; }),
+        dbService.fetchItemStatuses().catch(err => { console.warn('Failed to fetch item statuses', err); return {} as Record<string, 'mapped' | 'unmapped' | 'notRequired'>; }),
+        dbService.fetchGlobalMappingsPaginated({ limit: 20, offset: 0 }).catch(err => { console.warn('Failed to fetch mappings', err); return { items: [] as GlobalMapping[], total: 0 }; }),
+        dbService.fetchClassificationsPaginated({ limit: 20, offset: 0 }).catch(err => { console.warn('Failed to fetch classifications', err); return { items: [] as any[], total: 0 }; }),
+        dbService.fetchBomFilters().catch(err => { console.warn('Failed to fetch BOM filters', err); return { categories: [] as string[], productTypes: [] as string[] }; }),
+      ]);
 
-      // Fetch total BOM count for admin pagination
-      let totalCount = 0;
-      try {
-        totalCount = await dbService.fetchBomCount();
-      } catch (err) {
-        console.warn('Failed to fetch BOM count', err);
-      }
-
-      setDbState(prev => ({
-        ...state,
-        bom: lockedItems.length ? lockedItems : (adminFallbackItems.length ? adminFallbackItems : (prev?.bom || [])),
-      }));
+      setDbState({
+        bom: bomResult.items,
+        mappings: 'items' in mappingResult ? mappingResult.items : [],
+        classifications: 'items' in classResult ? classResult.items : [],
+        mappingTypeConfig: init.mappingTypeConfig,
+        localMappings: {},
+        classAttributeValues: {},
+        itemClassifications: init.itemClassifications || {},
+        locks: init.locks || {},
+        users: init.users || [],
+      });
       setBomTotalCount(totalCount);
-      try {
-        const statuses = await dbService.fetchItemStatuses();
-        setItemStatuses(statuses);
-      } catch (err) {
-        console.warn('Failed to fetch item statuses', err);
-      }
-      setConnectionMode(mode);
-      try {
-        const filters = await dbService.fetchBomFilters();
-        setBomFilters(filters);
-      } catch (err) {
-        console.warn('Failed to fetch BOM filters', err);
-      }
+      setItemStatuses(statuses);
+      setMappingTotalCount('total' in mappingResult ? mappingResult.total : 0);
+      setClassificationTotalCount('total' in classResult ? classResult.total : 0);
+      setConnectionMode('REMOTE_SQL');
+      setBomFilters(filters);
     } catch (error: any) {
       console.error("Database sync failed", error);
       alert(`Failed to connect to database: ${error?.message || 'Unknown error'}. Please ensure the backend server is running on port 8000.`);
       setConnectionMode('LOCAL_MOCK');
       setDbState(null);
+    } finally {
+      setIsDataLoading(false);
     }
   };
+  fetchFromDBRef.current = () => handleFetchFromDB();
 
   const handleLogin = (user: User) => {
     setCurrentUser(user);
+    setDbState(prev => prev || EMPTY_DB_STATE);
     handleFetchFromDB(user);
   };
 
   const handleLogout = () => {
-    setCurrentUser(null);
+      dbService.logout();
     setSelectedItemId(null);
     setMappingGenerationProgress(null);
   };
@@ -137,6 +255,10 @@ const App: React.FC = () => {
     let timer: ReturnType<typeof setTimeout> | null = null;
 
     const pollProgress = async () => {
+      if (document.hidden) {
+        timer = setTimeout(pollProgress, 30000);
+        return;
+      }
       try {
         const progress = await dbService.fetchMappingGenerationProgress();
         if (!cancelled) {
@@ -154,49 +276,22 @@ const App: React.FC = () => {
       }
     };
 
+    const handleVisibilityChange = () => {
+      if (!document.hidden && !cancelled) {
+        if (timer) clearTimeout(timer);
+        pollProgress();
+      }
+    };
+
+    document.addEventListener('visibilitychange', handleVisibilityChange);
     pollProgress();
 
     return () => {
       cancelled = true;
       if (timer) clearTimeout(timer);
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
     };
   }, [currentUser]);
-
-  const handleSignOn = async (itemId: string) => {
-    if (!currentUser) return;
-    const existingLocks = Object.values(dbState?.locks || {}).filter(lock => lock.userId === currentUser.userId);
-    if (existingLocks.length >= 2 && !existingLocks.some(lock => lock.itemId === itemId)) {
-      alert('You can only sign on to two items at a time. Please sign off another item first.');
-      return;
-    }
-    setIsRefreshing(true);
-    const result = await dbService.acquireLock(itemId, currentUser.userId, currentUser.userName);
-    if (!result.acquired) {
-      if (result.reason === 'limit') {
-        alert('You can only sign on to two items at a time. Please sign off another item first.');
-      } else if (result.reason === 'locked') {
-        alert('This item is currently locked by another session.');
-      } else {
-        alert('Failed to sign on. Please try again.');
-      }
-    }
-    await handleFetchFromDB();
-    setIsRefreshing(false);
-  };
-
-  const handleSignOff = async (itemId: string) => {
-    if (!currentUser) return;
-    setIsRefreshing(true);
-    
-    if (currentUser.role === 'admin') {
-      await dbService.forceReleaseLock(itemId);
-    } else {
-      await dbService.releaseLock(itemId, currentUser.userId);
-    }
-    
-    await handleFetchFromDB();
-    setIsRefreshing(false);
-  };
 
   const handleSaveWorkspaceChanges = async (updates: {
     localMappings?: LocalItemMappings;
@@ -294,103 +389,38 @@ const App: React.FC = () => {
     }
   };
 
-  const handleFetchBomItems = async (category?: string, productType?: string) => {
-    if (!dbState) return [];
-    setIsRefreshing(true);
-    try {
-      const pageSize = 500;
-      let offset = 0;
-      let items: DatabaseState['bom'] = [];
-
-      while (true) {
-        const batch = await dbService.fetchBomItems(category, productType, { limit: pageSize, offset });
-        items = items.concat(batch);
-        if (batch.length < pageSize) break;
-        offset += pageSize;
-      }
-
-      setDbState(prev => {
-        if (!prev) return prev;
-        const lockedIds = new Set(
-          Object.values(prev.locks || {})
-            .filter(lock => !currentUser || currentUser.role === 'admin' || lock.userId === currentUser.userId)
-            .map(lock => lock.itemId)
-        );
-
-        const lockedItems = prev.bom.filter(item => lockedIds.has(item.itemId));
-        const nextById: Record<string, DatabaseState['bom'][number]> = {};
-        lockedItems.forEach(item => {
-          nextById[item.itemId] = item;
-        });
-        items.forEach(item => {
-          nextById[item.itemId] = item;
-        });
-
-        return { ...prev, bom: Object.values(nextById) };
-      });
-      return items;
-    } finally {
-      setIsRefreshing(false);
-    }
-  };
-
-  const handleBomPageChange = async (page: number) => {
-    if (!dbState || !currentUser) return;
-    setIsRefreshing(true);
-    setBomPage(page);
-    try {
-      const items = await dbService.fetchBomItems(undefined, undefined, { limit: BOM_PAGE_SIZE, offset: page * BOM_PAGE_SIZE });
-      setDbState(prev => {
-        if (!prev) return prev;
-        // Keep locked items always visible; replace the non-locked page slice
-        const lockedIds = new Set(
-          Object.values(prev.locks || {})
-            .filter(lock => currentUser.role === 'admin' || lock.userId === currentUser.userId)
-            .map(lock => lock.itemId)
-        );
-        const lockedItems = prev.bom.filter(item => lockedIds.has(item.itemId));
-        const nextById: Record<string, DatabaseState['bom'][number]> = {};
-        lockedItems.forEach(item => { nextById[item.itemId] = item; });
-        items.forEach(item => { nextById[item.itemId] = item; });
-        return { ...prev, bom: Object.values(nextById) };
-      });
-    } catch (err) {
-      console.warn('Failed to fetch BOM page', err);
-    } finally {
-      setIsRefreshing(false);
-    }
-  };
-
-  const visibleBomItems = useMemo(() => {
-    if (!dbState || !currentUser) return [] as DatabaseState['bom'];
-    if (currentUser.role === 'admin') {
-      return dbState.bom || [];
-    }
-    const lockedIds = new Set(
-      Object.values(dbState.locks || {})
-        .filter(lock => lock.userId === currentUser.userId)
-        .map(lock => lock.itemId)
-    );
-    return (dbState.bom || []).filter(item => lockedIds.has(item.itemId));
-  }, [dbState, currentUser]);
-
-  const includedMappingTypes = useMemo(() => {
-    const available = (dbState?.mappingTypeConfig?.availableTypes || []).map(normalizeMappingType).filter(Boolean);
-    const included = (dbState?.mappingTypeConfig?.includedTypes || []).map(normalizeMappingType).filter(Boolean);
-    if (!available.length) {
-      return null;
-    }
-    const includeSet = new Set(included.length ? included : available);
-    return includeSet;
-  }, [dbState]);
-
   const isMappingGenerationActive =
     mappingGenerationProgress?.status === 'queued' || mappingGenerationProgress?.status === 'running';
 
-  const sidebarItems = useMemo(() => {
-    if (!showUnmappedOnlyInSidebar) return visibleBomItems;
-    return visibleBomItems.filter(item => itemStatuses[item.itemId] === 'unmapped');
-  }, [visibleBomItems, showUnmappedOnlyInSidebar, itemStatuses]);
+  const handleRetriggerGeneration = async () => {
+    try {
+      const result = await dbService.triggerMappingGeneration();
+      if (result.mappingGenerationJobId) {
+        setMappingGenerationProgress(prev => ({
+          id: result.mappingGenerationJobId,
+          status: 'queued',
+          isActive: true,
+          progress: 0,
+          totalFeatures: prev?.totalFeatures || 0,
+          processedFeatures: 0,
+          totalValues: prev?.totalValues || 0,
+          processedValues: 0,
+          generatedRows: 0,
+          triggeredByUserId: currentUser?.userId || null,
+          triggeredByUsername: currentUser?.userName || null,
+          startedAt: null,
+          finishedAt: null,
+          updatedAt: Date.now(),
+          error: null,
+        }));
+      }
+    } catch (err: any) {
+      alert(`Failed to trigger generation: ${err?.message || String(err)}`);
+    }
+  };
+
+  // Wire useLocking hook
+  const { handleSignOn, handleSignOff } = useLocking(dbState, currentUser, setIsRefreshing, handleFetchFromDB);
 
   useEffect(() => {
     if (selectedItemId && !sidebarItems.some(item => item.itemId === selectedItemId)) {
@@ -450,6 +480,8 @@ const App: React.FC = () => {
           setShowDashboard(true);
         }}
         mappingGenerationProgress={mappingGenerationProgress}
+        onRetriggerGeneration={handleRetriggerGeneration}
+        isMappingGenerationActive={isMappingGenerationActive}
       />
       
       <main className="flex flex-1 overflow-hidden relative">
@@ -478,63 +510,92 @@ const App: React.FC = () => {
           totalServerCount={currentUser.role === 'admin' ? bomTotalCount : undefined}
           currentPage={currentUser.role === 'admin' ? bomPage : undefined}
           onPageChange={currentUser.role === 'admin' ? handleBomPageChange : undefined}
+          onSearch={handleSidebarSearch}
+          searchResults={sidebarSearchResults}
+          searchTotalCount={sidebarSearchTotal}
+          isLoading={isDataLoading}
+          isAdmin={currentUser.role === 'admin'}
+          categories={bomFilters.categories}
+          productTypes={bomFilters.productTypes}
+          allUsers={dbState.users?.map(u => ({ userId: u.userId, userName: u.userName })) || []}
+          onFilterChange={currentUser.role === 'admin' ? handleAdminFilterChange : undefined}
         />
         
-        <MappingWorkspace 
-          item={selectedItem}
-          classes={dbState.classifications}
-          globalMappings={dbState.mappings}
-          mappingTypeConfig={dbState.mappingTypeConfig}
-          localItemMappings={dbState.localMappings}
-          classAttributeValues={dbState.classAttributeValues || {}}
-          assignedClassId={selectedItemId ? dbState.itemClassifications[selectedItemId] : null}
-          isLockedByMe={isLockedByMe}
-          lockOwner={currentLock}
-          currentUser={currentUser}
-          featureFlags={featureFlags}
-          onToggleNewClassTargetMapping={handleToggleNewClassTargetMapping}
-          onSignOn={async () => selectedItemId && (await handleSignOn(selectedItemId))}
-          onSignOff={async () => selectedItemId && (await handleSignOff(selectedItemId))}
-          onSaveChanges={handleSaveWorkspaceChanges}
-          onSyncFromDB={handleFetchFromDB}
-          isGenerationActive={isMappingGenerationActive}
-        />
+        <Suspense fallback={<LazyFallback />}>
+          {isDataLoading && !selectedItem ? (
+            <div className="flex-1 flex items-center justify-center">
+              <SectionSpinner label="Loading workspace..." />
+            </div>
+          ) : (
+          <MappingWorkspace 
+            item={selectedItem}
+            classes={dbState.classifications}
+            globalMappings={dbState.mappings}
+            mappingTypeConfig={dbState.mappingTypeConfig}
+            localItemMappings={dbState.localMappings}
+            classAttributeValues={dbState.classAttributeValues || {}}
+            assignedClassId={selectedItemId ? dbState.itemClassifications[selectedItemId] : null}
+            isLockedByMe={isLockedByMe}
+            lockOwner={currentLock}
+            currentUser={currentUser}
+            featureFlags={featureFlags}
+            onToggleNewClassTargetMapping={handleToggleNewClassTargetMapping}
+            onSignOn={async () => selectedItemId && (await handleSignOn(selectedItemId))}
+            onSignOff={async () => selectedItemId && (await handleSignOff(selectedItemId))}
+            onSaveChanges={handleSaveWorkspaceChanges}
+            onSyncFromDB={handleFetchFromDB}
+            isGenerationActive={isMappingGenerationActive}
+          />
+          )}
+        </Suspense>
 
         {activeInspector && (
-          <DataInspector 
-            category={activeInspector}
-            onClose={() => setActiveInspector(null)}
-            data={{
-              mapping: dbState.mappings,
-              classification: dbState.classifications,
-              values: dbState.classifications,
-              bom: dbState.bom,
-              users: dbState.users
-            }}
-            mappingTypeConfig={dbState.mappingTypeConfig}
-            onSave={handleSaveInspectorData}
-            onSwitchUser={(user) => {
-               setCurrentUser(user);
-               setActiveInspector(null);
-            }}
-            currentUser={currentUser!}
-            bomFilters={bomFilters}
-            onFetchBomItems={handleFetchBomItems}
-            locks={dbState.locks}
-            onSignOnItem={handleSignOn}
-            mappingGenerationProgress={mappingGenerationProgress}
-          />
+          <Suspense fallback={<LazyFallback />}>
+            <DataInspector 
+              category={activeInspector}
+              onClose={() => setActiveInspector(null)}
+              data={{
+                mapping: dbState.mappings,
+                classification: dbState.classifications,
+                values: dbState.classifications,
+                bom: dbState.bom,
+                users: dbState.users
+              }}
+              mappingTypeConfig={dbState.mappingTypeConfig}
+              onSave={handleSaveInspectorData}
+              onSwitchUser={(user) => {
+                 setCurrentUser(user);
+                 setActiveInspector(null);
+              }}
+              currentUser={currentUser!}
+              bomFilters={bomFilters}
+              onFetchBomItems={handleFetchBomItems}
+              locks={dbState.locks}
+              onSignOnItem={handleSignOn}
+              mappingGenerationProgress={mappingGenerationProgress}
+              mappingTotalCount={mappingTotalCount}
+              classificationTotalCount={classificationTotalCount}
+              bomTotalCount={bomTotalCount}
+              onCountsChanged={(counts) => {
+                if (counts.mappingTotal != null) setMappingTotalCount(counts.mappingTotal);
+                if (counts.classificationTotal != null) setClassificationTotalCount(counts.classificationTotal);
+                if (counts.bomTotal != null) setBomTotalCount(counts.bomTotal);
+              }}
+            />
+          </Suspense>
         )}
 
-        {showDashboard && (
-          <MappingDashboard
-            categories={bomFilters.categories || []}
-            productLines={bomFilters.productTypes || []}
-            onClose={() => {
-              setShowDashboard(false);
-            }}
-          />
-        )}
+        <div className={showDashboard ? '' : 'hidden'}>
+          <Suspense fallback={<LazyFallback />}>
+            <MappingDashboard
+              categories={bomFilters.categories || []}
+              productLines={bomFilters.productTypes || []}
+              onClose={() => {
+                setShowDashboard(false);
+              }}
+            />
+          </Suspense>
+        </div>
       </main>
 
       <footer className="bg-white border-t border-slate-200 px-5 py-2 flex items-center justify-between shrink-0">

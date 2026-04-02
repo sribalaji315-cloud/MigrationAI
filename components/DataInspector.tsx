@@ -1,7 +1,8 @@
 
 import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
-import { DataCategory, GlobalMapping, NewClassification, NewAttribute, LegacyItem, LegacyFeature, User, ItemLock, MappingTypeConfig, MappingGenerationProgress } from '../types';
+import { DataCategory, GlobalMapping, NewClassification, NewAttribute, LegacyItem, LegacyFeature, User, ItemLock, MappingTypeConfig, MappingGenerationProgress, ValueListGroup, ValueListRow } from '../types';
 import { dbService } from '../services/dbService';
+import { buildCsv, splitCsvLine, parseCsv } from '../utils/csvHelpers';
 
 interface DataInspectorProps {
   category: DataCategory;
@@ -26,6 +27,10 @@ interface DataInspectorProps {
   locks?: Record<string, ItemLock>;
   onSignOnItem?: (itemId: string) => Promise<void>;
   mappingGenerationProgress?: MappingGenerationProgress | null;
+  mappingTotalCount?: number;
+  classificationTotalCount?: number;
+  bomTotalCount?: number;
+  onCountsChanged?: (counts: { mappingTotal?: number; classificationTotal?: number; bomTotal?: number }) => void;
 }
 
 interface LegacyValueSelectorProps {
@@ -122,7 +127,7 @@ const LegacyValueSelector: React.FC<LegacyValueSelectorProps> = ({ value, option
   );
 };
 
-const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, mappingTypeConfig, onSave, onSwitchUser, currentUser, bomFilters, onFetchBomItems, locks, onSignOnItem, mappingGenerationProgress }) => {
+const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, mappingTypeConfig, onSave, onSwitchUser, currentUser, bomFilters, onFetchBomItems, locks, onSignOnItem, mappingGenerationProgress, mappingTotalCount, classificationTotalCount, bomTotalCount, onCountsChanged }) => {
   const normalizeKey = (value?: string | null) => (value || '').trim().toLowerCase();
   const normalizeAttributeType = (value?: string | null): string => (value || '').trim().toLowerCase();
   const [localMapping, setLocalMapping] = useState<GlobalMapping[]>([]);
@@ -160,6 +165,167 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
   const autoSaveTimerRef = useRef<number | null>(null);
   const hydrationCategoryRef = useRef<DataCategory | null>(null);
   const mappingProgressPct = Math.round((mappingGenerationProgress?.progress || 0) * 100);
+
+  // ---- Classification filter state (all distinct classes + attributes) ----
+  const [allClassOptions, setAllClassOptions] = useState<{ classId: string; className: string }[]>([]);
+  const [allAttributeOptions, setAllAttributeOptions] = useState<string[]>([]);
+
+  // ---- Server-side pagination state ----
+  const PAGE_SIZE = 20;
+  const [serverMappings, setServerMappings] = useState<GlobalMapping[]>([]);
+  const [serverMappingTotal, setServerMappingTotal] = useState(mappingTotalCount ?? 0);
+  const [serverClassifications, setServerClassifications] = useState<NewClassification[]>([]);
+  const [serverClassificationTotal, setServerClassificationTotal] = useState(classificationTotalCount ?? 0);
+  const [serverBom, setServerBom] = useState<LegacyItem[]>([]);
+  const [serverBomTotal, setServerBomTotal] = useState(bomTotalCount ?? 0);
+  const [isServerLoading, setIsServerLoading] = useState(false);
+  const searchTimerRef = useRef<number | null>(null);
+
+  // ---- Value List state (for category === 'values') ----
+  const [serverValueLists, setServerValueLists] = useState<ValueListGroup[]>([]);
+  const [serverValueListTotal, setServerValueListTotal] = useState(0);
+  const [selectedValueListId, setSelectedValueListId] = useState<string | null>(null);
+  const [valueListDetail, setValueListDetail] = useState<ValueListRow[]>([]);
+  const [isValueListDetailLoading, setIsValueListDetailLoading] = useState(false);
+  const [allValueListOptions, setAllValueListOptions] = useState<{ valuelistId: string; valuelistIdDescription: string }[]>([]);
+  const [allValueOptions, setAllValueOptions] = useState<string[]>([]);
+  const [valueListSearch, setValueListSearch] = useState('');
+  const [valueSearch, setValueSearch] = useState('');
+
+  // Keep totals in sync with parent
+  useEffect(() => { if (mappingTotalCount != null) setServerMappingTotal(mappingTotalCount); }, [mappingTotalCount]);
+  useEffect(() => { if (classificationTotalCount != null) setServerClassificationTotal(classificationTotalCount); }, [classificationTotalCount]);
+  useEffect(() => { if (bomTotalCount != null) setServerBomTotal(bomTotalCount); }, [bomTotalCount]);
+
+  // Request generation counter to discard stale responses from concurrent fetches
+  const fetchGenRef = useRef(0);
+
+  // Fetch page data from server for current tab
+  const fetchServerPage = useCallback(async (
+    cat: DataCategory,
+    pg: number,
+    opts?: { mappingSearch?: string; classSearch?: string; bomSearch?: string; bomCategory?: string; bomProductType?: string; valueListSearch?: string }
+  ) => {
+    const gen = ++fetchGenRef.current;
+    setIsServerLoading(true);
+    try {
+      if (cat === 'mapping') {
+        const result = await dbService.fetchGlobalMappingsPaginated({
+          limit: PAGE_SIZE,
+          offset: pg * PAGE_SIZE,
+          search: opts?.mappingSearch || undefined,
+        });
+        if (gen !== fetchGenRef.current) return; // stale response
+        setServerMappings(result.items);
+        setServerMappingTotal(result.total);
+        onCountsChanged?.({ mappingTotal: result.total });
+      } else if (cat === 'classification') {
+        const result = await dbService.fetchClassificationsPaginated({
+          limit: PAGE_SIZE,
+          offset: pg * PAGE_SIZE,
+          search: opts?.classSearch || undefined,
+        });
+        if (gen !== fetchGenRef.current) return; // stale response
+        setServerClassifications(result.items);
+        setServerClassificationTotal(result.total);
+        onCountsChanged?.({ classificationTotal: result.total });
+      } else if (cat === 'values') {
+        const result = await dbService.fetchValueListsPaginated({
+          limit: PAGE_SIZE,
+          offset: pg * PAGE_SIZE,
+          search: opts?.valueListSearch || undefined,
+        });
+        if (gen !== fetchGenRef.current) return; // stale response
+        setServerValueLists(result.items);
+        setServerValueListTotal(result.total);
+      } else if (cat === 'bom') {
+        const [items, count] = await Promise.all([
+          dbService.fetchBomItems(
+            opts?.bomCategory || undefined,
+            opts?.bomProductType || undefined,
+            { limit: PAGE_SIZE, offset: pg * PAGE_SIZE, search: opts?.bomSearch || undefined }
+          ),
+          dbService.fetchBomCount(
+            opts?.bomCategory || undefined,
+            opts?.bomProductType || undefined,
+            opts?.bomSearch || undefined
+          ),
+        ]);
+        if (gen !== fetchGenRef.current) return; // stale response
+        setServerBom(items);
+        setServerBomTotal(count);
+        // Only propagate total to parent when no BOM filters are active,
+        // otherwise the filtered count would corrupt the sidebar pagination.
+        const hasFilters = !!(opts?.bomCategory || opts?.bomProductType || opts?.bomSearch);
+        if (!hasFilters) {
+          onCountsChanged?.({ bomTotal: count });
+        }
+      }
+    } catch (err) {
+      if (gen !== fetchGenRef.current) return; // stale — suppress
+      console.warn('Failed to fetch server page', err);
+    } finally {
+      if (gen === fetchGenRef.current) {
+        setIsServerLoading(false);
+      }
+    }
+  }, [onCountsChanged]);
+
+  // Initial fetch when tab opens
+  useEffect(() => {
+    if (category === 'mapping' || category === 'classification' || category === 'values' || category === 'bom') {
+      fetchServerPage(category, 0);
+    }
+  }, [category]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Fetch classification filter options (all distinct classes & attributes) with cross-filtering
+  const refreshClassificationFilters = useCallback(async (opts?: { classId?: string; attributeId?: string }) => {
+    try {
+      const filters = await dbService.fetchClassificationFilters(opts);
+      setAllClassOptions(filters.classes || []);
+      setAllAttributeOptions(filters.attributes || []);
+    } catch (err) {
+      console.warn('Failed to fetch classification filters', err);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (category === 'classification') {
+      refreshClassificationFilters();
+    }
+  }, [category]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Fetch value list filter options with cross-filtering
+  const refreshValueListFilters = useCallback(async (opts?: { valuelistId?: string; value?: string }) => {
+    try {
+      const filters = await dbService.fetchValueListFilters(opts);
+      setAllValueListOptions(filters.valuelists || []);
+      setAllValueOptions(filters.values || []);
+    } catch (err) {
+      console.warn('Failed to fetch value list filters', err);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (category === 'values') {
+      refreshValueListFilters();
+    }
+  }, [category]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Fetch value list detail when a row is selected
+  useEffect(() => {
+    if (category !== 'values' || !selectedValueListId) {
+      setValueListDetail([]);
+      return;
+    }
+    let cancelled = false;
+    setIsValueListDetailLoading(true);
+    dbService.fetchValueListDetail(selectedValueListId)
+      .then(rows => { if (!cancelled) setValueListDetail(rows); })
+      .catch(() => { if (!cancelled) setValueListDetail([]); })
+      .finally(() => { if (!cancelled) setIsValueListDetailLoading(false); });
+    return () => { cancelled = true; };
+  }, [category, selectedValueListId]);
 
   const cloneData = <T,>(value: T): T => {
     if (typeof structuredClone === 'function') {
@@ -279,6 +445,7 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
     mappingData?: GlobalMapping[];
     mappingTypeData?: MappingTypeConfig;
     bomData?: LegacyItem[];
+    classificationData?: NewClassification[];
   }) => {
     const source = opts?.source || 'manual';
     const closeInspector = opts?.closeInspector ?? source === 'manual';
@@ -304,8 +471,8 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
           source,
         });
       }
-      if (category === 'classification' || category === 'values') {
-        await onSave('classification', localClassification, { closeInspector, source });
+      if (category === 'classification') {
+        await onSave('classification', opts?.classificationData || localClassification, { closeInspector, source });
       }
       if (category === 'bom') {
         await onSave('bom', opts?.bomData || localBom, { closeInspector, source });
@@ -370,6 +537,9 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
       if (autoSaveTimerRef.current) {
         window.clearTimeout(autoSaveTimerRef.current);
       }
+      if (searchTimerRef.current) {
+        window.clearTimeout(searchTimerRef.current);
+      }
     };
   }, []);
 
@@ -407,31 +577,36 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
     setLocalMapping(nextMapping);
     setAvailableAttributeTypes(availableTypes);
     setIncludedAttributeTypes(includedTypes);
-    setNewAttributeType('');
-    setExportTypeFilter('__all__');
     if (needsMapping && currentUser.role === 'admin') {
       setHasCsvUploaded(true);
     }
     setLocalClassification(needsClassification ? cloneData(data.classification) : []);
     setLocalBom(nextBom);
     setLocalUsers(needsUsers ? cloneData(data.users || []) : []);
-    setBomCategory('');
-    setBomProductType('');
-    setIsBomSyncing(false);
     setAvailableCategories(bomFilters?.categories || []);
     setAvailableProductTypes(bomFilters?.productTypes || []);
-    setPage(0);
-    setMappingSearch('');
-    setBomSearch('');
-    setSelectedBomItemId(null);
-    setLegacyValueFilter('');
-    setFeatureFilter('');
-    setClassSearch('');
-    setSelectedClassId(null);
-    setAttributeSearch('');
-    setSelectedAttributeId(null);
-    setRemoteAttribute(null);
-    setIsAttributeLoading(false);
+
+    // Only reset search/filter UI state when the user switches to a different category tab.
+    // When data is re-hydrated (e.g. after auto-save), preserve the user's active filters.
+    if (categoryChanged) {
+      setNewAttributeType('');
+      setExportTypeFilter('__all__');
+      setBomCategory('');
+      setBomProductType('');
+      setIsBomSyncing(false);
+      setPage(0);
+      setMappingSearch('');
+      setBomSearch('');
+      setSelectedBomItemId(null);
+      setLegacyValueFilter('');
+      setFeatureFilter('');
+      setClassSearch('');
+      setSelectedClassId(null);
+      setAttributeSearch('');
+      setSelectedAttributeId(null);
+      setRemoteAttribute(null);
+      setIsAttributeLoading(false);
+    }
     hydrationCategoryRef.current = category;
   }, [data, category, bomFilters, mappingTypeConfig, currentUser.role, suspendHydration, isAutoSaving]);
 
@@ -463,10 +638,12 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
     users: 'User Identity Registry'
   };
 
-  const PAGE_SIZE_MAPPING = 100;
-  const PAGE_SIZE_BOM = 20;
+  const PAGE_SIZE_MAPPING = PAGE_SIZE;
+  const PAGE_SIZE_BOM = PAGE_SIZE;
 
   const filteredClasses = useMemo(() => {
+    // Use server-side data for display when available
+    if (serverClassifications.length || classSearch) return serverClassifications;
     const q = classSearch.trim().toLowerCase();
     if (!q) return localClassification;
     return localClassification.filter(cls => {
@@ -474,10 +651,11 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
       const name = (cls.className || '').toLowerCase();
       return id.includes(q) || name.includes(q);
     });
-  }, [localClassification, classSearch]);
+  }, [localClassification, classSearch, serverClassifications]);
 
   const visibleClasses = useMemo(() => {
-    return filteredClasses.slice(0, 5);
+    // Server-side pagination already limits results
+    return filteredClasses;
   }, [filteredClasses]);
 
   const activeClass = useMemo(() => {
@@ -494,8 +672,10 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
   }, [filteredClasses, selectedClassId]);
 
   const classDropdownOptions = useMemo(() => {
-    return filteredClasses.map(cls => cls.className || cls.classId).slice(0, 5);
-  }, [filteredClasses]);
+    // Use server-provided filter list (all distinct classes, cross-filtered by attribute selection)
+    if (allClassOptions.length) return allClassOptions.map(c => c.className || c.classId);
+    return filteredClasses.map(cls => cls.className || cls.classId);
+  }, [allClassOptions, filteredClasses]);
 
   const allAttributesForActiveClass = activeClass?.attributes || [];
 
@@ -527,6 +707,8 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
   }, [allAttributesForActiveClass, attributeSearch, selectedAttributeId]);
 
   const attributeDropdownOptions = useMemo(() => {
+    // Use server-provided filter list (all distinct attributes, cross-filtered by class selection)
+    if (allAttributeOptions.length) return allAttributeOptions;
     const seen = new Set<string>();
     const opts: string[] = [];
     allAttributesForActiveClass.forEach(attr => {
@@ -537,7 +719,7 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
       }
     });
     return opts;
-  }, [allAttributesForActiveClass]);
+  }, [allAttributeOptions, allAttributesForActiveClass]);
 
   const selectedAttributeForDetail = useMemo(() => {
     const selectedKey = normalizeKey(selectedAttributeId);
@@ -731,6 +913,8 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
   }, [localClassification]);
 
   const filteredMapping = useMemo(() => {
+    // Use server-fetched data for display when available
+    if (serverMappings.length || mappingSearch) return serverMappings;
     const q = mappingSearch.trim().toLowerCase();
     if (!q) return localMapping;
     return localMapping.filter(m => {
@@ -740,11 +924,12 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
       const attrType = normalizeAttributeType((m as any).attributeType);
       return legacy.includes(q) || target.includes(q) || desc.includes(q) || attrType.includes(q);
     });
-  }, [localMapping, mappingSearch, attributeDescriptions]);
+  }, [localMapping, mappingSearch, attributeDescriptions, serverMappings]);
 
   const pagedMapping = useMemo(() => {
-    return filteredMapping.slice(page * PAGE_SIZE_MAPPING, (page + 1) * PAGE_SIZE_MAPPING);
-  }, [filteredMapping, page]);
+    // Server already returns only the current page
+    return filteredMapping;
+  }, [filteredMapping]);
 
   const [selectedMappingIndex, setSelectedMappingIndex] = useState<number | null>(null);
 
@@ -781,6 +966,8 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
   }, [selectedMapping, localBom]);
 
   const filteredBom = useMemo(() => {
+    // Use server-fetched data for display when available
+    if (serverBom.length || bomSearch) return serverBom;
     const q = bomSearch.trim().toLowerCase();
     if (!q) return localBom;
     return localBom.filter(item => {
@@ -788,11 +975,12 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
       const desc = (item.description || '').toLowerCase();
       return id.includes(q) || desc.includes(q);
     });
-  }, [localBom, bomSearch]);
+  }, [localBom, bomSearch, serverBom]);
 
   const pagedBom = useMemo(() => {
-    return filteredBom.slice(page * PAGE_SIZE_BOM, (page + 1) * PAGE_SIZE_BOM);
-  }, [filteredBom, page]);
+    // Server already returns only the current page
+    return filteredBom;
+  }, [filteredBom]);
 
   const selectedBomItem = useMemo(() => {
     if (!selectedBomItemId) return null;
@@ -804,63 +992,7 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
     return selectedBomItem.features.map(f => f.featureId).filter(Boolean).sort((a, b) => a.localeCompare(b));
   }, [selectedBomItem]);
 
-  // --- Lightweight CSV helpers (template + parsing) ---
-
-  const buildCsv = (rows: string[][]): string => {
-    return rows.map(r => r.map(cell => cell.replace(/"/g, '""')).join(',')).join('\n');
-  };
-
-  // Robust CSV line splitter that handles quoted fields with commas
-  const splitCsvLine = (line: string): string[] => {
-    // Fast path: no quotes in this line — plain split is ~10x faster
-    if (line.indexOf('"') === -1) return line.split(',');
-    const result: string[] = [];
-    let current = '';
-    let inQuotes = false;
-
-    for (let i = 0; i < line.length; i++) {
-      const ch = line[i];
-
-      if (ch === '"') {
-        // Handle escaped quote inside a quoted field
-        if (inQuotes && line[i + 1] === '"') {
-          current += '"';
-          i++; // skip next quote
-        } else {
-          inQuotes = !inQuotes;
-        }
-      } else if (ch === ',' && !inQuotes) {
-        result.push(current);
-        current = '';
-      } else {
-        current += ch;
-      }
-    }
-
-    result.push(current);
-    return result;
-  };
-
-  const parseCsv = (text: string): { [key: string]: string }[] => {
-    const rawLines = text.split(/\r?\n/).filter(l => l.trim().length > 0);
-    if (!rawLines.length) return [];
-
-    const headers = splitCsvLine(rawLines[0]).map(h => h.trim());
-    const rows: { [key: string]: string }[] = [];
-
-    for (let i = 1; i < rawLines.length; i++) {
-      const cols = splitCsvLine(rawLines[i]);
-      if (!cols.some(c => c.trim().length > 0)) continue;
-
-      const row: { [key: string]: string } = {};
-      headers.forEach((h, idx) => {
-        row[h] = (cols[idx] ?? '').trim();
-      });
-      rows.push(row);
-    }
-
-    return rows;
-  };
+  // --- CSV helpers imported from utils/csvHelpers ---
 
   const isTypeIncludedInExport = (value?: string | null) => {
     if (exportTypeFilter === '__all__') return true;
@@ -900,8 +1032,12 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
 
   const handleDownloadTemplate = () => {
     if (category === 'users') return;
-    if ((category === 'classification' || category === 'values') && currentUser.role !== 'admin') {
+    if (category === 'classification' && currentUser.role !== 'admin') {
       alert('Only administrators may download classification templates when using a shared SQL backend.');
+      return;
+    }
+    if (category === 'values' && currentUser.role !== 'admin') {
+      alert('Only administrators may download value list templates when using a shared SQL backend.');
       return;
     }
 
@@ -915,15 +1051,23 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
         ['FRM_MAT', 'MAT_COMP', sampleTypeA, 'RED', 'RED_MAT'],
         ['FRM_MFG', 'MAT_MFG1;MAT_MFG2', sampleTypeB, 'VIOLET', 'VIOLETNEW'],
       ];
-    } else if (category === 'classification' || category === 'values') {
+    } else if (category === 'classification') {
       rows = [
         ['classId', 'className', 'attributeId', 'attributeDescription', 'unit', 'allowedValues', 'valueDescriptions'],
         ['TABLE', 'TABLE', 'WIDTH', 'WIDTH', 'MM', '1200|600', 'Width 1200mm|Width 600mm'],
       ];
+    } else if (category === 'values') {
+      rows = [
+        ['valuelistId', 'valuelistIdDescription', 'unit', 'value', 'valueDescription'],
+        ['MATERIAL_TYPE', 'Material Composition', '', 'Wood', 'Natural timber'],
+        ['MATERIAL_TYPE', 'Material Composition', '', 'Metal', 'Aluminum alloy'],
+      ];
     } else if (category === 'bom') {
       rows = [
         ['itemId', 'description', 'category', 'productType', 'featureId', 'featureDescription', 'unit', 'values', 'valueDescriptions'],
-        ['ITEM1', 'Sample Item', 'TABLES', 'DINING', 'MMW', 'WIDTH', 'MM', '1200|600', 'Width 1200mm|Width 600mm'],
+        ['ITEM1', 'Sample Item', 'TABLES', 'DINING', 'ATHAT', 'Height Adjust Type', '', 'FH730|FHWL', 'Fixed height 730mm|Without legs'],
+        ['ITEM1', 'Sample Item', 'TABLES', 'DINING', 'MMW', 'Width', 'MM', '1200|600', ''],
+        ['ITEM1', 'Sample Item', 'TABLES', 'DINING', 'ACHPL', 'HPL Color', '', '', ''],
       ];
     }
 
@@ -1160,7 +1304,7 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
             includedTypes: includedAttributeTypes.filter(type => availableAttributeTypes.includes(type)),
           },
         });
-      } else if (category === 'classification' || category === 'values') {
+      } else if (category === 'classification') {
         // --- Optimised path: Map-based O(1) lookups + no intermediate row objects + async batching ---
         const BATCH = 2000; // yield to UI every N rows
         const yield_ = () => new Promise<void>(res => setTimeout(res, 0));
@@ -1254,20 +1398,39 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
           }
         }
 
-        setLocalClassification(Array.from(classMap.values()));
+        const importedClassifications = Array.from(classMap.values());
+        setLocalClassification(importedClassifications);
         setHasCsvUploaded(true);
+        await persistInspectorData({
+          source: 'auto',
+          closeInspector: false,
+          classificationData: importedClassifications,
+        });
+      } else if (category === 'values') {
+        // Upload CSV server-side for value list seeding
+        const blob = new Blob([text], { type: 'text/csv;charset=utf-8;' });
+        const csvFile = new File([blob], file?.name || 'valuelist.csv', { type: 'text/csv' });
+        setCsvImportProgress(50);
+        try {
+          const result = await dbService.uploadValueListCsv(csvFile);
+          setCsvImportProgress(95);
+          // Refresh the paginated view
+          setPage(0);
+          await fetchServerPage('values', 0, { valueListSearch: valueListSearch });
+          refreshValueListFilters();
+          alert(`Imported ${result.rowsInserted} value list rows successfully.`);
+        } catch (err: any) {
+          alert(`Value list CSV import failed: ${err?.message || String(err)}`);
+        }
       } else if (category === 'bom') {
         // Support both the app's BOM template and ggg.csv format:
         // - Template: itemId, description, featureId, featureDescription, values (pipe-separated)
         // - ggg.csv: itemId, itemDescription, featureId, featureDescription, featureValue (one per row)
 
-        // Require a valueDescriptions column so values and descriptions are stored separately
+        // valueDescriptions column is optional — empty descriptions are fine
         const firstRow = rows[0] || {};
         const headerKeys = Object.keys(firstRow);
         const hasValueDescCol = headerKeys.some(h => h === 'valueDescriptions' || h === 'value_description' || h === 'valueDescription');
-        if (!hasValueDescCol) {
-          throw new Error('CSV is missing a required "valueDescriptions" (or "value_description") column. Each feature value must have a corresponding description column.');
-        }
 
         const byItem: Record<string, LegacyItem> = {};
 
@@ -1303,13 +1466,16 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
 
           const featureDescription = r['featureDescription'] || featureId;
           const featureUnit = r['unit'] || '';
-          const rawValues = (r['values'] || r['featureValue'] || '')
+          // Support both pipe-separated columns (values / valueDescriptions)
+          // and singular one-per-row columns (value / valueDescription / featureValue)
+          const rawValuesStr = r['values'] || r['value'] || r['featureValue'] || '';
+          const rawValues = rawValuesStr
             .split('|')
             .map(s => s.trim())
             .filter(Boolean);
 
-          const hasDescCol = !!(r['valueDescriptions']);
-          const rawValueDescs = (r['valueDescriptions'] || '')
+          const rawDescStr = r['valueDescriptions'] || r['valueDescription'] || '';
+          const rawValueDescs = rawDescStr
             .split('|')
             .map(s => s.trim());
 
@@ -1357,25 +1523,47 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
   };
 
   const handleBomSync = async () => {
-    if (!onFetchBomItems) return;
     if (!bomCategory && !bomProductType) {
       alert('Select a category or product type before syncing BOM items.');
       return;
     }
     try {
       setIsBomSyncing(true);
-      const items = await onFetchBomItems(bomCategory || undefined, bomProductType || undefined);
-      setLocalBom(items || []);
-      if (category === 'mapping') {
-        setLocalMapping(prev => ensureMappingsCoverBom(prev, items || []));
-      }
-      setSelectedBomItemId(items?.[0]?.itemId || null);
-      setBomSearch('');
       setPage(0);
+      // Fetch first page with filters from server
+      await fetchServerPage('bom', 0, { bomCategory, bomProductType, bomSearch: '' });
+      setBomSearch('');
+      setSelectedBomItemId(null);
+      // Also fetch full set into localBom for editing/save via parent
+      if (onFetchBomItems) {
+        const items = await onFetchBomItems(bomCategory || undefined, bomProductType || undefined);
+        setLocalBom(items || []);
+        if (category === 'mapping') {
+          setLocalMapping(prev => ensureMappingsCoverBom(prev, items || []));
+        }
+      }
     } catch (err: any) {
       alert(`Failed to fetch BOM items: ${err?.message || String(err)}`);
     } finally {
       setIsBomSyncing(false);
+    }
+  };
+
+  const handleWipeBom = async () => {
+    if (currentUser.role !== 'admin') {
+      alert('Only administrators may wipe BOM data.');
+      return;
+    }
+    if (!confirm('This will permanently delete ALL BOM items and features from the database. Mappings will not be affected.\n\nAre you sure?')) return;
+    try {
+      await dbService.wipeBom();
+      setLocalBom([]);
+      setSelectedBomItemId(null);
+      setBomSearch('');
+      setPage(0);
+      alert('BOM data wiped successfully.');
+    } catch (err: any) {
+      alert(`Failed to wipe BOM data: ${err?.message || String(err)}`);
     }
   };
 
@@ -1384,8 +1572,12 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
   };
 
   const addRootRow = () => {
-    if ((category === 'classification' || category === 'values') && currentUser.role !== 'admin') {
+    if (category === 'classification' && currentUser.role !== 'admin') {
       alert('Only administrators may add new classification records when using a shared SQL backend.');
+      return;
+    }
+    if (category === 'values' && currentUser.role !== 'admin') {
+      alert('Only administrators may add new value list records when using a shared SQL backend.');
       return;
     }
 
@@ -1393,10 +1585,26 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
       const next = [...localMapping, { legacyFeatureIds: [], newAttributeId: '', attributeType: '', valueMappings: {} }];
       setLocalMapping(next);
       setSelectedMappingIndex(next.length - 1);
-    } else if (category === 'classification' || category === 'values') {
+    } else if (category === 'classification') {
       // Generate a unique ID for new classifications to avoid database conflicts
       const uniqueId = `NEW_CLASS_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
       setLocalClassification([...localClassification, { classId: uniqueId, className: 'New Classification', attributes: [] }]);
+    } else if (category === 'values') {
+      const newId = prompt('Enter a Value List ID:');
+      if (!newId || !newId.trim()) return;
+      const newDesc = prompt('Description (optional):') || '';
+      const newValue = prompt('Enter the first value:');
+      if (!newValue || !newValue.trim()) return;
+      const newValueDesc = prompt('Value description (optional):') || '';
+      // Immediately persist to server
+      dbService.saveValueListsBulk([
+        ...valueListDetail,
+        { valuelistId: newId.trim(), valuelistIdDescription: newDesc.trim(), value: newValue.trim(), valueDescription: newValueDesc.trim() }
+      ]).then(() => {
+        setPage(0);
+        fetchServerPage('values', 0, { valueListSearch });
+        refreshValueListFilters();
+      }).catch((err: any) => alert(`Failed to add: ${err?.message || String(err)}`));
     } else if (category === 'bom') {
       const next = [...localBom, { itemId: 'NEW-ITEM', description: 'New Item Description', category: '', productType: '', features: [] }];
       setLocalBom(next);
@@ -1408,14 +1616,18 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
 
   const deleteRootRow = (index: number) => {
     // disallow non-admins from deleting shared classification entries
-    if ((category === 'classification' || category === 'values') && currentUser.role !== 'admin') {
+    if (category === 'classification' && currentUser.role !== 'admin') {
       alert('Only administrators may remove shared classification records.');
+      return;
+    }
+    if (category === 'values' && currentUser.role !== 'admin') {
+      alert('Only administrators may remove shared value list records.');
       return;
     }
 
     if (confirm("Delete this permanent record?")) {
       if (category === 'mapping') setLocalMapping(localMapping.filter((_, i) => i !== index));
-      if (category === 'classification' || category === 'values') setLocalClassification(localClassification.filter((_, i) => i !== index));
+      if (category === 'classification') setLocalClassification(localClassification.filter((_, i) => i !== index));
       if (category === 'bom') setLocalBom(localBom.filter((_, i) => i !== index));
       if (category === 'users') setLocalUsers(localUsers.filter((_, i) => i !== index));
     }
@@ -1526,6 +1738,15 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
                   >
                     {isCsvImporting ? 'Importing…' : 'Upload CSV'}
                   </button>
+                  {category === 'bom' && currentUser.role === 'admin' && (
+                    <button
+                      type="button"
+                      onClick={handleWipeBom}
+                      className="px-3 py-1.5 border border-rose-200 bg-rose-50 rounded-lg text-[9px] font-black text-rose-700 hover:bg-rose-100 transition-all uppercase tracking-widest"
+                    >
+                      Wipe BOM
+                    </button>
+                  )}
                   <input
                     ref={fileInputRef}
                     type="file"
@@ -1548,7 +1769,7 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
               </div>
             )}
 
-            {(category === 'classification' || category === 'values') && (
+            {category === 'classification' && (
               <div className="flex-1 flex flex-wrap justify-end gap-3 mt-3 sm:mt-0">
                 <div className="w-48">
                   <LegacyValueSelector
@@ -1556,10 +1777,24 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
                     options={classDropdownOptions}
                     onChange={(val) => {
                       setClassSearch(val);
-                      const match = localClassification.find(c => c.className === val || c.classId === val);
-                      if (match) {
-                        setSelectedClassId(match.classId);
+                      const match = localClassification.find(c => c.className === val || c.classId === val)
+                        || allClassOptions.find(c => c.className === val || c.classId === val);
+                      const resolvedClassId = match ? ('classId' in match ? match.classId : (match as any).classId) : null;
+                      if (resolvedClassId) {
+                        setSelectedClassId(resolvedClassId);
+                        // Cross-filter: refresh attribute dropdown for this class
+                        refreshClassificationFilters({ classId: resolvedClassId });
+                      } else {
+                        setSelectedClassId(null);
+                        // No class selected — refresh without cross-filter but keep attribute selection
+                        refreshClassificationFilters(attributeSearch ? { attributeId: attributeSearch } : undefined);
                       }
+                      // Debounced server search
+                      if (searchTimerRef.current) window.clearTimeout(searchTimerRef.current);
+                      searchTimerRef.current = window.setTimeout(() => {
+                        setPage(0);
+                        fetchServerPage(category, 0, { classSearch: val });
+                      }, 400);
                     }}
                     placeholder="Search classes..."
                     maxVisibleOptions={5}
@@ -1574,9 +1809,63 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
                       const normalized = val.trim().toLowerCase();
                       const matched = attributeDropdownOptions.find(opt => opt.trim().toLowerCase() === normalized);
                       setSelectedAttributeId(matched || null);
+                      // Cross-filter: refresh class dropdown for this attribute
+                      const classFilterId = selectedClassId || undefined;
+                      if (matched) {
+                        refreshClassificationFilters({ classId: classFilterId, attributeId: matched });
+                      } else {
+                        refreshClassificationFilters(classFilterId ? { classId: classFilterId } : undefined);
+                      }
                     }}
                     placeholder="Search attributes..."
                     maxVisibleOptions={attributeDropdownOptions.length || 10}
+                  />
+                </div>
+              </div>
+            )}
+
+            {category === 'values' && (
+              <div className="flex-1 flex flex-wrap justify-end gap-3 mt-3 sm:mt-0">
+                <div className="w-48">
+                  <LegacyValueSelector
+                    value={valueListSearch}
+                    options={allValueListOptions.map(v => v.valuelistId)}
+                    onChange={(val) => {
+                      setValueListSearch(val);
+                      const matched = allValueListOptions.find(v => v.valuelistId === val);
+                      if (matched) {
+                        setSelectedValueListId(matched.valuelistId);
+                        refreshValueListFilters({ valuelistId: matched.valuelistId });
+                      } else {
+                        setSelectedValueListId(null);
+                        refreshValueListFilters(valueSearch ? { value: valueSearch } : undefined);
+                      }
+                      if (searchTimerRef.current) window.clearTimeout(searchTimerRef.current);
+                      searchTimerRef.current = window.setTimeout(() => {
+                        setPage(0);
+                        fetchServerPage('values', 0, { valueListSearch: val });
+                      }, 400);
+                    }}
+                    placeholder="Search value lists..."
+                    maxVisibleOptions={5}
+                  />
+                </div>
+                <div className="w-48">
+                  <LegacyValueSelector
+                    value={valueSearch}
+                    options={allValueOptions}
+                    onChange={(val) => {
+                      setValueSearch(val);
+                      const normalized = val.trim().toLowerCase();
+                      const matched = allValueOptions.find(opt => opt.trim().toLowerCase() === normalized);
+                      if (matched) {
+                        refreshValueListFilters({ valuelistId: selectedValueListId || undefined, value: matched });
+                      } else {
+                        refreshValueListFilters(selectedValueListId ? { valuelistId: selectedValueListId } : undefined);
+                      }
+                    }}
+                    placeholder="Search values..."
+                    maxVisibleOptions={allValueOptions.length || 10}
                   />
                 </div>
               </div>
@@ -1637,15 +1926,7 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
                 }`}>
                   {mappingGenerationProgress.status}
                 </span>
-                <span className="text-[10px] font-bold text-slate-600">
-                  {mappingProgressPct}% ({mappingGenerationProgress.processedFeatures}/{mappingGenerationProgress.totalFeatures} features)
-                </span>
-                <span className="text-[10px] font-bold text-slate-500">
-                  {mappingGenerationProgress.generatedRows} rows generated
-                </span>
-                {mappingGenerationProgress.triggeredByUsername && (
-                  <span className="text-[10px] text-slate-400">by {mappingGenerationProgress.triggeredByUsername}</span>
-                )}
+
                 {mappingGenerationProgress.error && (
                   <span className="text-[10px] font-bold text-rose-600">{mappingGenerationProgress.error}</span>
                 )}
@@ -1673,8 +1954,14 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
                       type="text"
                       value={bomSearch}
                       onChange={(e) => {
-                        setBomSearch(e.target.value);
+                        const val = e.target.value;
+                        setBomSearch(val);
                         setPage(0);
+                        // Debounced server search
+                        if (searchTimerRef.current) window.clearTimeout(searchTimerRef.current);
+                        searchTimerRef.current = window.setTimeout(() => {
+                          fetchServerPage('bom', 0, { bomSearch: val, bomCategory, bomProductType });
+                        }, 400);
                       }}
                       placeholder="Search item or description..."
                       className="w-full pl-7 pr-2 py-1.5 text-[10px] rounded-lg border border-slate-200 bg-white text-slate-700 outline-none focus:border-blue-400 focus:ring-1 focus:ring-blue-300 placeholder:text-slate-300 font-bold"
@@ -1685,8 +1972,14 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
                       type="text"
                       value={mappingSearch}
                       onChange={(e) => {
-                        setMappingSearch(e.target.value);
+                        const val = e.target.value;
+                        setMappingSearch(val);
                         setPage(0);
+                        // Debounced server search
+                        if (searchTimerRef.current) window.clearTimeout(searchTimerRef.current);
+                        searchTimerRef.current = window.setTimeout(() => {
+                          fetchServerPage('mapping', 0, { mappingSearch: val });
+                        }, 400);
                       }}
                       placeholder="Search legacy or target attribute..."
                       className="w-full pl-7 pr-2 py-1.5 text-[10px] rounded-lg border border-slate-200 bg-white text-slate-700 outline-none focus:border-blue-400 focus:ring-1 focus:ring-blue-300 placeholder:text-slate-300 font-bold"
@@ -1743,7 +2036,15 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
             </div>
           )}
 
-          <div className="bg-white rounded-xl border border-slate-200 overflow-hidden shadow-sm">
+          <div className="bg-white rounded-xl border border-slate-200 overflow-hidden shadow-sm relative">
+            {isServerLoading && (
+              <div className="absolute inset-0 bg-white/60 z-10 flex items-center justify-center">
+                <div className="flex items-center gap-2 text-[9px] font-black text-slate-400 uppercase tracking-widest">
+                  <div className="w-4 h-4 border-2 border-blue-500 border-t-transparent rounded-full animate-spin"></div>
+                  Loading...
+                </div>
+              </div>
+            )}
             {category === 'users' ? (
                 <table className="w-full text-left">
                   <thead>
@@ -1831,7 +2132,11 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
                       </thead>
                       <tbody className="divide-y divide-slate-100">
                         {pagedMapping.map((m, idxOnPage) => {
-                          const globalIdx = localMapping.indexOf(m);
+                          // Find matching index in localMapping for editing
+                          const globalIdx = localMapping.findIndex(lm =>
+                            lm.newAttributeId === m.newAttributeId &&
+                            JSON.stringify(lm.legacyFeatureIds) === JSON.stringify(m.legacyFeatureIds)
+                          );
                           const isSelected = selectedMappingIndex === globalIdx;
                           const legacyLabel = (m.legacyFeatureIds || []).join(' | ') || '—';
                           const targetLabel = m.newAttributeId || 'UNMAPPED';
@@ -1895,7 +2200,7 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
                     </>
                   )}
 
-                  {(category === 'classification' || category === 'values') && (
+                  {category === 'classification' && (
                     <>
                       <thead>
                         <tr className="bg-slate-50 border-b border-slate-100">
@@ -1947,6 +2252,62 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
                     </>
                   )}
 
+                  {category === 'values' && (
+                    <>
+                      <thead>
+                        <tr className="bg-slate-50 border-b border-slate-100">
+                          <th className="px-6 py-4 text-[10px] font-black text-slate-400 uppercase tracking-widest w-64">Domain Registry</th>
+                          <th className="px-6 py-4 text-[10px] font-black text-slate-400 uppercase tracking-widest">Summary</th>
+                          <th className="px-6 py-4 text-[10px] font-black text-slate-400 uppercase tracking-widest w-16 text-center">X</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-slate-100">
+                        {serverValueLists.map((vl, idx) => (
+                          <tr
+                            key={vl.valuelistId || idx}
+                            className={`group hover:bg-slate-50 transition-colors cursor-pointer ${
+                              selectedValueListId === vl.valuelistId ? 'bg-blue-50/60' : ''
+                            }`}
+                            onClick={() => setSelectedValueListId(vl.valuelistId)}
+                          >
+                            <td className="px-6 py-4 align-top">
+                              <p className="text-[11px] font-black text-slate-900 truncate" title={vl.valuelistIdDescription || vl.valuelistId}>
+                                {vl.valuelistIdDescription || vl.valuelistId}
+                              </p>
+                              <p className="text-[8px] font-mono text-slate-400 mt-1 truncate" title={vl.valuelistId}>
+                                {vl.valuelistId}
+                              </p>
+                            </td>
+                            <td className="px-6 py-4 align-top">
+                              <p className="text-[10px] text-slate-600 font-medium">
+                                {vl.valueCount} value{vl.valueCount === 1 ? '' : 's'} defined
+                              </p>
+                            </td>
+                            <td className="px-6 py-4 align-top text-center">
+                              <button
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  if (!confirm(`Delete value list "${vl.valuelistId}" and all its values?`)) return;
+                                  dbService.deleteValueList(vl.valuelistId).then(() => {
+                                    if (selectedValueListId === vl.valuelistId) {
+                                      setSelectedValueListId(null);
+                                      setValueListDetail([]);
+                                    }
+                                    fetchServerPage('values', page, { valueListSearch });
+                                    refreshValueListFilters();
+                                  }).catch((err: any) => alert(`Delete failed: ${err?.message || String(err)}`));
+                                }}
+                                className="p-1.5 text-slate-300 hover:text-red-500 rounded-md transition-all"
+                              >
+                                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" /></svg>
+                              </button>
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </>
+                  )}
+
                   {category === 'bom' && (
                     <>
                       <thead>
@@ -1961,7 +2322,7 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
                       </thead>
                       <tbody className="divide-y divide-slate-100">
                         {pagedBom.map((item, visibleIdx) => {
-                          const idx = filteredBom.indexOf(item);
+                          const idx = localBom.findIndex(i => i.itemId === item.itemId);
                           const isSelected = selectedBomItemId === item.itemId;
                           const lock = locks?.[item.itemId];
                           const isLockedByMe = lock && lock.userId === currentUser.userId;
@@ -2068,31 +2429,42 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
           </div>
 
           {/* Pagination controls for large datasets */}
-          {category === 'mapping' && filteredMapping.length > PAGE_SIZE_MAPPING && (
+          {category === 'mapping' && serverMappingTotal > PAGE_SIZE_MAPPING && (
             <div className="mt-3 flex items-center justify-between text-[10px] text-slate-500">
               <span className="font-bold">
                 Records {page * PAGE_SIZE_MAPPING + 1}–
-                {Math.min((page + 1) * PAGE_SIZE_MAPPING, filteredMapping.length)} of {filteredMapping.length}
+                {Math.min((page + 1) * PAGE_SIZE_MAPPING, serverMappingTotal)} of {serverMappingTotal}
               </span>
               <div className="flex items-center gap-2">
                 <button
                   type="button"
-                  disabled={page === 0}
-                  onClick={() => setPage(p => Math.max(0, p - 1))}
+                  disabled={page === 0 || isServerLoading}
+                  onClick={() => {
+                    const prev = Math.max(0, page - 1);
+                    setPage(prev);
+                    fetchServerPage('mapping', prev, { mappingSearch });
+                  }}
                   className={`px-2 py-1 rounded border text-[9px] font-black uppercase tracking-widest ${
-                    page === 0
+                    page === 0 || isServerLoading
                       ? 'border-slate-100 text-slate-300 cursor-not-allowed'
                       : 'border-slate-200 text-slate-600 hover:bg-slate-50'
                   }`}
                 >
                   Prev
                 </button>
+                <span className="text-[9px] font-black text-slate-400 uppercase tracking-widest">
+                  {page + 1} / {Math.ceil(serverMappingTotal / PAGE_SIZE_MAPPING)}
+                </span>
                 <button
                   type="button"
-                  disabled={(page + 1) * PAGE_SIZE_MAPPING >= filteredMapping.length}
-                  onClick={() => setPage(p => ((p + 1) * PAGE_SIZE_MAPPING < filteredMapping.length ? p + 1 : p))}
+                  disabled={(page + 1) * PAGE_SIZE_MAPPING >= serverMappingTotal || isServerLoading}
+                  onClick={() => {
+                    const next = page + 1;
+                    setPage(next);
+                    fetchServerPage('mapping', next, { mappingSearch });
+                  }}
                   className={`px-2 py-1 rounded border text-[9px] font-black uppercase tracking-widest ${
-                    (page + 1) * PAGE_SIZE_MAPPING >= filteredMapping.length
+                    (page + 1) * PAGE_SIZE_MAPPING >= serverMappingTotal || isServerLoading
                       ? 'border-slate-100 text-slate-300 cursor-not-allowed'
                       : 'border-slate-200 text-slate-600 hover:bg-slate-50'
                   }`}
@@ -2102,32 +2474,48 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
               </div>
             </div>
           )}
+          {category === 'mapping' && serverMappingTotal > 0 && serverMappingTotal <= PAGE_SIZE_MAPPING && (
+            <div className="mt-3 text-[10px] text-slate-500 font-bold">
+              {serverMappingTotal} record{serverMappingTotal === 1 ? '' : 's'}
+            </div>
+          )}
 
-          {category === 'bom' && filteredBom.length > PAGE_SIZE_BOM && (
+          {category === 'bom' && serverBomTotal > PAGE_SIZE_BOM && (
             <div className="mt-3 flex items-center justify-between text-[10px] text-slate-500">
               <span className="font-bold">
                 Items {page * PAGE_SIZE_BOM + 1}–
-                {Math.min((page + 1) * PAGE_SIZE_BOM, filteredBom.length)} of {filteredBom.length}
+                {Math.min((page + 1) * PAGE_SIZE_BOM, serverBomTotal)} of {serverBomTotal}
               </span>
               <div className="flex items-center gap-2">
                 <button
                   type="button"
-                  disabled={page === 0}
-                  onClick={() => setPage(p => Math.max(0, p - 1))}
+                  disabled={page === 0 || isServerLoading}
+                  onClick={() => {
+                    const prev = Math.max(0, page - 1);
+                    setPage(prev);
+                    fetchServerPage('bom', prev, { bomSearch, bomCategory, bomProductType });
+                  }}
                   className={`px-2 py-1 rounded border text-[9px] font-black uppercase tracking-widest ${
-                    page === 0
+                    page === 0 || isServerLoading
                       ? 'border-slate-100 text-slate-300 cursor-not-allowed'
                       : 'border-slate-200 text-slate-600 hover:bg-slate-50'
                   }`}
                 >
                   Prev
                 </button>
+                <span className="text-[9px] font-black text-slate-400 uppercase tracking-widest">
+                  {page + 1} / {Math.ceil(serverBomTotal / PAGE_SIZE_BOM)}
+                </span>
                 <button
                   type="button"
-                  disabled={(page + 1) * PAGE_SIZE_BOM >= filteredBom.length}
-                  onClick={() => setPage(p => ((p + 1) * PAGE_SIZE_BOM < filteredBom.length ? p + 1 : p))}
+                  disabled={(page + 1) * PAGE_SIZE_BOM >= serverBomTotal || isServerLoading}
+                  onClick={() => {
+                    const next = page + 1;
+                    setPage(next);
+                    fetchServerPage('bom', next, { bomSearch, bomCategory, bomProductType });
+                  }}
                   className={`px-2 py-1 rounded border text-[9px] font-black uppercase tracking-widest ${
-                    (page + 1) * PAGE_SIZE_BOM >= filteredBom.length
+                    (page + 1) * PAGE_SIZE_BOM >= serverBomTotal || isServerLoading
                       ? 'border-slate-100 text-slate-300 cursor-not-allowed'
                       : 'border-slate-200 text-slate-600 hover:bg-slate-50'
                   }`}
@@ -2137,8 +2525,13 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
               </div>
             </div>
           )}
+          {category === 'bom' && serverBomTotal > 0 && serverBomTotal <= PAGE_SIZE_BOM && (
+            <div className="mt-3 text-[10px] text-slate-500 font-bold">
+              {serverBomTotal} item{serverBomTotal === 1 ? '' : 's'}
+            </div>
+          )}
 
-          {(category === 'classification' || category === 'values') && (
+          {category === 'classification' && (
             <div className="mt-4 flex gap-4 min-h-[200px]">
               {/* Left: Summary & Attribute List */}
               <div className="flex-1 bg-white rounded-xl border border-slate-200 shadow-sm p-4 flex flex-col">
@@ -2292,6 +2685,61 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
                   ) : (
                     <div className="h-full flex items-center justify-center">
                       <p className="text-[9px] text-slate-400 italic">No classification selected</p>
+                    </div>
+                  )}
+                </div>
+              </div>
+            </div>
+          )}
+
+          {category === 'values' && selectedValueListId && (
+            <div className="mt-4 flex gap-4 min-h-[200px]">
+              {/* Left: Value List Info */}
+              <div className="flex-1 bg-white rounded-xl border border-slate-200 shadow-sm p-4 flex flex-col">
+                <p className="text-[9px] font-black text-slate-400 uppercase tracking-widest mb-3">Value List Detail</p>
+                <div className="mb-3">
+                  <p className="text-xs font-black text-slate-900 mb-1">
+                    {valueListDetail.length > 0 ? (valueListDetail[0].valuelistIdDescription || selectedValueListId) : selectedValueListId}
+                  </p>
+                  <p className="text-[9px] text-slate-500 mb-1">{selectedValueListId}</p>
+                  {valueListDetail.length > 0 && valueListDetail[0].unit && (
+                    <p className="text-[9px] text-slate-500">
+                      <span className="font-black text-slate-400 uppercase tracking-widest">Unit:</span>{' '}
+                      {valueListDetail[0].unit}
+                    </p>
+                  )}
+                  <p className="text-[10px] text-slate-600 font-medium mt-2">
+                    {valueListDetail.length} value{valueListDetail.length === 1 ? '' : 's'} defined
+                  </p>
+                </div>
+              </div>
+
+              {/* Right: Values */}
+              <div className="flex-1 bg-white rounded-xl border border-slate-200 shadow-sm p-4 flex flex-col">
+                <p className="text-[9px] font-black text-slate-400 uppercase tracking-widest mb-3">Values</p>
+                <div className="text-[10px] text-slate-600 font-medium flex-1">
+                  {isValueListDetailLoading ? (
+                    <span className="text-[8px] text-slate-400">Loading...</span>
+                  ) : valueListDetail.length === 0 ? (
+                    <p className="text-[9px] text-slate-400 italic">No values in this list.</p>
+                  ) : (
+                    <div className="flex flex-wrap items-start gap-1 max-h-48 overflow-y-auto">
+                      {valueListDetail.map(row => (
+                        <div
+                          key={row.id}
+                          className="inline-flex flex-col items-start max-w-full"
+                        >
+                          <span className="px-2 py-0.5 rounded-full bg-slate-100 text-slate-700 text-[8px] font-black uppercase tracking-widest truncate max-w-full">
+                            {row.value}
+                          </span>
+                          <span
+                            className="mt-0.5 text-[8px] text-slate-400 truncate max-w-full"
+                            title={row.valueDescription || 'No description'}
+                          >
+                            {row.valueDescription || '—'}
+                          </span>
+                        </div>
+                      ))}
                     </div>
                   )}
                 </div>
@@ -2495,7 +2943,113 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
           </div>
         )}
 
-        {(category === 'classification' || category === 'values') && null}
+        {category === 'classification' && serverClassificationTotal > 0 && (
+          <div className="px-6 pb-2">
+            {serverClassificationTotal > PAGE_SIZE ? (
+              <div className="flex items-center justify-between text-[10px] text-slate-500">
+                <span className="font-bold">
+                  Classes {page * PAGE_SIZE + 1}–
+                  {Math.min((page + 1) * PAGE_SIZE, serverClassificationTotal)} of {serverClassificationTotal}
+                </span>
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    disabled={page === 0 || isServerLoading}
+                    onClick={() => {
+                      const prev = Math.max(0, page - 1);
+                      setPage(prev);
+                      fetchServerPage(category, prev, { classSearch });
+                    }}
+                    className={`px-2 py-1 rounded border text-[9px] font-black uppercase tracking-widest ${
+                      page === 0 || isServerLoading
+                        ? 'border-slate-100 text-slate-300 cursor-not-allowed'
+                        : 'border-slate-200 text-slate-600 hover:bg-slate-50'
+                    }`}
+                  >
+                    Prev
+                  </button>
+                  <span className="text-[9px] font-black text-slate-400 uppercase tracking-widest">
+                    {page + 1} / {Math.ceil(serverClassificationTotal / PAGE_SIZE)}
+                  </span>
+                  <button
+                    type="button"
+                    disabled={(page + 1) * PAGE_SIZE >= serverClassificationTotal || isServerLoading}
+                    onClick={() => {
+                      const next = page + 1;
+                      setPage(next);
+                      fetchServerPage(category, next, { classSearch });
+                    }}
+                    className={`px-2 py-1 rounded border text-[9px] font-black uppercase tracking-widest ${
+                      (page + 1) * PAGE_SIZE >= serverClassificationTotal || isServerLoading
+                        ? 'border-slate-100 text-slate-300 cursor-not-allowed'
+                        : 'border-slate-200 text-slate-600 hover:bg-slate-50'
+                    }`}
+                  >
+                    Next
+                  </button>
+                </div>
+              </div>
+            ) : (
+              <div className="text-[10px] text-slate-500 font-bold">
+                {serverClassificationTotal} class{serverClassificationTotal === 1 ? '' : 'es'}
+              </div>
+            )}
+          </div>
+        )}
+
+        {category === 'values' && serverValueListTotal > 0 && (
+          <div className="px-6 pb-2">
+            {serverValueListTotal > PAGE_SIZE ? (
+              <div className="flex items-center justify-between text-[10px] text-slate-500">
+                <span className="font-bold">
+                  Value Lists {page * PAGE_SIZE + 1}–
+                  {Math.min((page + 1) * PAGE_SIZE, serverValueListTotal)} of {serverValueListTotal}
+                </span>
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    disabled={page === 0 || isServerLoading}
+                    onClick={() => {
+                      const prev = Math.max(0, page - 1);
+                      setPage(prev);
+                      fetchServerPage('values', prev, { valueListSearch });
+                    }}
+                    className={`px-2 py-1 rounded border text-[9px] font-black uppercase tracking-widest ${
+                      page === 0 || isServerLoading
+                        ? 'border-slate-100 text-slate-300 cursor-not-allowed'
+                        : 'border-slate-200 text-slate-600 hover:bg-slate-50'
+                    }`}
+                  >
+                    Prev
+                  </button>
+                  <span className="text-[9px] font-black text-slate-400 uppercase tracking-widest">
+                    {page + 1} / {Math.ceil(serverValueListTotal / PAGE_SIZE)}
+                  </span>
+                  <button
+                    type="button"
+                    disabled={(page + 1) * PAGE_SIZE >= serverValueListTotal || isServerLoading}
+                    onClick={() => {
+                      const next = page + 1;
+                      setPage(next);
+                      fetchServerPage('values', next, { valueListSearch });
+                    }}
+                    className={`px-2 py-1 rounded border text-[9px] font-black uppercase tracking-widest ${
+                      (page + 1) * PAGE_SIZE >= serverValueListTotal || isServerLoading
+                        ? 'border-slate-100 text-slate-300 cursor-not-allowed'
+                        : 'border-slate-200 text-slate-600 hover:bg-slate-50'
+                    }`}
+                  >
+                    Next
+                  </button>
+                </div>
+              </div>
+            ) : (
+              <div className="text-[10px] text-slate-500 font-bold">
+                {serverValueListTotal} value list{serverValueListTotal === 1 ? '' : 's'}
+              </div>
+            )}
+          </div>
+        )}
 
         {category === 'bom' && selectedBomItem && (
           <div className="px-6 pb-6 pt-1 bg-slate-50/40 border-t border-slate-100">

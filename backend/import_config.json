@@ -1,0 +1,25 @@
+{
+    "source_db_path": "C:\\Users\\ISA2\\OneDrive - HAWORTH INC\\Downloads\\sqlite.db",
+
+    "parent_table": "SwingExpansions",
+    "child_table": "SwingExpansionValues",
+
+    "parent_pk_column": "Id",
+    "child_fk_column": "SwingExpansionId",
+
+    "parent_to_bom_item": {
+        "item_id":      "ITEM",
+        "description":  "ItemDescription",
+        "category":     "ProductGroup",
+        "product_type": "DefaultBluestarClassName"
+    },
+
+    "child_to_bom_feature": {
+        "feature_id":   "Feature",
+        "description":  "FeatureDescription",
+        "unit":         "Sequence"
+    },
+
+    "child_values_columns": ["Option"],
+    "child_value_description_column": "OptionDescription"
+}

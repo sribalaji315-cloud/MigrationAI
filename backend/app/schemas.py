@@ -4,6 +4,7 @@ from typing import Any, Dict, Optional, List
 class Token(BaseModel):
     access_token: str
     token_type: str
+    refresh_token: Optional[str] = None
 
 class UserCreate(BaseModel):
     username: str
@@ -59,3 +60,31 @@ class ClassAttributeOut(BaseModel):
     allowedValues: Optional[List[str]] = []
     # Optional per-value descriptions, keyed by allowed value
     valueDescriptions: Optional[Dict[str, str]] = None
+
+
+# --- Value List related schemas ---------------------------------------------------
+
+class ValueListRowOut(BaseModel):
+    id: int
+    valuelistId: str
+    valuelistIdDescription: Optional[str] = None
+    unit: Optional[str] = None
+    value: str
+    valueDescription: Optional[str] = None
+
+    class Config:
+        orm_mode = True
+        from_attributes = True
+
+class ValueListRowCreate(BaseModel):
+    valuelistId: str
+    valuelistIdDescription: Optional[str] = None
+    unit: Optional[str] = None
+    value: str
+    valueDescription: Optional[str] = None
+
+class ValueListGroupOut(BaseModel):
+    valuelistId: str
+    valuelistIdDescription: Optional[str] = None
+    unit: Optional[str] = None
+    valueCount: int

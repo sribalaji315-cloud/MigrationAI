@@ -731,8 +731,8 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
       const globalMapping = globalMappingsForFeature[0] || null;
       const localOverride = localByFeature[f.featureId];
       const fallbackGlobal = allGlobalMappingsByFeature[f.featureId];
-      const effectiveForType = localOverride || fallbackGlobal;
-      const effectiveType = normalizeMappingType(effectiveForType?.attributeType);
+      // Use global mapping's attributeType for type filtering (workspace mappings have empty attributeType)
+      const effectiveType = normalizeMappingType(fallbackGlobal?.attributeType);
       if (includedMappingTypeSet && effectiveType && !includedMappingTypeSet.has(effectiveType)) {
         return;
       }
@@ -841,8 +841,11 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
     });
 
     item.features.forEach(feature => {
-      const effective = localByFeature[feature.featureId] || allGlobalMappingsByFeature[feature.featureId];
-      const attrType = normalizeMappingType(effective?.attributeType);
+      // Use workspace mapping table's attributeType (set during generation) as the source of truth
+      const local = localByFeature[feature.featureId];
+      const attrType = normalizeMappingType(local?.attributeType);
+      // Blank/empty attribute type → keep as uncategorized (not ignored).
+      // Non-blank attribute type that is NOT in the included set → ignored.
       if (attrType && !includedMappingTypeSet.has(attrType)) {
         ignored.add(feature.featureId);
       }
@@ -978,6 +981,7 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
           newAttributeId: attrId,
           attributeType: globalRef?.attributeType || '',
           valueMappings: nextValueMappings,
+          mappedFrom: 'local' as const,
         },
       ];
     });
@@ -995,7 +999,8 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
           legacyFeatureIds: [featureId],
           newAttributeId: globalRef?.newAttributeId || '',
           attributeType: globalRef?.attributeType || '',
-          valueMappings: globalRef ? { ...globalRef.valueMappings, [legacyVal]: newVal } : { [legacyVal]: newVal }
+          valueMappings: globalRef ? { ...globalRef.valueMappings, [legacyVal]: newVal } : { [legacyVal]: newVal },
+          mappedFrom: 'local' as const,
         });
       } else {
         const existingMapping = next[idx];
@@ -1006,10 +1011,11 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
             legacyFeatureIds: [featureId],
             newAttributeId: existingMapping.newAttributeId,
             attributeType: existingMapping.attributeType || '',
-            valueMappings: { ...existingMapping.valueMappings, [legacyVal]: newVal }
+            valueMappings: { ...existingMapping.valueMappings, [legacyVal]: newVal },
+            mappedFrom: 'local' as const,
           });
         } else {
-          next[idx] = { ...existingMapping, valueMappings: { ...existingMapping.valueMappings, [legacyVal]: newVal } };
+          next[idx] = { ...existingMapping, valueMappings: { ...existingMapping.valueMappings, [legacyVal]: newVal }, mappedFrom: 'local' as const };
         }
       }
       return next;
@@ -1233,10 +1239,27 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
               });
             });
 
-            return item.features.map((f, idx) => {
-              if (ignoredFeatureIds.has(f.featureId)) {
-                return null;
-              }
+            // --- Group features by attribute type from workspace mapping table ---
+            const typeGroups: Record<string, typeof item.features> = {};
+            item.features.forEach(f => {
+              if (ignoredFeatureIds.has(f.featureId)) return;
+              // Use workspace mapping table's attributeType as the source of truth
+              const localForType = localByFeature[f.featureId];
+              const attrType = normalizeMappingType(localForType?.attributeType) || 'uncategorized';
+              if (!typeGroups[attrType]) typeGroups[attrType] = [];
+              typeGroups[attrType].push(f);
+            });
+            const sortedTypes = Object.keys(typeGroups).sort((a, b) => {
+              if (a === 'uncategorized') return 1;
+              if (b === 'uncategorized') return -1;
+              return a.localeCompare(b);
+            });
+
+            return sortedTypes.map(typeKey => {
+              const groupFeatures = typeGroups[typeKey];
+              const groupLabel = typeKey === 'uncategorized' ? 'Uncategorized' : typeKey.toUpperCase();
+
+              const renderedCards = groupFeatures.map((f, idx) => {
               // Find ALL global mappings for this feature
               const globalMappingsForFeature = globalByFeature[f.featureId] || [];
               const globalMapping = globalMappingsForFeature[0] || null;
@@ -1459,12 +1482,12 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
 
                     <div className="flex flex-col items-end gap-1 min-w-[220px]">
                       <div className="flex flex-wrap items-center justify-end gap-2">
-                        {localOverride && (
+                        {localOverride && localOverride.mappedFrom === 'local' && (
                           <span className="px-2 py-0.5 bg-purple-100 text-purple-700 text-[7px] font-black rounded-full uppercase tracking-wider">
                             Local
                           </span>
                         )}
-                        {globalMapping && !localOverride && (
+                        {(globalMapping || localOverride) && (!localOverride || localOverride.mappedFrom !== 'local') && (
                           <span className="px-2 py-0.5 bg-blue-100 text-blue-700 text-[7px] font-black rounded-full uppercase tracking-wider">
                             Global
                           </span>
@@ -1537,30 +1560,26 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
                         return (
                           <div
                             key={`${item.itemId}-${f.featureId}-row-${vidx}`}
-                            className="grid grid-cols-[1fr_auto_1fr] gap-4 items-center"
+                            className="grid grid-cols-[1fr_0.8fr_auto_1fr_0.8fr] gap-2 items-center"
                           >
-                            <div className="px-3 py-2 bg-slate-900 text-white rounded-lg text-[9px] font-black uppercase tracking-tight truncate flex flex-col max-w-full">
+                            {/* Source value */}
+                            <div className="px-3 py-2 bg-slate-900 text-white rounded-lg text-[9px] font-black uppercase tracking-tight truncate max-w-full">
                               <span className="truncate">{v}</span>
-                              {legacyDesc && (
-                                <span className="mt-0.5 text-[8px] font-normal normal-case tracking-normal text-slate-100/80 truncate" title={legacyDesc}>
-                                  {legacyDesc}
-                                </span>
-                              )}
+                            </div>
+                            {/* Source value description */}
+                            <div className="px-2 py-2 bg-slate-100 text-slate-500 rounded-lg text-[8px] font-medium normal-case tracking-normal truncate min-h-[32px]" title={legacyDesc}>
+                              {legacyDesc || ''}
                             </div>
 
                             <div className="flex items-center justify-center text-2xl font-black text-slate-300">
                               →
                             </div>
 
+                            {/* Target value */}
                             <div>
                               {isReadOnly ? (
                                 <div className={`px-3 py-2 rounded-lg text-[9px] font-black uppercase tracking-tight truncate ${valuePalette.valueReadonly}`}>
                                   {valueTone === 'notRequired' ? 'N/A' : mappedValue || '—'}
-                                  {targetValueDescription && valueTone !== 'notRequired' && (
-                                    <div className="mt-0.5 text-[8px] font-normal normal-case tracking-normal text-white/80 truncate" title={targetValueDescription}>
-                                      {targetValueDescription}
-                                    </div>
-                                  )}
                                 </div>
                               ) : (
                                 <div className={`rounded-lg p-1 ${valuePalette.valueWrapper}`}>
@@ -1571,13 +1590,12 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
                                     disabled={isReadOnly}
                                     onChange={(newVal) => handleUpdateValue(f.featureId, v, newVal)}
                                   />
-                                  {targetValueDescription && valueTone !== 'notRequired' && (
-                                    <div className="mt-1 text-[8px] font-normal normal-case tracking-normal text-slate-600 truncate" title={targetValueDescription}>
-                                      {targetValueDescription}
-                                    </div>
-                                  )}
                                 </div>
                               )}
+                            </div>
+                            {/* Target value description */}
+                            <div className="px-2 py-2 bg-slate-50 text-slate-500 rounded-lg text-[8px] font-medium normal-case tracking-normal truncate min-h-[32px] border border-slate-100" title={targetValueDescription}>
+                              {targetValueDescription || ''}
                             </div>
                           </div>
                         );
@@ -1587,7 +1605,30 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
                 </div>
               </div>
             );
-          })})()}
+          });
+
+              const visibleCards = renderedCards.filter(Boolean);
+              if (visibleCards.length === 0) return null;
+
+              return (
+                <div key={`type-group-${typeKey}`} className="mb-6">
+                  <div className="flex items-center gap-2 mb-3 px-1">
+                    <div className="h-px flex-1 bg-slate-200" />
+                    <span className="text-[9px] font-black text-slate-500 uppercase tracking-widest whitespace-nowrap">
+                      {groupLabel}
+                    </span>
+                    <span className="px-1.5 py-0.5 rounded-full bg-slate-100 text-slate-500 border border-slate-200 text-[8px] font-black">
+                      {visibleCards.length}
+                    </span>
+                    <div className="h-px flex-1 bg-slate-200" />
+                  </div>
+                  <div className="space-y-3">
+                    {visibleCards}
+                  </div>
+                </div>
+              );
+            });
+          })()}
 
           {ignoredFeatures.length > 0 && (
             <div className="mt-4 rounded-xl border border-amber-200 bg-amber-50/50 p-4">

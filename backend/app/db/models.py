@@ -77,27 +77,12 @@ class GlobalMapping(Base):
     new_attribute_id = Column(String, nullable=False)
     attribute_type = Column(String, nullable=False, default="")
     value_mappings = Column(JSON, nullable=True)
-
-
-class LocalAttributeMapping(Base):
-    """Per-item, per-value mapping overrides captured from the workspace.
-
-    Each row represents the effective mapping of a legacy value on a
-    specific legacy attribute for a given BOM item to a new attribute
-    and value.
-    """
-
-    __tablename__ = "local_attribute_mappings"
-
-    id = Column(Integer, primary_key=True, index=True)
-    item_id = Column(String, index=True, nullable=False)
-    item_description = Column(String, nullable=True)
-    category = Column(String, index=True, nullable=True)
-    product_type = Column(String, index=True, nullable=True)
-    legacy_attribute_id = Column(String, index=True, nullable=False)
-    legacy_value = Column(String, nullable=False)
-    new_attribute_id = Column(String, nullable=False)
-    new_value = Column(String, nullable=False)
+    # Phase 4.2: Optimistic locking version column
+    version = Column(Integer, nullable=False, default=1)
+    # Phase 4.3: Audit trail columns
+    created_by = Column(String, nullable=True)
+    modified_by = Column(String, nullable=True)
+    modified_at = Column(Float, nullable=True)
 
 
 class WorkspaceMapping(Base):
@@ -124,10 +109,34 @@ class WorkspaceMapping(Base):
     legacy_value = Column(String, nullable=False, default="")
     new_attribute_id = Column(String, nullable=False)
     new_value = Column(String, nullable=False, default="")
+    attribute_type = Column(String, nullable=False, default="")
+    mapped_from = Column(String, nullable=False, default="global")
     signed_on_by_user_id = Column(String, index=True, nullable=True)
     signed_on_by_username = Column(String, nullable=True)
     signed_on_at = Column(Float, nullable=True)
     updated_at = Column(Float, nullable=False, default=0)
+    # Phase 4.2: Optimistic locking version column
+    version = Column(Integer, nullable=False, default=1)
+    # Phase 4.3: Audit trail columns
+    created_by = Column(String, nullable=True)
+    modified_by = Column(String, nullable=True)
+    modified_at = Column(Float, nullable=True)
+
+
+class ValueList(Base):
+    """Flat value-list table: one row per allowed value.
+
+    Multiple rows sharing the same ``valuelist_id`` form a single list.
+    """
+
+    __tablename__ = "value_list"
+
+    id = Column(Integer, primary_key=True, index=True)
+    valuelist_id = Column(String, index=True, nullable=False)
+    valuelist_id_description = Column(String, nullable=True)
+    unit = Column(String, nullable=True)
+    value = Column(String, nullable=False)
+    value_description = Column(String, nullable=True)
 
 
 class MappingGenerationJob(Base):
@@ -151,3 +160,38 @@ class MappingGenerationJob(Base):
     finished_at = Column(Float, nullable=True)
     updated_at = Column(Float, nullable=False, default=0)
     error_message = Column(String, nullable=True)
+
+
+class ItemLock(Base):
+    """Database-backed item lock for atomic locking (eliminates TOCTOU race)."""
+
+    __tablename__ = "item_locks"
+
+    id = Column(Integer, primary_key=True, index=True)
+    item_id = Column(String, unique=True, nullable=False, index=True)
+    user_id = Column(String, nullable=False, index=True)
+    user_name = Column(String, nullable=True)
+    acquired_at = Column(Float, nullable=False)
+
+
+class TokenBlacklist(Base):
+    """Revoked JWT tokens (jti claim). Checked on every authenticated request."""
+
+    __tablename__ = "token_blacklist"
+
+    id = Column(Integer, primary_key=True, index=True)
+    jti = Column(String, unique=True, nullable=False, index=True)
+    expires_at = Column(Float, nullable=False)
+
+
+class AuditLog(Base):
+    """Audit trail for destructive / sensitive operations."""
+
+    __tablename__ = "audit_log"
+
+    id = Column(Integer, primary_key=True, index=True)
+    timestamp = Column(Float, nullable=False)
+    user_id = Column(String, nullable=True)
+    username = Column(String, nullable=True)
+    action = Column(String, nullable=False)
+    detail = Column(String, nullable=True)

@@ -73,6 +73,8 @@ const MappingDashboard: React.FC<MappingDashboardProps> = ({ categories, product
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState('');
   const [metrics, setMetrics] = useState<DashboardMetricsResponse | null>(null);
+  const [progress, setProgress] = useState(0);
+  const [progressPhase, setProgressPhase] = useState('');
 
   const canCompute = Boolean(selectedCategory) && Boolean(selectedProductLine);
 
@@ -91,12 +93,30 @@ const MappingDashboard: React.FC<MappingDashboardProps> = ({ categories, product
     if (!canCompute) return;
     setIsLoading(true);
     setError('');
+    setProgress(0);
+    setProgressPhase('Connecting to server...');
+
+    // Animate progress phases while waiting
+    const phases = [
+      { at: 300, pct: 15, label: 'Querying workspace mappings...' },
+      { at: 1200, pct: 40, label: 'Aggregating feature stats...' },
+      { at: 2500, pct: 65, label: 'Computing coverage metrics...' },
+      { at: 4000, pct: 80, label: 'Building item breakdown...' },
+    ];
+    const timers = phases.map(p =>
+      setTimeout(() => { setProgress(p.pct); setProgressPhase(p.label); }, p.at)
+    );
+
     try {
       const category = selectedCategory === SELECT_ALL ? undefined : selectedCategory;
       const productLine = selectedProductLine === SELECT_ALL ? undefined : selectedProductLine;
       const response = await dbService.fetchDashboardMetrics({ category, productLine, includeExcluded, forceRecompute });
+      timers.forEach(clearTimeout);
+      setProgress(100);
+      setProgressPhase('Done');
       setMetrics(response);
     } catch (err: any) {
+      timers.forEach(clearTimeout);
       console.warn('Failed to compute dashboard metrics', err);
       setError(err?.message || 'Failed to compute dashboard metrics.');
       setMetrics(null);
@@ -112,12 +132,24 @@ const MappingDashboard: React.FC<MappingDashboardProps> = ({ categories, product
 
     setIsLoading(true);
     setError('');
+    setProgress(0);
+    setProgressPhase('Recalculating with toggle...');
+
+    const timers = [
+      setTimeout(() => { setProgress(30); setProgressPhase('Querying workspace mappings...'); }, 200),
+      setTimeout(() => { setProgress(60); setProgressPhase('Recomputing metrics...'); }, 800),
+    ];
+
     try {
       const category = selectedCategory === SELECT_ALL ? undefined : selectedCategory;
       const productLine = selectedProductLine === SELECT_ALL ? undefined : selectedProductLine;
       const response = await dbService.fetchDashboardMetrics({ category, productLine, includeExcluded: next });
+      timers.forEach(clearTimeout);
+      setProgress(100);
+      setProgressPhase('Done');
       setMetrics(response);
     } catch (err: any) {
+      timers.forEach(clearTimeout);
       console.warn('Failed to compute dashboard metrics', err);
       setError(err?.message || 'Failed to compute dashboard metrics.');
       setMetrics(null);
@@ -224,8 +256,17 @@ const MappingDashboard: React.FC<MappingDashboardProps> = ({ categories, product
           )}
 
           {isLoading && (
-            <div className="rounded-xl border border-slate-200 bg-white p-6 text-center">
-              <p className="text-[10px] font-black text-slate-500 uppercase tracking-widest">Computing Server Metrics</p>
+            <div className="rounded-xl border border-slate-200 bg-white p-6 space-y-3">
+              <div className="flex items-center justify-between">
+                <p className="text-[10px] font-black text-slate-500 uppercase tracking-widest">{progressPhase || 'Computing...'}</p>
+                <span className="text-[10px] font-black text-indigo-600">{progress}%</span>
+              </div>
+              <div className="w-full h-2 bg-slate-100 rounded-full overflow-hidden">
+                <div
+                  className="h-full bg-indigo-500 rounded-full transition-all duration-500 ease-out"
+                  style={{ width: `${Math.max(progress, 5)}%` }}
+                />
+              </div>
             </div>
           )}
 

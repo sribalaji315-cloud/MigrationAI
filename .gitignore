@@ -33,3 +33,6 @@ state_after.json
 *.njsproj
 *.sln
 *.sw?
+
+# PID files for start-app.ps1
+.pids/

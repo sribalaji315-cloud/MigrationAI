@@ -14,9 +14,11 @@ interface BOMHeaderProps {
   onExportBomCsv: () => void;
   onOpenDashboard: () => void;
   mappingGenerationProgress?: MappingGenerationProgress | null;
+  onRetriggerGeneration?: () => void;
+  isMappingGenerationActive?: boolean;
 }
 
-const BOMHeader: React.FC<BOMHeaderProps> = ({ onRegenerate, isRefreshing, onInspectData, onCommit, currentUser, onLogout, onClearCache, onExportBomCsv, onOpenDashboard, mappingGenerationProgress }) => {
+const BOMHeader: React.FC<BOMHeaderProps> = ({ onRegenerate, isRefreshing, onInspectData, onCommit, currentUser, onLogout, onClearCache, onExportBomCsv, onOpenDashboard, mappingGenerationProgress, onRetriggerGeneration, isMappingGenerationActive }) => {
   const uploadOptions: { label: string; id: DataCategory; icon: string; adminOnly?: boolean }[] = [
     { label: 'Global Mapping', id: 'mapping', icon: 'M8 7v8a2 2 0 002 2h6M8 7V5a2 2 0 012-2h4.586a1 1 0 01.707.293l4.414 4.414a1 1 0 01.293.707V15a2 2 0 01-2 2h-2' },
     { label: 'Classifications', id: 'classification', icon: 'M4 6h16M4 10h16M4 14h16M4 18h16' },
@@ -67,6 +69,24 @@ const BOMHeader: React.FC<BOMHeaderProps> = ({ onRegenerate, isRefreshing, onIns
                   <span>Mapping Gen</span>
                   <span>{generationStatus === 'running' || generationStatus === 'queued' ? `${generationPercent}%` : generationStatus}</span>
                 </div>
+              )}
+              {currentUser.role === 'admin' && onRetriggerGeneration && (
+                <button
+                  type="button"
+                  onClick={onRetriggerGeneration}
+                  disabled={isMappingGenerationActive}
+                  className={`ml-1 inline-flex items-center gap-1 px-2 py-0.5 border rounded-full text-[8px] font-black uppercase tracking-widest transition-colors ${
+                    isMappingGenerationActive
+                      ? 'bg-slate-50 border-slate-200 text-slate-300 cursor-not-allowed'
+                      : 'bg-violet-50 border-violet-200 text-violet-700 hover:bg-violet-100'
+                  }`}
+                  title="Re-generate workspace mappings from current BOM and global mappings"
+                >
+                  <svg className="w-2.5 h-2.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                  </svg>
+                  Regenerate
+                </button>
               )}
             </div>
           </div>
