@@ -2,6 +2,7 @@
 import React, { useMemo, useState, useDeferredValue, useRef, useCallback, useEffect, ReactElement } from 'react';
 import { List as VirtualList } from 'react-window';
 import { LegacyItem, ItemLock } from '../types';
+import { dbService } from '../services/dbService';
 
 type ItemStatus = 'mapped' | 'unmapped' | 'notRequired';
 
@@ -109,26 +110,121 @@ interface ItemSidebarProps {
   totalServerCount?: number;
   currentPage?: number;
   onPageChange?: (page: number) => void;
-  onSearch?: (query: string) => void;
+  onSearch?: (query: string, filters?: { category?: string; productType?: string; userId?: string; priority?: number }) => void;
   searchResults?: LegacyItem[] | null;
   searchTotalCount?: number;
   isLoading?: boolean;
   isAdmin?: boolean;
   categories?: string[];
   productTypes?: string[];
+  priorities?: number[];
   allUsers?: { userId: string; userName: string }[];
-  onFilterChange?: (filters: { category?: string; productType?: string; userId?: string }) => void;
+  onFilterChange?: (filters: { category?: string; productType?: string; userId?: string; priority?: number }) => void;
 }
 
-const ItemSidebar: React.FC<ItemSidebarProps> = ({ items, selectedId, onSelect, locks, currentUserId, itemStatuses, showUnmappedOnly = false, onToggleUnmappedOnly, totalServerCount, currentPage, onPageChange, onSearch, searchResults, searchTotalCount, isLoading, isAdmin, categories, productTypes, allUsers, onFilterChange }) => {
+const ItemSidebar: React.FC<ItemSidebarProps> = ({ items, selectedId, onSelect, locks, currentUserId, itemStatuses, showUnmappedOnly = false, onToggleUnmappedOnly, totalServerCount, currentPage, onPageChange, onSearch, searchResults, searchTotalCount, isLoading, isAdmin, categories, productTypes, priorities, allUsers, onFilterChange }) => {
   const [search, setSearch] = useState('');
   const deferredSearch = useDeferredValue(search);
   const listContainerRef = useRef<HTMLDivElement | null>(null);
   const [listHeight, setListHeight] = useState(400);
+  const [liveItemStatuses, setLiveItemStatuses] = useState<Record<string, ItemStatus>>(itemStatuses || {});
   const searchTimerRef = useRef<number | null>(null);
   const [filterCategory, setFilterCategory] = useState('');
   const [filterProductType, setFilterProductType] = useState('');
+  const [filterPriority, setFilterPriority] = useState<number | ''>('');
   const [filterUserId, setFilterUserId] = useState('');
+  const [availableCategories, setAvailableCategories] = useState<string[]>(categories || []);
+  const [availableProductTypes, setAvailableProductTypes] = useState<string[]>(productTypes || []);
+  const [availablePriorities, setAvailablePriorities] = useState<number[]>(priorities || []);
+  const latestFilterStateRef = useRef<{ category?: string; productType?: string; userId?: string; priority?: number }>({});
+
+  useEffect(() => {
+    latestFilterStateRef.current = {
+      category: filterCategory || undefined,
+      productType: filterProductType || undefined,
+      userId: filterUserId || undefined,
+      priority: filterPriority !== '' ? filterPriority : undefined,
+    };
+  }, [filterCategory, filterProductType, filterUserId, filterPriority]);
+
+  useEffect(() => {
+    setAvailableCategories(categories || []);
+  }, [categories]);
+
+  useEffect(() => {
+    setAvailableProductTypes(productTypes || []);
+  }, [productTypes]);
+
+  useEffect(() => {
+    setAvailablePriorities(priorities || []);
+  }, [priorities]);
+
+  useEffect(() => {
+    setLiveItemStatuses(itemStatuses || {});
+  }, [itemStatuses]);
+
+  const statusRequestKey = useMemo(() => {
+    return items.map(item => item.itemId).join('|');
+  }, [items]);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    const refreshStatuses = async () => {
+      try {
+        const nextStatuses = await dbService.fetchItemStatuses();
+        if (!cancelled) {
+          setLiveItemStatuses(nextStatuses || {});
+        }
+      } catch (err) {
+        if (!cancelled) {
+          console.warn('Failed to fetch live item statuses for sidebar', err);
+        }
+      }
+    };
+
+    refreshStatuses();
+    return () => {
+      cancelled = true;
+    };
+  }, [statusRequestKey, currentPage, isAdmin]);
+
+  useEffect(() => {
+    if (!isAdmin) return;
+    let cancelled = false;
+
+    const refreshAvailableFilters = async () => {
+      try {
+        const filters = await dbService.fetchBomFilters({
+          category: filterCategory || undefined,
+          productType: filterProductType || undefined,
+          priority: filterPriority !== '' ? filterPriority : undefined,
+        });
+        if (cancelled) return;
+        setAvailableCategories(filters.categories || []);
+        setAvailableProductTypes(filters.productTypes || []);
+        setAvailablePriorities(filters.priorities || []);
+        if (filterCategory && !(filters.categories || []).includes(filterCategory)) {
+          setFilterCategory('');
+        }
+        if (filterProductType && !(filters.productTypes || []).includes(filterProductType)) {
+          setFilterProductType('');
+        }
+        if (filterPriority !== '' && !(filters.priorities || []).includes(filterPriority)) {
+          setFilterPriority('');
+        }
+      } catch (err) {
+        if (!cancelled) {
+          console.warn('Failed to refresh sidebar BOM filters', err);
+        }
+      }
+    };
+
+    refreshAvailableFilters();
+    return () => {
+      cancelled = true;
+    };
+  }, [isAdmin, filterCategory, filterProductType, filterPriority]);
 
   const measureList = useCallback((node: HTMLDivElement | null) => {
     listContainerRef.current = node;
@@ -144,45 +240,35 @@ const ItemSidebar: React.FC<ItemSidebarProps> = ({ items, selectedId, onSelect, 
   }, []);
 
   // Debounce server search when onSearch is available
+  const onSearchRef = useRef(onSearch);
+  useEffect(() => { onSearchRef.current = onSearch; }, [onSearch]);
   useEffect(() => {
-    if (!onSearch) return;
+    if (!onSearchRef.current) return;
     if (searchTimerRef.current) window.clearTimeout(searchTimerRef.current);
     const q = deferredSearch.trim();
-    if (!q) {
-      onSearch('');
-      return;
-    }
     searchTimerRef.current = window.setTimeout(() => {
-      onSearch(q);
+      onSearchRef.current?.(q, latestFilterStateRef.current);
     }, 350);
     return () => {
       if (searchTimerRef.current) window.clearTimeout(searchTimerRef.current);
     };
-  }, [deferredSearch, onSearch]);
+  }, [deferredSearch]);
 
   // When server search is active and has results, use those; otherwise filter locally
   const isServerSearchActive = !!(onSearch && deferredSearch.trim() && searchResults);
   const filteredItems = useMemo(() => {
     if (isServerSearchActive && searchResults) {
-      // Server results — still apply unmapped-only toggle locally
-      let next = searchResults;
-      if (showUnmappedOnly) {
-        next = next.filter(item => itemStatuses?.[item.itemId] === 'unmapped');
-      }
-      return next;
+      return searchResults;
     }
     const q = deferredSearch.trim().toLowerCase();
     let next = items;
-    if (showUnmappedOnly) {
-      next = next.filter(item => itemStatuses?.[item.itemId] === 'unmapped');
-    }
     if (!q) return next;
     return next.filter(item => {
       const id = (item.itemId || '').toLowerCase();
       const desc = (item.description || '').toLowerCase();
       return id.includes(q) || desc.includes(q);
     });
-  }, [items, itemStatuses, showUnmappedOnly, deferredSearch, isServerSearchActive, searchResults]);
+  }, [items, deferredSearch, isServerSearchActive, searchResults]);
 
   // Determine display counts
   const displayTotal = isServerSearchActive && typeof searchTotalCount === 'number'
@@ -193,6 +279,15 @@ const ItemSidebar: React.FC<ItemSidebarProps> = ({ items, selectedId, onSelect, 
   const isServerPaged = typeof totalServerCount === 'number' && totalServerCount > 0 && onPageChange;
   const totalPages = isServerPaged ? Math.max(1, Math.ceil(totalServerCount / PAGE_SIZE)) : 1;
   const activePage = currentPage ?? 0;
+  const shownCount = typeof displayTotal === 'number'
+    ? Math.min((activePage + 1) * PAGE_SIZE, displayTotal)
+    : filteredItems.length;
+
+  const listRenderKey = useMemo(() => {
+    return filteredItems
+      .map(item => `${item.itemId}:${liveItemStatuses[item.itemId] || 'unknown'}`)
+      .join('|');
+  }, [filteredItems, liveItemStatuses]);
 
   return (
     <div className="w-64 bg-white border-r border-slate-200 flex flex-col h-full shrink-0">
@@ -227,28 +322,43 @@ const ItemSidebar: React.FC<ItemSidebarProps> = ({ items, selectedId, onSelect, 
           <div className="mt-2 flex flex-col gap-1.5">
             <select
               value={filterCategory}
-              onChange={(e) => { setFilterCategory(e.target.value); onFilterChange({ category: e.target.value || undefined, productType: filterProductType || undefined, userId: filterUserId || undefined }); }}
+              onChange={(e) => { setFilterCategory(e.target.value); }}
               className="w-full text-[10px] px-2 py-1 bg-white border border-slate-200 rounded-md focus:outline-none focus:ring-1 focus:ring-blue-500/30"
             >
               <option value="">All Categories</option>
-              {(categories || []).map(c => <option key={c} value={c}>{c}</option>)}
+              {availableCategories.map(c => <option key={c} value={c}>{c}</option>)}
             </select>
             <select
               value={filterProductType}
-              onChange={(e) => { setFilterProductType(e.target.value); onFilterChange({ category: filterCategory || undefined, productType: e.target.value || undefined, userId: filterUserId || undefined }); }}
+              onChange={(e) => { setFilterProductType(e.target.value); }}
               className="w-full text-[10px] px-2 py-1 bg-white border border-slate-200 rounded-md focus:outline-none focus:ring-1 focus:ring-blue-500/30"
             >
               <option value="">All Product Lines</option>
-              {(productTypes || []).map(p => <option key={p} value={p}>{p}</option>)}
+              {availableProductTypes.map(p => <option key={p} value={p}>{p}</option>)}
+            </select>
+            <select
+              value={filterPriority}
+              onChange={(e) => { const val = e.target.value === '' ? '' as const : Number(e.target.value); setFilterPriority(val); }}
+              className="w-full text-[10px] px-2 py-1 bg-white border border-slate-200 rounded-md focus:outline-none focus:ring-1 focus:ring-blue-500/30"
+            >
+              <option value="">All Priorities</option>
+              {availablePriorities.map(p => <option key={p} value={p}>{p}</option>)}
             </select>
             <select
               value={filterUserId}
-              onChange={(e) => { setFilterUserId(e.target.value); onFilterChange({ category: filterCategory || undefined, productType: filterProductType || undefined, userId: e.target.value || undefined }); }}
+              onChange={(e) => { setFilterUserId(e.target.value); }}
               className="w-full text-[10px] px-2 py-1 bg-white border border-slate-200 rounded-md focus:outline-none focus:ring-1 focus:ring-blue-500/30"
             >
               <option value="">All Users</option>
               {(allUsers || []).map(u => <option key={u.userId} value={u.userId}>{u.userName}</option>)}
             </select>
+            <button
+              type="button"
+              onClick={() => onFilterChange(latestFilterStateRef.current)}
+              className="w-full px-2 py-1.5 rounded-md border border-blue-200 bg-blue-50 text-[10px] font-black uppercase tracking-widest text-blue-700 hover:bg-blue-100 transition-colors"
+            >
+              Apply Filters
+            </button>
           </div>
         )}
       </div>
@@ -260,32 +370,33 @@ const ItemSidebar: React.FC<ItemSidebarProps> = ({ items, selectedId, onSelect, 
           </div>
         ) : (
         <VirtualList<RowExtraProps>
+          key={listRenderKey}
           style={{ height: listHeight }}
           rowCount={filteredItems.length}
           rowHeight={ITEM_ROW_HEIGHT}
           overscanCount={5}
           rowComponent={SidebarRow}
-          rowProps={{ filteredItems, locks, currentUserId, selectedId, onSelect, itemStatuses }}
+          rowProps={{ filteredItems, locks, currentUserId, selectedId, onSelect, itemStatuses: liveItemStatuses }}
         />
         )}
       </div>
-      {isServerPaged && totalPages > 1 && (
+      {typeof displayTotal === 'number' && displayTotal > 0 && (
         <div className="px-3 py-2 border-t border-slate-100 bg-slate-50/30 flex items-center justify-between shrink-0">
           <button
             type="button"
-            disabled={activePage <= 0}
-            onClick={() => onPageChange(activePage - 1)}
+            disabled={!isServerPaged || activePage <= 0}
+            onClick={() => onPageChange?.(activePage - 1)}
             className="px-2 py-1 rounded text-[9px] font-black uppercase tracking-widest border border-slate-200 bg-white text-slate-600 hover:bg-slate-100 disabled:opacity-40 disabled:cursor-not-allowed transition-all"
           >
             Prev
           </button>
           <span className="text-[9px] font-black text-slate-400 uppercase tracking-widest">
-            {activePage + 1} / {totalPages}
+            {shownCount}/{displayTotal} Items
           </span>
           <button
             type="button"
-            disabled={activePage >= totalPages - 1}
-            onClick={() => onPageChange(activePage + 1)}
+            disabled={!isServerPaged || activePage >= totalPages - 1}
+            onClick={() => onPageChange?.(activePage + 1)}
             className="px-2 py-1 rounded text-[9px] font-black uppercase tracking-widest border border-slate-200 bg-white text-slate-600 hover:bg-slate-100 disabled:opacity-40 disabled:cursor-not-allowed transition-all"
           >
             Next

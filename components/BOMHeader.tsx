@@ -13,12 +13,13 @@ interface BOMHeaderProps {
   onClearCache: () => void;
   onExportBomCsv: () => void;
   onOpenDashboard: () => void;
+  onOpenHierarchy: () => void;
   mappingGenerationProgress?: MappingGenerationProgress | null;
   onRetriggerGeneration?: () => void;
   isMappingGenerationActive?: boolean;
 }
 
-const BOMHeader: React.FC<BOMHeaderProps> = ({ onRegenerate, isRefreshing, onInspectData, onCommit, currentUser, onLogout, onClearCache, onExportBomCsv, onOpenDashboard, mappingGenerationProgress, onRetriggerGeneration, isMappingGenerationActive }) => {
+const BOMHeader: React.FC<BOMHeaderProps> = ({ onRegenerate, isRefreshing, onInspectData, onCommit, currentUser, onLogout, onClearCache, onExportBomCsv, onOpenDashboard, onOpenHierarchy, mappingGenerationProgress, onRetriggerGeneration, isMappingGenerationActive }) => {
   const uploadOptions: { label: string; id: DataCategory; icon: string; adminOnly?: boolean }[] = [
     { label: 'Global Mapping', id: 'mapping', icon: 'M8 7v8a2 2 0 002 2h6M8 7V5a2 2 0 012-2h4.586a1 1 0 01.707.293l4.414 4.414a1 1 0 01.293.707V15a2 2 0 01-2 2h-2' },
     { label: 'Classifications', id: 'classification', icon: 'M4 6h16M4 10h16M4 14h16M4 18h16' },
@@ -171,6 +172,17 @@ const BOMHeader: React.FC<BOMHeaderProps> = ({ onRegenerate, isRefreshing, onIns
                       <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M11 3.055A9.001 9.001 0 1020.945 13H11V3.055z" />
                     </svg>
                     Mapping Dashboard
+                  </button>
+
+                  <button 
+                    type="button"
+                    onClick={onOpenHierarchy}
+                    className="flex items-center gap-1.5 px-2.5 py-1.5 bg-violet-50 text-violet-700 border border-violet-100 hover:bg-violet-100 rounded-md text-[9px] font-black transition-all whitespace-nowrap uppercase tracking-wider"
+                  >
+                    <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 6h16M4 10h16M4 14h16M4 18h16" />
+                    </svg>
+                    BOM Hierarchy
                   </button>
 
                   <button 

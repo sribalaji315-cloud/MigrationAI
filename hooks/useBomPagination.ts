@@ -14,9 +14,9 @@ export function useBomPagination(
 ) {
   const [bomPage, setBomPage] = useState(0);
   const [bomTotalCount, setBomTotalCount] = useState(0);
-  const [bomFilters, setBomFilters] = useState<{ categories: string[]; productTypes: string[] }>({ categories: [], productTypes: [] });
+  const [bomFilters, setBomFilters] = useState<{ categories: string[]; productTypes: string[]; priorities: number[] }>({ categories: [], productTypes: [], priorities: [] });
 
-  const handleFetchBomItems = async (category?: string, productType?: string) => {
+  const handleFetchBomItems = async (category?: string, productType?: string, priority?: number) => {
     if (!dbState) return [];
     setIsRefreshing(true);
     try {
@@ -25,7 +25,7 @@ export function useBomPagination(
       let items: DatabaseState['bom'] = [];
 
       while (true) {
-        const batch = await dbService.fetchBomItems(category, productType, { limit: pageSize, offset });
+        const batch = await dbService.fetchBomItems(category, productType, { limit: pageSize, offset, priority });
         items = items.concat(batch);
         if (batch.length < pageSize) break;
         offset += pageSize;

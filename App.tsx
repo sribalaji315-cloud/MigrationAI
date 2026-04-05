@@ -13,6 +13,7 @@ import { useWebSocket, WsEvent } from './hooks/useWebSocket';
 const MappingWorkspace = lazy(() => import('./components/MappingWorkspace'));
 const DataInspector = lazy(() => import('./components/DataInspector'));
 const MappingDashboard = lazy(() => import('./components/MappingDashboard'));
+const BOMHierarchy = lazy(() => import('./components/BOMHierarchy'));
 
 const LazyFallback = () => (
   <div className="flex items-center justify-center p-8">
@@ -38,6 +39,7 @@ const EMPTY_DB_STATE: DatabaseState = {
 };
 
 type ItemStatus = 'mapped' | 'unmapped' | 'notRequired';
+type SidebarBomFilters = { category?: string; productType?: string; userId?: string; priority?: number; unmappedOnly?: boolean };
 
 const normalizeMappingType = (value?: string | null) => (value || '').trim().toLowerCase();
 
@@ -51,6 +53,7 @@ const App: React.FC = () => {
   const [dbState, setDbState] = useState<DatabaseState | null>(null);
   const [activeInspector, setActiveInspector] = useState<DataCategory | null>(null);
   const [showDashboard, setShowDashboard] = useState(false);
+  const [showHierarchy, setShowHierarchy] = useState(false);
   const [showUnmappedOnlyInSidebar, setShowUnmappedOnlyInSidebar] = useState(false);
   const [featureFlags, setFeatureFlags] = useState<FeatureFlags>(() => ({
     useNewClassTargetMapping: import.meta.env.VITE_USE_NEW_CLASS_TARGET_MAPPING === 'true',
@@ -62,12 +65,12 @@ const App: React.FC = () => {
 
   const {
     bomPage,
+    setBomPage,
     bomTotalCount,
     setBomTotalCount,
     bomFilters,
     setBomFilters,
     handleFetchBomItems,
-    handleBomPageChange,
     BOM_PAGE_SIZE,
   } = useBomPagination(dbState, currentUser, setDbState, setIsRefreshing);
 
@@ -77,46 +80,93 @@ const App: React.FC = () => {
   // --- Sidebar server search state ---
   const [sidebarSearchResults, setSidebarSearchResults] = useState<DatabaseState['bom'] | null>(null);
   const [sidebarSearchTotal, setSidebarSearchTotal] = useState<number>(0);
+  const [sidebarAdminFilters, setSidebarAdminFilters] = useState<SidebarBomFilters>({});
+  const [sidebarSearchQuery, setSidebarSearchQuery] = useState('');
+  const [sidebarTotalCount, setSidebarTotalCount] = useState<number>(0);
+  const [sidebarBomItems, setSidebarBomItems] = useState<DatabaseState['bom']>([]);
   const sidebarSearchGenRef = useRef(0);
+  const sidebarLoadGenRef = useRef(0);
 
-  const handleSidebarSearch = useCallback(async (query: string) => {
-    if (!query.trim()) {
+  const refreshItemStatuses = useCallback(async () => {
+    try {
+      const statuses = await dbService.fetchItemStatuses();
+      setItemStatuses(statuses);
+    } catch (err) {
+      console.warn('Failed to refresh item statuses', err);
+    }
+  }, [setItemStatuses]);
+
+  const loadSidebarItems = useCallback(async (filters: SidebarBomFilters = {}, page = 0, search = '') => {
+    if (!currentUser || currentUser.role !== 'admin') return;
+    const gen = ++sidebarLoadGenRef.current;
+    setIsDataLoading(true);
+    setSidebarAdminFilters(filters);
+    setSidebarSearchQuery(search);
+    setBomPage(page);
+    try {
+      const [result, totalCount] = await Promise.all([
+        dbService.fetchSignedOnBomItems({
+          category: filters.category,
+          productType: filters.productType,
+          userId: filters.userId,
+          search: search || undefined,
+          priority: filters.priority,
+          unmappedOnly: filters.unmappedOnly,
+          limit: BOM_PAGE_SIZE,
+          offset: page * BOM_PAGE_SIZE,
+        }),
+        dbService.fetchBomCount(
+          filters.category,
+          filters.productType,
+          search || undefined,
+          filters.priority,
+          filters.unmappedOnly,
+        ),
+      ]);
+      if (gen !== sidebarLoadGenRef.current) return;
+      setSidebarBomItems(result.items);
+      setSidebarTotalCount(totalCount);
       setSidebarSearchResults(null);
       setSidebarSearchTotal(0);
-      return;
+      await refreshItemStatuses();
+    } catch (err) {
+      if (gen !== sidebarLoadGenRef.current) return;
+      console.warn('Failed to fetch filtered BOM items', err);
+    } finally {
+      if (gen === sidebarLoadGenRef.current) {
+        setIsDataLoading(false);
+      }
     }
+  }, [BOM_PAGE_SIZE, currentUser, refreshItemStatuses, setBomPage]);
+
+  const handleSidebarSearch = useCallback(async (query: string, filters: SidebarBomFilters = sidebarAdminFilters) => {
     const gen = ++sidebarSearchGenRef.current;
+    const mergedFilters = { ...filters, unmappedOnly: showUnmappedOnlyInSidebar || undefined };
     try {
+      if (currentUser?.role === 'admin') {
+        await loadSidebarItems(mergedFilters, 0, query.trim());
+        return;
+      }
       const [items, count] = await Promise.all([
-        dbService.fetchBomItems(undefined, undefined, { limit: 50, search: query }),
-        dbService.fetchBomCount(undefined, undefined, query),
+        dbService.fetchBomItems(mergedFilters.category, mergedFilters.productType, { limit: BOM_PAGE_SIZE, search: query, priority: mergedFilters.priority, unmappedOnly: mergedFilters.unmappedOnly }),
+        dbService.fetchBomCount(mergedFilters.category, mergedFilters.productType, query, mergedFilters.priority, mergedFilters.unmappedOnly),
       ]);
-      if (gen !== sidebarSearchGenRef.current) return; // stale
+      if (gen !== sidebarSearchGenRef.current) return;
       setSidebarSearchResults(items);
       setSidebarSearchTotal(count);
     } catch (err) {
       if (gen !== sidebarSearchGenRef.current) return;
       console.warn('Sidebar search failed', err);
     }
-  }, []);
+  }, [BOM_PAGE_SIZE, currentUser, loadSidebarItems, sidebarAdminFilters, showUnmappedOnlyInSidebar]);
 
-  const handleAdminFilterChange = useCallback(async (filters: { category?: string; productType?: string; userId?: string }) => {
-    setIsDataLoading(true);
-    try {
-      const result = await dbService.fetchSignedOnBomItems({
-        category: filters.category,
-        productType: filters.productType,
-        userId: filters.userId,
-        limit: 20,
-        offset: 0,
-      });
-      setDbState(prev => prev ? { ...prev, bom: result.items } : prev);
-    } catch (err) {
-      console.warn('Failed to fetch filtered BOM items', err);
-    } finally {
-      setIsDataLoading(false);
-    }
-  }, []);
+  const handleAdminFilterChange = useCallback(async (filters: SidebarBomFilters) => {
+    await loadSidebarItems({ ...filters, unmappedOnly: showUnmappedOnlyInSidebar || undefined }, 0, sidebarSearchQuery);
+  }, [loadSidebarItems, sidebarSearchQuery, showUnmappedOnlyInSidebar]);
+
+  const handleAdminSidebarPageChange = useCallback(async (page: number) => {
+    await loadSidebarItems({ ...sidebarAdminFilters, unmappedOnly: showUnmappedOnlyInSidebar || undefined }, page, sidebarSearchQuery);
+  }, [loadSidebarItems, sidebarAdminFilters, sidebarSearchQuery, showUnmappedOnlyInSidebar]);
 
   // WebSocket: real-time collaboration events (ref avoids stale closure)
   const fetchFromDBRef = useRef<() => void>(() => {});
@@ -201,12 +251,12 @@ const App: React.FC = () => {
 
       // Step 2: Fire ALL secondary fetches in parallel
       const [bomResult, totalCount, statuses, mappingResult, classResult, filters] = await Promise.all([
-        dbService.fetchSignedOnBomItems({ limit: 20, offset: 0 }).catch(err => { console.warn('Failed to fetch signed-on BOM items', err); return { items: [] as DatabaseState['bom'], signedOnCount: 0 }; }),
+        dbService.fetchSignedOnBomItems({ limit: 20, offset: 0 }).catch(err => { console.warn('Failed to fetch signed-on BOM items', err); return { items: [] as DatabaseState['bom'], signedOnCount: 0, totalCount: 0 }; }),
         dbService.fetchBomCount().catch(err => { console.warn('Failed to fetch BOM count', err); return 0; }),
         dbService.fetchItemStatuses().catch(err => { console.warn('Failed to fetch item statuses', err); return {} as Record<string, 'mapped' | 'unmapped' | 'notRequired'>; }),
         dbService.fetchGlobalMappingsPaginated({ limit: 20, offset: 0 }).catch(err => { console.warn('Failed to fetch mappings', err); return { items: [] as GlobalMapping[], total: 0 }; }),
         dbService.fetchClassificationsPaginated({ limit: 20, offset: 0 }).catch(err => { console.warn('Failed to fetch classifications', err); return { items: [] as any[], total: 0 }; }),
-        dbService.fetchBomFilters().catch(err => { console.warn('Failed to fetch BOM filters', err); return { categories: [] as string[], productTypes: [] as string[] }; }),
+        dbService.fetchBomFilters().catch(err => { console.warn('Failed to fetch BOM filters', err); return { categories: [] as string[], productTypes: [] as string[], priorities: [] as number[] }; }),
       ]);
 
       setDbState({
@@ -221,6 +271,8 @@ const App: React.FC = () => {
         users: init.users || [],
       });
       setBomTotalCount(totalCount);
+      setSidebarBomItems(bomResult.items);
+      setSidebarTotalCount(totalCount);
       setItemStatuses(statuses);
       setMappingTotalCount('total' in mappingResult ? mappingResult.total : 0);
       setClassificationTotalCount('total' in classResult ? classResult.total : 0);
@@ -346,21 +398,69 @@ const App: React.FC = () => {
     options?: { closeInspector?: boolean; source?: 'manual' | 'auto' }
   ) => {
     if (!dbState) return;
-    let nextState = { ...dbState };
+    const nextState = { ...dbState };
+
+    // Extract the edited-only mappings for the sync payload BEFORE touching
+    // nextState.  The in-memory app state must keep its full list so the UI
+    // doesn't lose data; only the sync payload should carry the delta.
+    let editedMappingsForSync: any[] | undefined;
 
     if (category === 'mapping') {
       if (Array.isArray(updatedData)) {
-        nextState.mappings = updatedData;
+        editedMappingsForSync = updatedData;
+        // Do NOT overwrite nextState.mappings – keep the full cached list.
       } else {
-        nextState.mappings = updatedData?.mappings || [];
+        editedMappingsForSync = updatedData?.mappings || [];
         nextState.mappingTypeConfig = updatedData?.mappingTypeConfig;
+        // Do NOT overwrite nextState.mappings – keep the full cached list.
       }
     }
-    if (category === 'classification' || category === 'values') nextState.classifications = updatedData;
-    if (category === 'bom') nextState.bom = updatedData;
-    if (category === 'users') nextState.users = updatedData;
 
-    const saveResult = await dbService.saveAll(nextState, currentUser?.role);
+    if (category === 'classification' || category === 'values') {
+      nextState.classifications = updatedData;
+    }
+
+    if (category === 'bom') {
+      nextState.bom = updatedData;
+    }
+
+    if (category === 'users') {
+      nextState.users = updatedData;
+    }
+
+    // Build a reduced payload for sync so we never overwrite full tables
+    // with paginated UI subsets.
+    const syncPayload: any = { ...nextState };
+
+    // For mappings, send ONLY the edited records – never the full cached list.
+    if (category === 'mapping') {
+      syncPayload.mappings = editedMappingsForSync;
+      syncPayload.mappingSyncMode = 'patch';
+      syncPayload.deletedGlobalMappingIds = Array.isArray(updatedData?.deletedGlobalMappingIds)
+        ? updatedData.deletedGlobalMappingIds
+        : [];
+      syncPayload.deletedGlobalMappingKeys = Array.isArray(updatedData?.deletedGlobalMappingKeys)
+        ? updatedData.deletedGlobalMappingKeys
+        : [];
+    } else {
+      delete syncPayload.mappings;
+      delete syncPayload.mappingSyncMode;
+      delete syncPayload.deletedGlobalMappingIds;
+      delete syncPayload.deletedGlobalMappingKeys;
+    }
+
+    if (category !== 'classification' && category !== 'values') {
+      delete syncPayload.classifications;
+    }
+
+    if (category !== 'bom') {
+      delete syncPayload.bom;
+    }
+
+    // DataInspector does not edit workspace mappings directly.
+    delete syncPayload.localMappings;
+
+    const saveResult = await dbService.saveAll(syncPayload as DatabaseState, currentUser?.role);
     setConnectionMode(saveResult.mode);
 
     if (category === 'bom' && saveResult.mappingGenerationJobId) {
@@ -422,13 +522,62 @@ const App: React.FC = () => {
   // Wire useLocking hook
   const { handleSignOn, handleSignOff } = useLocking(dbState, currentUser, setIsRefreshing, handleFetchFromDB);
 
+  // For admin, sidebar items live in sidebarBomItems; for non-admin, in sidebarItems (from hook).
+  const effectiveSidebarItems = currentUser?.role === 'admin' ? sidebarBomItems : sidebarItems;
+
+  // --- Session transition guards: preserve sidebar state across sign-on / sign-off ---
+  const sessionTransitionRef = useRef(false);
+  const preSessionSidebarRef = useRef<{
+    items: DatabaseState['bom'];
+    totalCount: number;
+    filters: SidebarBomFilters;
+    searchQuery: string;
+    page: number;
+  } | null>(null);
+
+  const handleSignOnWithSidebar = useCallback(async (itemId: string) => {
+    const selectedItemData = effectiveSidebarItems.find(i => i.itemId === itemId);
+    if (currentUser?.role === 'admin') {
+      preSessionSidebarRef.current = {
+        items: [...sidebarBomItems],
+        totalCount: sidebarTotalCount,
+        filters: { ...sidebarAdminFilters },
+        searchQuery: sidebarSearchQuery,
+        page: bomPage,
+      };
+    }
+    sessionTransitionRef.current = true;
+    await handleSignOn(itemId);
+    if (selectedItemData && currentUser?.role === 'admin') {
+      setSidebarBomItems([selectedItemData]);
+      setSidebarTotalCount(1);
+    }
+    sessionTransitionRef.current = false;
+  }, [handleSignOn, effectiveSidebarItems, currentUser, sidebarBomItems, sidebarTotalCount, sidebarAdminFilters, sidebarSearchQuery, bomPage]);
+
+  const handleSignOffWithSidebar = useCallback(async (itemId: string) => {
+    sessionTransitionRef.current = true;
+    await handleSignOff(itemId);
+    const saved = preSessionSidebarRef.current;
+    if (saved && currentUser?.role === 'admin') {
+      await loadSidebarItems(
+        { ...saved.filters, unmappedOnly: showUnmappedOnlyInSidebar || undefined },
+        saved.page,
+        saved.searchQuery,
+      );
+    }
+    preSessionSidebarRef.current = null;
+    sessionTransitionRef.current = false;
+  }, [handleSignOff, currentUser, loadSidebarItems, showUnmappedOnlyInSidebar]);
+
   useEffect(() => {
-    if (selectedItemId && !sidebarItems.some(item => item.itemId === selectedItemId)) {
+    if (sessionTransitionRef.current) return;
+    if (selectedItemId && !effectiveSidebarItems.some(item => item.itemId === selectedItemId)) {
       setSelectedItemId(null);
     }
-  }, [selectedItemId, sidebarItems]);
+  }, [selectedItemId, effectiveSidebarItems]);
 
-  const selectedItem = sidebarItems.find(item => item.itemId === selectedItemId) || null;
+  const selectedItem = effectiveSidebarItems.find(item => item.itemId === selectedItemId) || null;
 
   if (!currentUser) {
     return <LoginSignUp onLogin={handleLogin} />;
@@ -479,6 +628,9 @@ const App: React.FC = () => {
         onOpenDashboard={() => {
           setShowDashboard(true);
         }}
+        onOpenHierarchy={() => {
+          setShowHierarchy(true);
+        }}
         mappingGenerationProgress={mappingGenerationProgress}
         onRetriggerGeneration={handleRetriggerGeneration}
         isMappingGenerationActive={isMappingGenerationActive}
@@ -499,17 +651,23 @@ const App: React.FC = () => {
         )}
 
         <ItemSidebar 
-          items={sidebarItems} 
+          items={currentUser.role === 'admin' ? sidebarBomItems : sidebarItems} 
           selectedId={selectedItemId} 
           onSelect={setSelectedItemId} 
           locks={dbState.locks}
           currentUserId={currentUser.userId}
           itemStatuses={itemStatuses}
           showUnmappedOnly={showUnmappedOnlyInSidebar}
-          onToggleUnmappedOnly={() => setShowUnmappedOnlyInSidebar(v => !v)}
-          totalServerCount={currentUser.role === 'admin' ? bomTotalCount : undefined}
+          onToggleUnmappedOnly={() => {
+            const next = !showUnmappedOnlyInSidebar;
+            setShowUnmappedOnlyInSidebar(next);
+            if (currentUser?.role === 'admin') {
+              loadSidebarItems({ ...sidebarAdminFilters, unmappedOnly: next || undefined }, 0, sidebarSearchQuery);
+            }
+          }}
+          totalServerCount={currentUser.role === 'admin' ? sidebarTotalCount : undefined}
           currentPage={currentUser.role === 'admin' ? bomPage : undefined}
-          onPageChange={currentUser.role === 'admin' ? handleBomPageChange : undefined}
+          onPageChange={currentUser.role === 'admin' ? handleAdminSidebarPageChange : undefined}
           onSearch={handleSidebarSearch}
           searchResults={sidebarSearchResults}
           searchTotalCount={sidebarSearchTotal}
@@ -517,6 +675,7 @@ const App: React.FC = () => {
           isAdmin={currentUser.role === 'admin'}
           categories={bomFilters.categories}
           productTypes={bomFilters.productTypes}
+          priorities={bomFilters.priorities}
           allUsers={dbState.users?.map(u => ({ userId: u.userId, userName: u.userName })) || []}
           onFilterChange={currentUser.role === 'admin' ? handleAdminFilterChange : undefined}
         />
@@ -540,8 +699,8 @@ const App: React.FC = () => {
             currentUser={currentUser}
             featureFlags={featureFlags}
             onToggleNewClassTargetMapping={handleToggleNewClassTargetMapping}
-            onSignOn={async () => selectedItemId && (await handleSignOn(selectedItemId))}
-            onSignOff={async () => selectedItemId && (await handleSignOff(selectedItemId))}
+            onSignOn={async () => selectedItemId && (await handleSignOnWithSidebar(selectedItemId))}
+            onSignOff={async () => selectedItemId && (await handleSignOffWithSidebar(selectedItemId))}
             onSaveChanges={handleSaveWorkspaceChanges}
             onSyncFromDB={handleFetchFromDB}
             isGenerationActive={isMappingGenerationActive}
@@ -571,7 +730,6 @@ const App: React.FC = () => {
               bomFilters={bomFilters}
               onFetchBomItems={handleFetchBomItems}
               locks={dbState.locks}
-              onSignOnItem={handleSignOn}
               mappingGenerationProgress={mappingGenerationProgress}
               mappingTotalCount={mappingTotalCount}
               classificationTotalCount={classificationTotalCount}
@@ -590,12 +748,22 @@ const App: React.FC = () => {
             <MappingDashboard
               categories={bomFilters.categories || []}
               productLines={bomFilters.productTypes || []}
+              priorities={bomFilters.priorities || []}
               onClose={() => {
                 setShowDashboard(false);
               }}
             />
           </Suspense>
         </div>
+
+        {showHierarchy && (
+          <Suspense fallback={<LazyFallback />}>
+            <BOMHierarchy
+              currentUser={currentUser}
+              onClose={() => setShowHierarchy(false)}
+            />
+          </Suspense>
+        )}
       </main>
 
       <footer className="bg-white border-t border-slate-200 px-5 py-2 flex items-center justify-between shrink-0">

@@ -22,8 +22,8 @@ interface DataInspectorProps {
   ) => void | Promise<void>;
   onSwitchUser?: (user: User) => void;
   currentUser: User; // used to determine admin privileges
-  bomFilters?: { categories: string[]; productTypes: string[] };
-  onFetchBomItems?: (category?: string, productType?: string) => Promise<LegacyItem[]>;
+  bomFilters?: { categories: string[]; productTypes: string[]; priorities: number[] };
+  onFetchBomItems?: (category?: string, productType?: string, priority?: number) => Promise<LegacyItem[]>;
   locks?: Record<string, ItemLock>;
   onSignOnItem?: (itemId: string) => Promise<void>;
   mappingGenerationProgress?: MappingGenerationProgress | null;
@@ -131,6 +131,62 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
   const normalizeKey = (value?: string | null) => (value || '').trim().toLowerCase();
   const normalizeAttributeType = (value?: string | null): string => (value || '').trim().toLowerCase();
   const [localMapping, setLocalMapping] = useState<GlobalMapping[]>([]);
+  // Track deleted mappings so sync can issue precise row-level deletes.
+  const deletedMappingIdsRef = useRef<Set<number>>(new Set());
+  const deletedMappingKeysRef = useRef<Set<string>>(new Set());
+  const mappingNaturalKeyFor = (m: GlobalMapping) => {
+    const fk = (m.legacyFeatureIds || []).slice().sort().join('|');
+    return `${fk}=>${m.newAttributeId || ''}`;
+  };
+  const getMappingModifiedAt = (m: GlobalMapping) => {
+    const clientEditedAt = Number((m as any)._clientEditedAt);
+    if (Number.isFinite(clientEditedAt)) return clientEditedAt;
+    const modifiedAt = Number((m as any).modifiedAt);
+    if (Number.isFinite(modifiedAt)) return modifiedAt;
+    return Number.NEGATIVE_INFINITY;
+  };
+  const preferNewerMapping = (current: GlobalMapping, candidate: GlobalMapping) => {
+    const currentModifiedAt = getMappingModifiedAt(current);
+    const candidateModifiedAt = getMappingModifiedAt(candidate);
+    if (candidateModifiedAt !== currentModifiedAt) {
+      return candidateModifiedAt > currentModifiedAt ? candidate : current;
+    }
+    const currentId = typeof current.id === 'number' ? current.id : Number.NEGATIVE_INFINITY;
+    const candidateId = typeof candidate.id === 'number' ? candidate.id : Number.NEGATIVE_INFINITY;
+    if (candidateId !== currentId) {
+      return candidateId > currentId ? candidate : current;
+    }
+    return candidate;
+  };
+  const dedupeMappingsByNaturalKey = (mappings: GlobalMapping[]) => {
+    const byKey = new Map<string, GlobalMapping>();
+    (mappings || []).forEach(mapping => {
+      const naturalKey = mappingNaturalKeyFor(mapping);
+      const existing = byKey.get(naturalKey);
+      if (!existing) {
+        byKey.set(naturalKey, mapping);
+        return;
+      }
+      byKey.set(naturalKey, preferNewerMapping(existing, mapping));
+    });
+    return Array.from(byKey.values());
+  };
+  const mappingKeyFor = (m: GlobalMapping) => {
+    if (typeof m.id === 'number') {
+      return `id:${m.id}`;
+    }
+    return mappingNaturalKeyFor(m);
+  };
+  const findLocalMappingIndex = (mapping: GlobalMapping) => {
+    if (typeof mapping.id === 'number') {
+      return localMapping.findIndex(localRow => localRow.id === mapping.id);
+    }
+    return localMapping.findIndex(localRow => mappingNaturalKeyFor(localRow) === mappingNaturalKeyFor(mapping));
+  };
+  const markMappingEdited = (mapping: GlobalMapping): GlobalMapping => ({
+    ...mapping,
+    _clientEditedAt: Date.now(),
+  } as GlobalMapping);
   const [availableAttributeTypes, setAvailableAttributeTypes] = useState<string[]>([]);
   const [includedAttributeTypes, setIncludedAttributeTypes] = useState<string[]>([]);
   const [newAttributeType, setNewAttributeType] = useState('');
@@ -141,9 +197,11 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
   const [localUsers, setLocalUsers] = useState<User[]>([]);
   const [bomCategory, setBomCategory] = useState('');
   const [bomProductType, setBomProductType] = useState('');
+  const [bomPriority, setBomPriority] = useState<number | ''>('');
   const [isBomSyncing, setIsBomSyncing] = useState(false);
   const [availableCategories, setAvailableCategories] = useState<string[]>([]);
   const [availableProductTypes, setAvailableProductTypes] = useState<string[]>([]);
+  const [availablePriorities, setAvailablePriorities] = useState<number[]>([]);
   const [page, setPage] = useState(0);
   const [mappingSearch, setMappingSearch] = useState('');
   const [bomSearch, setBomSearch] = useState('');
@@ -204,7 +262,7 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
   const fetchServerPage = useCallback(async (
     cat: DataCategory,
     pg: number,
-    opts?: { mappingSearch?: string; classSearch?: string; bomSearch?: string; bomCategory?: string; bomProductType?: string; valueListSearch?: string }
+    opts?: { mappingSearch?: string; classSearch?: string; bomSearch?: string; bomCategory?: string; bomProductType?: string; bomPriority?: number; valueListSearch?: string }
   ) => {
     const gen = ++fetchGenRef.current;
     setIsServerLoading(true);
@@ -243,12 +301,13 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
           dbService.fetchBomItems(
             opts?.bomCategory || undefined,
             opts?.bomProductType || undefined,
-            { limit: PAGE_SIZE, offset: pg * PAGE_SIZE, search: opts?.bomSearch || undefined }
+            { limit: PAGE_SIZE, offset: pg * PAGE_SIZE, search: opts?.bomSearch || undefined, priority: opts?.bomPriority ?? undefined }
           ),
           dbService.fetchBomCount(
             opts?.bomCategory || undefined,
             opts?.bomProductType || undefined,
-            opts?.bomSearch || undefined
+            opts?.bomSearch || undefined,
+            opts?.bomPriority ?? undefined
           ),
         ]);
         if (gen !== fetchGenRef.current) return; // stale response
@@ -256,7 +315,7 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
         setServerBomTotal(count);
         // Only propagate total to parent when no BOM filters are active,
         // otherwise the filtered count would corrupt the sidebar pagination.
-        const hasFilters = !!(opts?.bomCategory || opts?.bomProductType || opts?.bomSearch);
+        const hasFilters = !!(opts?.bomCategory || opts?.bomProductType || opts?.bomSearch || opts?.bomPriority != null);
         if (!hasFilters) {
           onCountsChanged?.({ bomTotal: count });
         }
@@ -270,6 +329,28 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
       }
     }
   }, [onCountsChanged]);
+
+  const fetchAllGlobalMappings = useCallback(async (): Promise<GlobalMapping[]> => {
+    const batchSize = 1000;
+    let offset = 0;
+    let total = Number.POSITIVE_INFINITY;
+    const all: GlobalMapping[] = [];
+
+    while (offset < total) {
+      const result = await dbService.fetchGlobalMappingsPaginated({
+        limit: batchSize,
+        offset,
+      });
+      const items = result?.items || [];
+      total = typeof result?.total === 'number' ? result.total : items.length;
+      all.push(...items);
+      if (!items.length) break;
+      offset += items.length;
+      if (items.length < batchSize) break;
+    }
+
+    return all;
+  }, []);
 
   // Initial fetch when tab opens
   useEffect(() => {
@@ -431,13 +512,11 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
       });
     });
 
-    const pruned = prunePlaceholderMappings(next);
-    if (pruned.length !== next.length) {
-      changed = true;
-    }
-
-    return changed ? pruned : mappings;
+    return changed ? next : mappings;
   };
+
+  // Single record being edited – completely decoupled from the table / localMapping.
+  const [editingRecord, setEditingRecord] = useState<GlobalMapping | null>(null);
 
   const persistInspectorData = useCallback(async (opts?: {
     closeInspector?: boolean;
@@ -457,19 +536,64 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
     setIsSaving(true);
     try {
       if (category === 'mapping') {
-        const mappingPayload = prunePlaceholderMappings(opts?.mappingData || localMapping);
+        let mappingPayload: GlobalMapping[] = [];
+
+        if (opts?.mappingData) {
+          // CSV import path: send the full uploaded set as-is
+          mappingPayload = opts.mappingData;
+        } else {
+          // UI edit path: only send the single record the user was editing.
+          // Never touch any other DB record.
+          if (!editingRecord || (editingRecord as any)._clientEditedAt === undefined) {
+            // Nothing to sync – no edits made; just handle deletions if any
+            mappingPayload = [];
+          } else {
+            mappingPayload = [editingRecord];
+          }
+        }
+
+        if (opts?.mappingData) {
+          mappingPayload = dedupeMappingsByNaturalKey(mappingPayload);
+        }
+
         const mappingTypePayload = opts?.mappingTypeData || {
           availableTypes: availableAttributeTypes,
           includedTypes: includedAttributeTypes.filter(type => availableAttributeTypes.includes(type)),
         };
-        setLocalMapping(mappingPayload);
-        await onSave('mapping', {
-          mappings: mappingPayload,
-          mappingTypeConfig: mappingTypePayload,
-        }, {
-          closeInspector,
-          source,
-        });
+        console.log(`[Mapping Save] sending ${mappingPayload.length} record(s) to backend`);
+
+        if (!opts?.mappingData && source === 'manual') {
+          if (mappingPayload.length === 1) {
+            await dbService.upsertGlobalMapping(mappingPayload[0]);
+          }
+        } else {
+          await onSave('mapping', {
+            mappings: mappingPayload,
+            mappingTypeConfig: mappingTypePayload,
+            deletedGlobalMappingIds: [],
+            deletedGlobalMappingKeys: [],
+          }, {
+            closeInspector,
+            source,
+          });
+        }
+        deletedMappingIdsRef.current = new Set();
+        deletedMappingKeysRef.current = new Set();
+        // Clear the edit pane – record is now saved
+        setEditingRecord(null);
+        // Refresh paginated view from server so table reflects the saved data
+        try {
+          const freshPage = await dbService.fetchGlobalMappingsPaginated({
+            limit: PAGE_SIZE,
+            offset: 0,
+            search: mappingSearch || undefined,
+          });
+          setServerMappings(freshPage.items);
+          setLocalMapping(freshPage.items);
+          setServerMappingTotal(freshPage.total);
+          onCountsChanged?.({ mappingTotal: freshPage.total });
+          setPage(0);
+        } catch (_e) { /* best-effort refresh */ }
       }
       if (category === 'classification') {
         await onSave('classification', opts?.classificationData || localClassification, { closeInspector, source });
@@ -493,11 +617,14 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
   }, [
     availableAttributeTypes,
     category,
+    editingRecord,
     includedAttributeTypes,
     localBom,
     localClassification,
     localMapping,
     localUsers,
+    mappingSearch,
+    onCountsChanged,
     onSave,
   ]);
 
@@ -585,6 +712,7 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
     setLocalUsers(needsUsers ? cloneData(data.users || []) : []);
     setAvailableCategories(bomFilters?.categories || []);
     setAvailableProductTypes(bomFilters?.productTypes || []);
+    setAvailablePriorities(bomFilters?.priorities || []);
 
     // Only reset search/filter UI state when the user switches to a different category tab.
     // When data is re-hydrated (e.g. after auto-save), preserve the user's active filters.
@@ -593,6 +721,7 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
       setExportTypeFilter('__all__');
       setBomCategory('');
       setBomProductType('');
+      setBomPriority('');
       setIsBomSyncing(false);
       setPage(0);
       setMappingSearch('');
@@ -610,20 +739,25 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
     hydrationCategoryRef.current = category;
   }, [data, category, bomFilters, mappingTypeConfig, currentUser.role, suspendHydration, isAutoSaving]);
 
-  const refreshBomFilters = async (nextCategory: string, nextProductType: string) => {
+  const refreshBomFilters = async (nextCategory: string, nextProductType: string, nextPriority: number | '') => {
     try {
       const filters = await dbService.fetchBomFilters({
         category: nextCategory || undefined,
         productType: nextProductType || undefined,
+        priority: nextPriority !== '' ? nextPriority : undefined,
       });
       setAvailableCategories(filters.categories || []);
       setAvailableProductTypes(filters.productTypes || []);
+      setAvailablePriorities(filters.priorities || []);
 
       if (nextCategory && !(filters.categories || []).includes(nextCategory)) {
         setBomCategory('');
       }
       if (nextProductType && !(filters.productTypes || []).includes(nextProductType)) {
         setBomProductType('');
+      }
+      if (nextPriority !== '' && !(filters.priorities || []).includes(nextPriority)) {
+        setBomPriority('');
       }
     } catch (err) {
       console.warn('Failed to refresh BOM filters', err);
@@ -660,16 +794,35 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
 
   const activeClass = useMemo(() => {
     if (selectedClassId) {
-      return localClassification.find(c => c.classId === selectedClassId) || null;
+      const selectedKey = normalizeKey(selectedClassId);
+      return (
+        localClassification.find(c => normalizeKey(c.classId) === selectedKey)
+        || filteredClasses.find(c => normalizeKey(c.classId) === selectedKey)
+        || serverClassifications.find(c => normalizeKey(c.classId) === selectedKey)
+        || null
+      );
     }
-    return filteredClasses[0] || null;
-  }, [filteredClasses, localClassification, selectedClassId]);
+    return filteredClasses[0] || localClassification[0] || null;
+  }, [filteredClasses, localClassification, selectedClassId, serverClassifications]);
 
   useEffect(() => {
     if (!selectedClassId && filteredClasses.length) {
       setSelectedClassId(filteredClasses[0].classId);
     }
   }, [filteredClasses, selectedClassId]);
+
+  useEffect(() => {
+    if (category !== 'classification') return;
+    if (selectedClassId) {
+      void refreshClassificationFilters({ classId: selectedClassId });
+      return;
+    }
+    if (selectedAttributeId) {
+      void refreshClassificationFilters({ attributeId: selectedAttributeId });
+      return;
+    }
+    void refreshClassificationFilters();
+  }, [category, selectedClassId, selectedAttributeId, refreshClassificationFilters]);
 
   const classDropdownOptions = useMemo(() => {
     // Use server-provided filter list (all distinct classes, cross-filtered by attribute selection)
@@ -707,8 +860,7 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
   }, [allAttributesForActiveClass, attributeSearch, selectedAttributeId]);
 
   const attributeDropdownOptions = useMemo(() => {
-    // Use server-provided filter list (all distinct attributes, cross-filtered by class selection)
-    if (allAttributeOptions.length) return allAttributeOptions;
+    // For a selected class, always show that class's own attribute list.
     const seen = new Set<string>();
     const opts: string[] = [];
     allAttributesForActiveClass.forEach(attr => {
@@ -718,8 +870,27 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
         opts.push(id);
       }
     });
+    if (opts.length) return opts;
+
+    // Fall back to server-provided cross-filter options when no class-specific
+    // attributes are available yet.
+    if (allAttributeOptions.length) return allAttributeOptions;
+
     return opts;
   }, [allAttributeOptions, allAttributesForActiveClass]);
+
+  useEffect(() => {
+    if (category !== 'classification') return;
+    if (!selectedAttributeId) return;
+    const selectedKey = normalizeKey(selectedAttributeId);
+    const existsInActiveClass = allAttributesForActiveClass.some(
+      attr => normalizeKey(attr.attributeId) === selectedKey
+    );
+    if (!existsInActiveClass) {
+      setSelectedAttributeId(null);
+      setRemoteAttribute(null);
+    }
+  }, [category, allAttributesForActiveClass, selectedAttributeId]);
 
   const selectedAttributeForDetail = useMemo(() => {
     const selectedKey = normalizeKey(selectedAttributeId);
@@ -931,17 +1102,9 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
     return filteredMapping;
   }, [filteredMapping]);
 
-  const [selectedMappingIndex, setSelectedMappingIndex] = useState<number | null>(null);
-
-  const selectedMapping = useMemo(() => {
-    if (selectedMappingIndex == null) return null;
-    if (selectedMappingIndex < 0 || selectedMappingIndex >= localMapping.length) return null;
-    return localMapping[selectedMappingIndex];
-  }, [localMapping, selectedMappingIndex]);
-
   const legacyValueCandidates = useMemo(() => {
-    if (!selectedMapping) return [] as string[];
-    const featureIds = selectedMapping.legacyFeatureIds || [];
+    if (!editingRecord) return [] as string[];
+    const featureIds = editingRecord.legacyFeatureIds || [];
     const valuesSet = new Set<string>();
 
     if (featureIds.length) {
@@ -957,25 +1120,18 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
       });
     }
 
-    Object.keys(selectedMapping.valueMappings || {}).forEach(k => {
+    Object.keys(editingRecord.valueMappings || {}).forEach(k => {
       const val = k.trim();
       if (val) valuesSet.add(val);
     });
 
     return Array.from(valuesSet).sort((a, b) => a.localeCompare(b));
-  }, [selectedMapping, localBom]);
+  }, [editingRecord, localBom]);
 
   const filteredBom = useMemo(() => {
-    // Use server-fetched data for display when available
-    if (serverBom.length || bomSearch) return serverBom;
-    const q = bomSearch.trim().toLowerCase();
-    if (!q) return localBom;
-    return localBom.filter(item => {
-      const id = (item.itemId || '').toLowerCase();
-      const desc = (item.description || '').toLowerCase();
-      return id.includes(q) || desc.includes(q);
-    });
-  }, [localBom, bomSearch, serverBom]);
+    // Always use server-paged data (20 items per page)
+    return serverBom;
+  }, [serverBom]);
 
   const pagedBom = useMemo(() => {
     // Server already returns only the current page
@@ -984,8 +1140,10 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
 
   const selectedBomItem = useMemo(() => {
     if (!selectedBomItemId) return null;
-    return localBom.find(item => item.itemId === selectedBomItemId) || null;
-  }, [localBom, selectedBomItemId]);
+    return serverBom.find(item => item.itemId === selectedBomItemId)
+      || localBom.find(item => item.itemId === selectedBomItemId)
+      || null;
+  }, [serverBom, localBom, selectedBomItemId]);
 
   const featureCandidates = useMemo(() => {
     if (!selectedBomItem) return [] as string[];
@@ -1064,10 +1222,10 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
       ];
     } else if (category === 'bom') {
       rows = [
-        ['itemId', 'description', 'category', 'productType', 'featureId', 'featureDescription', 'unit', 'values', 'valueDescriptions'],
-        ['ITEM1', 'Sample Item', 'TABLES', 'DINING', 'ATHAT', 'Height Adjust Type', '', 'FH730|FHWL', 'Fixed height 730mm|Without legs'],
-        ['ITEM1', 'Sample Item', 'TABLES', 'DINING', 'MMW', 'Width', 'MM', '1200|600', ''],
-        ['ITEM1', 'Sample Item', 'TABLES', 'DINING', 'ACHPL', 'HPL Color', '', '', ''],
+        ['itemId', 'description', 'category', 'productType', 'priority', 'featureId', 'featureDescription', 'unit', 'condition', 'values', 'valueDescriptions'],
+        ['ITEM1', 'Sample Item', 'TABLES', 'DINING', '1', 'ATHAT', 'Height Adjust Type', '', '', 'FH730|FHWL', 'Fixed height 730mm|Without legs'],
+        ['ITEM1', 'Sample Item', 'TABLES', 'DINING', '1', 'MMW', 'Width', 'MM', '', '1200|600', ''],
+        ['ITEM1', 'Sample Item', 'TABLES', 'DINING', '1', 'ACHPL', 'HPL Color', '', '', '', ''],
       ];
     }
 
@@ -1217,9 +1375,9 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
             const [from, to] = p.split(':');
             const fromVal = (from || '').trim();
             const toVal = (to || '').trim();
-            if (fromVal && toVal) rowValueMappings[fromVal] = toVal;
+            if (fromVal) rowValueMappings[fromVal] = toVal;
           });
-          if (legacyValue && newValue) {
+          if (legacyValue) {
             rowValueMappings[legacyValue] = newValue;
           }
 
@@ -1233,7 +1391,17 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
           });
         });
 
-        const existing = localMapping.map(m => ({
+        // Fetch ALL existing mappings from server to avoid destroying
+        // unloaded pages when /sync replaces the entire table.
+        let allServerMappings: GlobalMapping[] = [];
+        try {
+          allServerMappings = await fetchAllGlobalMappings();
+        } catch (err) {
+          console.warn('Failed to fetch all server mappings, falling back to local', err);
+          allServerMappings = localMapping;
+        }
+
+        const existing = allServerMappings.map(m => ({
           ...m,
           legacyFeatureIds: [...(m.legacyFeatureIds || [])],
           attributeType: normalizeAttributeType((m as any).attributeType),
@@ -1292,7 +1460,23 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
           });
         });
 
-        const nextMapping = prunePlaceholderMappings(existing);
+        // Do NOT prune after CSV import — the CSV is the user's explicit intent.
+        // Placeholder pruning is only appropriate for auto-generated BOM placeholders.
+        const nextMapping = dedupeMappingsByNaturalKey(existing);
+
+        // --- Import statistics ---
+        const importedKeySet = new Set(imported.map(m => {
+          const fk = (m.legacyFeatureIds || []).slice().sort().join('|');
+          return `${fk}=>${m.newAttributeId || ''}=>${normalizeAttributeType(m.attributeType)}`;
+        }));
+        const newCount = nextMapping.filter(m => {
+          const fk = (m.legacyFeatureIds || []).slice().sort().join('|');
+          const k = `${fk}=>${m.newAttributeId || ''}=>${normalizeAttributeType(m.attributeType)}`;
+          return importedKeySet.has(k);
+        }).length;
+        const totalValuePairs = imported.reduce((sum, m) => sum + Object.keys(m.valueMappings || {}).length, 0);
+        console.log(`[CSV Import] ${imported.length} CSV rows → ${newCount} unique mappings (${nextMapping.length} total after merge, ${totalValuePairs} value pairs)`);
+
         setLocalMapping(nextMapping);
         setHasCsvUploaded(true);
         await persistInspectorData({
@@ -1446,9 +1630,11 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
           const description = r['description'] || r['itemDescription'] || '';
           const category = r['category'] || '';
           const productType = r['productType'] || r['producttype'] || r['product_type'] || '';
+          const rawPriority = r['priority'] || '';
+          const priority = rawPriority ? parseInt(rawPriority, 10) : undefined;
 
           if (!byItem[itemId]) {
-            byItem[itemId] = { itemId, description, category, productType, features: [] };
+            byItem[itemId] = { itemId, description, category, productType, ...(priority != null && !isNaN(priority) ? { priority } : {}), features: [] };
           } else {
             if (!byItem[itemId].description && description) {
               byItem[itemId].description = description;
@@ -1459,6 +1645,9 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
             if (productType && !byItem[itemId].productType) {
               byItem[itemId].productType = productType;
             }
+            if (priority != null && !isNaN(priority) && byItem[itemId].priority == null) {
+              byItem[itemId].priority = priority;
+            }
           }
 
           const featureId = r['featureId'] || '';
@@ -1466,6 +1655,8 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
 
           const featureDescription = r['featureDescription'] || featureId;
           const featureUnit = r['unit'] || '';
+          const featureCondition = r['condition'] || '';
+          const featureFormula = r['formula'] || '';
           // Support both pipe-separated columns (values / valueDescriptions)
           // and singular one-per-row columns (value / valueDescription / featureValue)
           const rawValuesStr = r['values'] || r['value'] || r['featureValue'] || '';
@@ -1481,12 +1672,18 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
 
           let feature = byItem[itemId].features.find(f => f.featureId === featureId);
           if (!feature) {
-            feature = { featureId, description: featureDescription, unit: featureUnit || undefined, values: [], valueDescriptions: {} };
+            feature = { featureId, description: featureDescription, unit: featureUnit || undefined, condition: featureCondition || undefined, formula: featureFormula || undefined, values: [], valueDescriptions: {} };
             byItem[itemId].features.push(feature);
           } else if (!feature.description && featureDescription) {
             feature.description = featureDescription;
           } else if (featureUnit && !feature.unit) {
             feature.unit = featureUnit;
+          }
+          if (featureCondition && !feature.condition) {
+            feature.condition = featureCondition;
+          }
+          if (featureFormula && !feature.formula) {
+            feature.formula = featureFormula;
           }
 
           rawValues.forEach((v, idx) => {
@@ -1523,25 +1720,13 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
   };
 
   const handleBomSync = async () => {
-    if (!bomCategory && !bomProductType) {
-      alert('Select a category or product type before syncing BOM items.');
-      return;
-    }
     try {
       setIsBomSyncing(true);
       setPage(0);
-      // Fetch first page with filters from server
-      await fetchServerPage('bom', 0, { bomCategory, bomProductType, bomSearch: '' });
+      // Fetch first page with filters from server (20 items only)
+      await fetchServerPage('bom', 0, { bomCategory, bomProductType, bomPriority: bomPriority !== '' ? bomPriority : undefined, bomSearch: '' });
       setBomSearch('');
       setSelectedBomItemId(null);
-      // Also fetch full set into localBom for editing/save via parent
-      if (onFetchBomItems) {
-        const items = await onFetchBomItems(bomCategory || undefined, bomProductType || undefined);
-        setLocalBom(items || []);
-        if (category === 'mapping') {
-          setLocalMapping(prev => ensureMappingsCoverBom(prev, items || []));
-        }
-      }
     } catch (err: any) {
       alert(`Failed to fetch BOM items: ${err?.message || String(err)}`);
     } finally {
@@ -1582,9 +1767,7 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
     }
 
     if (category === 'mapping') {
-      const next = [...localMapping, { legacyFeatureIds: [], newAttributeId: '', attributeType: '', valueMappings: {} }];
-      setLocalMapping(next);
-      setSelectedMappingIndex(next.length - 1);
+      setEditingRecord({ legacyFeatureIds: [], newAttributeId: '', attributeType: '', valueMappings: {} });
     } else if (category === 'classification') {
       // Generate a unique ID for new classifications to avoid database conflicts
       const uniqueId = `NEW_CLASS_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
@@ -1606,7 +1789,7 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
         refreshValueListFilters();
       }).catch((err: any) => alert(`Failed to add: ${err?.message || String(err)}`));
     } else if (category === 'bom') {
-      const next = [...localBom, { itemId: 'NEW-ITEM', description: 'New Item Description', category: '', productType: '', features: [] }];
+      const next = [...localBom, { itemId: 'NEW-ITEM', description: 'New Item Description', category: '', productType: '', priority: undefined, features: [] }];
       setLocalBom(next);
       setSelectedBomItemId('NEW-ITEM');
     } else if (category === 'users') {
@@ -1626,30 +1809,78 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
     }
 
     if (confirm("Delete this permanent record?")) {
-      if (category === 'mapping') setLocalMapping(localMapping.filter((_, i) => i !== index));
+      if (category === 'mapping') {
+        const deleted = localMapping[index];
+        if (deleted) {
+          if (typeof deleted.id === 'number') {
+            deletedMappingIdsRef.current.add(deleted.id);
+            deletedMappingKeysRef.current.add(mappingNaturalKeyFor(deleted));
+          } else {
+            deletedMappingKeysRef.current.add(mappingNaturalKeyFor(deleted));
+          }
+          // Clear edit pane if the deleted row was selected
+          if (editingRecord && (
+            (typeof deleted.id === 'number' && editingRecord.id === deleted.id) ||
+            mappingNaturalKeyFor(editingRecord) === mappingNaturalKeyFor(deleted)
+          )) {
+            setEditingRecord(null);
+          }
+        }
+        setLocalMapping(localMapping.filter((_, i) => i !== index));
+      }
       if (category === 'classification') setLocalClassification(localClassification.filter((_, i) => i !== index));
-      if (category === 'bom') setLocalBom(localBom.filter((_, i) => i !== index));
+      if (category === 'bom') {
+        const deletedItem = localBom[index];
+        setLocalBom(localBom.filter((_, i) => i !== index));
+        if (deletedItem) {
+          setServerBom(prev => prev.filter(b => b.itemId !== deletedItem.itemId));
+          setServerBomTotal(prev => Math.max(0, prev - 1));
+        }
+      }
       if (category === 'users') setLocalUsers(localUsers.filter((_, i) => i !== index));
     }
   };
 
+  const deleteSingleMappingRecord = async (mapping: GlobalMapping) => {
+    if (!confirm('Delete this permanent record?')) {
+      return;
+    }
+
+    if (typeof mapping.id === 'number') {
+      await dbService.deleteGlobalMapping(mapping.id);
+      setServerMappings(prev => prev.filter(row => row.id !== mapping.id));
+      setLocalMapping(prev => prev.filter(row => row.id !== mapping.id));
+      setServerMappingTotal(prev => Math.max(0, prev - 1));
+      onCountsChanged?.({ mappingTotal: Math.max(0, serverMappingTotal - 1) });
+      if (editingRecord && editingRecord.id === mapping.id) {
+        setEditingRecord(null);
+      }
+      return;
+    }
+
+    setLocalMapping(prev => prev.filter(row => mappingNaturalKeyFor(row) !== mappingNaturalKeyFor(mapping)));
+    if (editingRecord && mappingNaturalKeyFor(editingRecord) === mappingNaturalKeyFor(mapping)) {
+      setEditingRecord(null);
+    }
+  };
+
   // Mapping-specific helper functions to restore "original" functionality
-  const addValueMappingPair = (rowIdx: number) => {
+  const addValueMappingPair = () => {
+    if (!editingRecord) return;
     const key = prompt("Enter Legacy Value name:");
     if (!key) return;
-    const next = [...localMapping];
-    if (next[rowIdx].valueMappings[key]) {
+    if (editingRecord.valueMappings[key] !== undefined) {
       alert("This value pair already exists.");
       return;
     }
-    next[rowIdx].valueMappings[key] = '';
-    setLocalMapping(next);
+    setEditingRecord(markMappingEdited({ ...editingRecord, valueMappings: { ...editingRecord.valueMappings, [key]: '' } }));
   };
 
-  const removeValueMappingPair = (rowIdx: number, key: string) => {
-    const next = [...localMapping];
-    delete next[rowIdx].valueMappings[key];
-    setLocalMapping(next);
+  const removeValueMappingPair = (key: string) => {
+    if (!editingRecord) return;
+    const newVm = { ...editingRecord.valueMappings };
+    delete newVm[key];
+    setEditingRecord(markMappingEdited({ ...editingRecord, valueMappings: newVm }));
   };
 
   return (
@@ -1879,7 +2110,7 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
                     options={availableCategories}
                     onChange={(val) => {
                       setBomCategory(val);
-                      refreshBomFilters(val, bomProductType);
+                      refreshBomFilters(val, bomProductType, bomPriority);
                     }}
                     placeholder="Category..."
                     maxVisibleOptions={10}
@@ -1891,11 +2122,25 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
                     options={availableProductTypes}
                     onChange={(val) => {
                       setBomProductType(val);
-                      refreshBomFilters(bomCategory, val);
+                      refreshBomFilters(bomCategory, val, bomPriority);
                     }}
                     placeholder="Product type..."
                     maxVisibleOptions={10}
                   />
+                </div>
+                <div className="w-28">
+                  <select
+                    value={bomPriority}
+                    onChange={(e) => {
+                      const val = e.target.value === '' ? '' : Number(e.target.value);
+                      setBomPriority(val);
+                      refreshBomFilters(bomCategory, bomProductType, val);
+                    }}
+                    className="w-full text-[9px] font-black text-slate-900 bg-white px-1.5 py-1 rounded-md border border-slate-200 outline-none focus:border-indigo-400 focus:ring-1 focus:ring-indigo-300"
+                  >
+                    <option value="">Priority...</option>
+                    {availablePriorities.map(p => <option key={p} value={p}>{p}</option>)}
+                  </select>
                 </div>
                 <button
                   type="button"
@@ -1907,7 +2152,7 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
                       : 'border-emerald-200 bg-emerald-50 text-emerald-700 hover:bg-emerald-100'
                   }`}
                 >
-                  {isBomSyncing ? 'Syncing…' : 'Sync Items'}
+                  {isBomSyncing ? 'Applying…' : 'Apply Filters'}
                 </button>
               </div>
             )}
@@ -1960,7 +2205,7 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
                         // Debounced server search
                         if (searchTimerRef.current) window.clearTimeout(searchTimerRef.current);
                         searchTimerRef.current = window.setTimeout(() => {
-                          fetchServerPage('bom', 0, { bomSearch: val, bomCategory, bomProductType });
+                          fetchServerPage('bom', 0, { bomSearch: val, bomCategory, bomProductType, bomPriority: bomPriority !== '' ? bomPriority : undefined });
                         }, 400);
                       }}
                       placeholder="Search item or description..."
@@ -2132,24 +2377,30 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
                       </thead>
                       <tbody className="divide-y divide-slate-100">
                         {pagedMapping.map((m, idxOnPage) => {
-                          // Find matching index in localMapping for editing
-                          const globalIdx = localMapping.findIndex(lm =>
-                            lm.newAttributeId === m.newAttributeId &&
-                            JSON.stringify(lm.legacyFeatureIds) === JSON.stringify(m.legacyFeatureIds)
+                          const isSelected = editingRecord != null && (
+                            (typeof m.id === 'number' && editingRecord.id === m.id) ||
+                            mappingNaturalKeyFor(editingRecord) === mappingNaturalKeyFor(m)
                           );
-                          const isSelected = selectedMappingIndex === globalIdx;
                           const legacyLabel = (m.legacyFeatureIds || []).join(' | ') || '—';
                           const targetLabel = m.newAttributeId || 'UNMAPPED';
                           const attrType = normalizeAttributeType((m as any).attributeType);
                           const targetDesc = attributeDescriptions[m.newAttributeId] || '';
                           return (
                             <tr
-                              key={`${targetLabel}-${globalIdx}`}
+                              key={`${mappingKeyFor(m)}-${idxOnPage}`}
                               className={`group cursor-pointer transition-colors ${
                                 isSelected ? 'bg-blue-50/60' : 'hover:bg-slate-50'
                               }`}
                               onClick={() => {
-                                if (globalIdx >= 0) setSelectedMappingIndex(globalIdx);
+                                setEditingRecord({
+                                  ...m,
+                                  _originalId: typeof m.id === 'number' ? m.id : undefined,
+                                  _originalLegacyFeatureIds: [...(m.legacyFeatureIds || [])],
+                                  _originalNewAttributeId: m.newAttributeId || '',
+                                  legacyFeatureIds: [...(m.legacyFeatureIds || [])],
+                                  valueMappings: { ...(m.valueMappings || {}) },
+                                  attributeType: normalizeAttributeType((m as any).attributeType),
+                                });
                               }}
                             >
                               <td className="px-6 py-3 align-top">
@@ -2177,9 +2428,13 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
                               <td className="px-6 py-3 align-top text-center">
                                 <button
                                   type="button"
-                                  onClick={(e) => {
+                                  onClick={async (e) => {
                                     e.stopPropagation();
-                                    if (globalIdx >= 0) deleteRootRow(globalIdx);
+                                    try {
+                                      await deleteSingleMappingRecord(m);
+                                    } catch (err: any) {
+                                      alert(`Delete failed: ${err?.message || String(err)}`);
+                                    }
                                   }}
                                   className="p-1.5 text-slate-300 hover:text-red-500 rounded-md transition-all"
                                 >
@@ -2316,7 +2571,8 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
                           <th className="px-6 py-4 text-[10px] font-black text-slate-400 uppercase tracking-widest">Description</th>
                           <th className="px-6 py-4 text-[10px] font-black text-slate-400 uppercase tracking-widest w-36">Category</th>
                           <th className="px-6 py-4 text-[10px] font-black text-slate-400 uppercase tracking-widest w-36">Product Type</th>
-                          <th className="px-6 py-4 text-[10px] font-black text-slate-400 uppercase tracking-widest w-24 text-center">Session</th>
+                          <th className="px-6 py-4 text-[10px] font-black text-slate-400 uppercase tracking-widest w-20 text-center">Priority</th>
+                          <th className="px-6 py-4 text-[10px] font-black text-slate-400 uppercase tracking-widest w-24 text-center">Status</th>
                           <th className="px-6 py-4 text-[10px] font-black text-slate-400 uppercase tracking-widest w-16 text-center">X</th>
                         </tr>
                       </thead>
@@ -2366,6 +2622,11 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
                                 </p>
                               </td>
                               <td className="px-6 py-3 align-top text-center">
+                                <span className="text-[10px] text-slate-500 font-medium">
+                                  {item.priority != null ? item.priority : <span className="text-slate-300">—</span>}
+                                </span>
+                              </td>
+                              <td className="px-6 py-3 align-top text-center">
                                 {isLockedByMe ? (
                                   <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-emerald-100 text-emerald-700 text-[8px] font-black uppercase tracking-widest">
                                     Signed On
@@ -2374,21 +2635,10 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
                                   <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-amber-100 text-amber-700 text-[8px] font-black uppercase tracking-widest">
                                     Locked
                                   </span>
-                                ) : onSignOnItem ? (
-                                  <button
-                                    type="button"
-                                    onClick={(e) => {
-                                      e.stopPropagation();
-                                      onSignOnItem(item.itemId).catch(() => {
-                                        // errors handled upstream
-                                      });
-                                    }}
-                                    className="px-2 py-0.5 rounded-full bg-indigo-600 text-white text-[8px] font-black uppercase tracking-widest hover:bg-indigo-700"
-                                  >
-                                    Sign On
-                                  </button>
                                 ) : (
-                                  <span className="text-[9px] text-slate-300">—</span>
+                                  <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-slate-100 text-slate-400 text-[8px] font-black uppercase tracking-widest">
+                                    Available
+                                  </span>
                                 )}
                               </td>
                               <td className="px-6 py-3 align-top text-center">
@@ -2399,6 +2649,9 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
                                     const globalIndex = localBom.findIndex(b => b.itemId === item.itemId);
                                     if (globalIndex >= 0) {
                                       deleteRootRow(globalIndex);
+                                    } else if (confirm('Delete this permanent record?')) {
+                                      setServerBom(prev => prev.filter(b => b.itemId !== item.itemId));
+                                      setServerBomTotal(prev => Math.max(0, prev - 1));
                                     }
                                   }}
                                   className="p-1.5 text-slate-300 hover:text-red-500 rounded-md transition-all"
@@ -2493,7 +2746,7 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
                   onClick={() => {
                     const prev = Math.max(0, page - 1);
                     setPage(prev);
-                    fetchServerPage('bom', prev, { bomSearch, bomCategory, bomProductType });
+                    fetchServerPage('bom', prev, { bomSearch, bomCategory, bomProductType, bomPriority: bomPriority !== '' ? bomPriority : undefined });
                   }}
                   className={`px-2 py-1 rounded border text-[9px] font-black uppercase tracking-widest ${
                     page === 0 || isServerLoading
@@ -2512,7 +2765,7 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
                   onClick={() => {
                     const next = page + 1;
                     setPage(next);
-                    fetchServerPage('bom', next, { bomSearch, bomCategory, bomProductType });
+                    fetchServerPage('bom', next, { bomSearch, bomCategory, bomProductType, bomPriority: bomPriority !== '' ? bomPriority : undefined });
                   }}
                   className={`px-2 py-1 rounded border text-[9px] font-black uppercase tracking-widest ${
                     (page + 1) * PAGE_SIZE_BOM >= serverBomTotal || isServerLoading
@@ -2748,7 +3001,7 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
           )}
         </div>
 
-        {category === 'mapping' && selectedMapping && (
+        {category === 'mapping' && editingRecord && (
           <div className="px-6 pb-4 pt-1 bg-slate-50/40 border-t border-slate-100">
             <div className="max-w-5xl mx-auto bg-white rounded-xl border border-slate-200 shadow-sm p-4 mt-3">
               <div className="flex items-center justify-between mb-3">
@@ -2757,12 +3010,12 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
                     Selected Mapping Detail
                   </p>
                   <p className="text-xs font-black text-slate-900 truncate">
-                    {(selectedMapping.legacyFeatureIds || []).join(' | ') || 'New Mapping'}
+                    {(editingRecord.legacyFeatureIds || []).join(' | ') || 'New Mapping'}
                   </p>
                 </div>
                 <button
                   type="button"
-                  onClick={() => setSelectedMappingIndex(null)}
+                  onClick={() => setEditingRecord(null)}
                   className="p-1.5 rounded-md text-slate-300 hover:text-slate-600 hover:bg-slate-50 transition-all"
                   title="Close mapping detail"
                 >
@@ -2778,18 +3031,15 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
                     Legacy Features
                   </label>
                   <input
-                    value={(selectedMapping.legacyFeatureIds || []).join('|')}
+                    value={(editingRecord.legacyFeatureIds || []).join('|')}
                     onChange={(e) => {
-                      if (selectedMappingIndex == null) return;
-                      const next = [...localMapping];
-                      next[selectedMappingIndex] = {
-                        ...next[selectedMappingIndex],
+                      setEditingRecord(prev => markMappingEdited({
+                        ...prev!,
                         legacyFeatureIds: e.target.value
                           .split('|')
                           .map(s => s.trim())
                           .filter(Boolean),
-                      };
-                      setLocalMapping(next);
+                      }));
                     }}
                     placeholder="e.g. FRM_MAT|FRAME_SPEC"
                     className="w-full p-2 text-[10px] bg-slate-50 border border-slate-200 rounded-md font-bold text-slate-900 outline-none focus:border-indigo-400"
@@ -2800,15 +3050,9 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
                     Target ERP Attribute
                   </label>
                   <input
-                    value={selectedMapping.newAttributeId}
+                    value={editingRecord.newAttributeId}
                     onChange={(e) => {
-                      if (selectedMappingIndex == null) return;
-                      const next = [...localMapping];
-                      next[selectedMappingIndex] = {
-                        ...next[selectedMappingIndex],
-                        newAttributeId: e.target.value,
-                      };
-                      setLocalMapping(next);
+                      setEditingRecord(prev => markMappingEdited({ ...prev!, newAttributeId: e.target.value }));
                     }}
                     placeholder="e.g. MAT_COMP"
                     className="w-full p-2 text-[10px] bg-indigo-50 text-indigo-700 border border-indigo-100 rounded-md font-black outline-none focus:border-indigo-400"
@@ -2819,16 +3063,10 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
                     Attribute Type
                   </label>
                   <select
-                    value={normalizeAttributeType((selectedMapping as any).attributeType)}
+                    value={normalizeAttributeType((editingRecord as any).attributeType)}
                     onChange={(e) => {
-                      if (selectedMappingIndex == null) return;
                       const nextType = normalizeAttributeType(e.target.value);
-                      const next = [...localMapping];
-                      next[selectedMappingIndex] = {
-                        ...next[selectedMappingIndex],
-                        attributeType: nextType,
-                      };
-                      setLocalMapping(next);
+                      setEditingRecord(prev => markMappingEdited({ ...prev!, attributeType: nextType }));
                       if (nextType && !availableAttributeTypes.includes(nextType)) {
                         setAvailableAttributeTypes(prev => [...prev, nextType]);
                         setIncludedAttributeTypes(prev => [...prev, nextType]);
@@ -2869,10 +3107,10 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
                         Clear
                       </button>
                     )}
-                    {selectedMappingIndex != null && (
+                    {editingRecord != null && (
                       <button
                         type="button"
-                        onClick={() => addValueMappingPair(selectedMappingIndex)}
+                        onClick={() => addValueMappingPair()}
                         className="px-2 py-1 border border-dashed border-slate-300 rounded-md text-[8px] font-black text-slate-500 hover:text-indigo-600 hover:border-indigo-300 uppercase tracking-widest flex items-center gap-1 shrink-0"
                         title="Add custom legacy value"
                       >
@@ -2886,7 +3124,7 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
                 </div>
 
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 max-h-64 overflow-y-auto pr-1">
-                  {Object.entries(selectedMapping.valueMappings || {})
+                  {Object.entries(editingRecord.valueMappings || {})
                     .filter(([k]) => {
                       if (!legacyValueFilter.trim()) return true;
                       return k.toLowerCase().includes(legacyValueFilter.toLowerCase());
@@ -2910,24 +3148,18 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
                       <input
                         value={v}
                         onChange={(e) => {
-                          if (selectedMappingIndex == null) return;
-                          const next = [...localMapping];
-                          next[selectedMappingIndex] = {
-                            ...next[selectedMappingIndex],
-                            valueMappings: {
-                              ...next[selectedMappingIndex].valueMappings,
-                              [k]: e.target.value,
-                            },
-                          };
-                          setLocalMapping(next);
+                          setEditingRecord(prev => markMappingEdited({
+                            ...prev!,
+                            valueMappings: { ...prev!.valueMappings, [k]: e.target.value },
+                          }));
                         }}
                         placeholder="Target Value"
                         className="flex-1 text-[9px] font-black text-indigo-600 bg-white px-1.5 py-1 rounded-md border border-indigo-100 outline-none focus:ring-1 focus:ring-indigo-400"
                       />
-                      {selectedMappingIndex != null && (
+                      {editingRecord != null && (
                         <button
                           type="button"
-                          onClick={() => removeValueMappingPair(selectedMappingIndex, k)}
+                          onClick={() => removeValueMappingPair(k)}
                           className="absolute -top-1.5 -right-1.5 opacity-0 group-hover/pair:opacity-100 w-4 h-4 bg-red-500 text-white rounded-full flex items-center justify-center shadow-sm transition-all hover:scale-110"
                         >
                           <svg className="w-2.5 h-2.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -3120,9 +3352,31 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
                 </div>
                 <div className="md:col-span-1">
                   <label className="text-[8px] font-black text-slate-400 uppercase tracking-widest mb-1 block">
-                    Part Description
+                    Priority
                   </label>
-                  <textarea
+                  <input
+                    type="number"
+                    min={1}
+                    value={selectedBomItem.priority ?? ''}
+                    onChange={(e) => {
+                      const idx = localBom.findIndex(i => i.itemId === selectedBomItem.itemId);
+                      if (idx === -1) return;
+                      const next = [...localBom];
+                      const val = e.target.value.trim();
+                      next[idx] = { ...next[idx], priority: val ? parseInt(val, 10) : undefined };
+                      setLocalBom(next);
+                    }}
+                    className="w-full p-2 text-[10px] bg-white border border-slate-200 rounded-md font-medium text-slate-700 outline-none focus:border-indigo-400"
+                    placeholder="Priority (1, 2, 3...)"
+                  />
+                </div>
+              </div>
+
+              <div className="mb-4">
+                <label className="text-[8px] font-black text-slate-400 uppercase tracking-widest mb-1 block">
+                  Part Description
+                </label>
+                <textarea
                     value={selectedBomItem.description}
                     onChange={(e) => {
                       const idx = localBom.findIndex(i => i.itemId === selectedBomItem.itemId);
@@ -3134,7 +3388,6 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
                     className="w-full p-2 text-[10px] bg-white border border-slate-200 rounded-md font-medium text-slate-700 h-16 resize-none outline-none focus:border-indigo-400"
                     placeholder="Part Description"
                   />
-                </div>
               </div>
 
               <div>
@@ -3227,6 +3480,26 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
                             </svg>
                           </button>
                         </div>
+                        <input
+                          value={feat.condition || ''}
+                          onChange={(e) => {
+                            const next = [...localBom];
+                            next[parentIdx].features[fIdx].condition = e.target.value;
+                            setLocalBom(next);
+                          }}
+                          placeholder="Condition"
+                          className="w-full text-[8px] text-slate-400 font-bold bg-transparent outline-none focus:text-slate-600 mb-1"
+                        />
+                        <input
+                          value={feat.formula || ''}
+                          onChange={(e) => {
+                            const next = [...localBom];
+                            next[parentIdx].features[fIdx].formula = e.target.value;
+                            setLocalBom(next);
+                          }}
+                          placeholder="Formula"
+                          className="w-full text-[8px] text-purple-400 font-bold bg-transparent outline-none focus:text-purple-600 mb-1"
+                        />
                         <input
                           value={feat.values.join(', ')}
                           onChange={(e) => {

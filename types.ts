@@ -14,6 +14,8 @@ export interface LegacyFeature {
   description: string;
   values: string[];
   unit?: string;
+  condition?: string;
+  formula?: string;
   // Optional per-value descriptions, keyed by raw value
   valueDescriptions?: Record<string, string>;
 }
@@ -23,6 +25,7 @@ export interface LegacyItem {
   description: string;
   category?: string;
   productType?: string;
+  priority?: number;
   features: LegacyFeature[];
 }
 
@@ -65,6 +68,11 @@ export interface MappingTypeConfig {
 }
 
 export interface GlobalMapping {
+  id?: number;
+  _originalId?: number;
+  _originalLegacyFeatureIds?: string[];
+  _originalNewAttributeId?: string;
+  _clientEditedAt?: number;
   legacyFeatureIds: string[];
   newAttributeId: string;
   valueMappings: Record<string, string>;
@@ -115,11 +123,14 @@ export interface WorkspaceMappingRow {
   newAttributeId: string;
   newValue: string;
   attributeType?: string;
+  condition?: string;
+  formula?: string;
   mappedFrom?: string;
   signedOnByUserId?: string | null;
   signedOnByUsername?: string | null;
   signedOnAt?: number | null;
   updatedAt?: number | null;
+  allGlobalTargets?: string[];
 }
 
 export interface MappingGenerationProgress {
@@ -138,4 +149,18 @@ export interface MappingGenerationProgress {
   finishedAt?: number | null;
   updatedAt?: number | null;
   error?: string | null;
+}
+
+export interface BomHierarchyItem {
+  id?: number;
+  level?: number;
+  parentBom?: string;
+  itemId: string;
+  description?: string;
+  qty?: number;
+  unit?: string;
+  condition?: string;
+  formula?: string;
+  createdAt?: number;
+  createdBy?: string;
 }

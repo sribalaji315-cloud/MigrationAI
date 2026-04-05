@@ -30,8 +30,35 @@ export const splitCsvLine = (line: string): string[] => {
   return result;
 };
 
+/** Reassemble physical lines into logical CSV rows, respecting quoted newlines. */
+const assembleLogicalLines = (text: string): string[] => {
+  const physicalLines = text.split(/\r?\n/);
+  const logical: string[] = [];
+  let buffer = '';
+  let insideQuotes = false;
+
+  for (const line of physicalLines) {
+    if (buffer) {
+      buffer += '\n' + line;
+    } else {
+      buffer = line;
+    }
+    // Count unescaped quotes to determine if we're still inside a quoted field
+    for (let i = 0; i < line.length; i++) {
+      if (line[i] === '"') insideQuotes = !insideQuotes;
+    }
+    if (!insideQuotes) {
+      if (buffer.trim().length > 0) logical.push(buffer);
+      buffer = '';
+    }
+  }
+  // flush last buffer
+  if (buffer.trim().length > 0) logical.push(buffer);
+  return logical;
+};
+
 export const parseCsv = (text: string): { [key: string]: string }[] => {
-  const rawLines = text.split(/\r?\n/).filter(l => l.trim().length > 0);
+  const rawLines = assembleLogicalLines(text);
   if (!rawLines.length) return [];
 
   const headers = splitCsvLine(rawLines[0]).map(h => h.trim());

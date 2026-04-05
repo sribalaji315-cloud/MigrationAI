@@ -480,6 +480,10 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
     return exact; // may be '' or undefined
   };
 
+  const hasResolvedValueMapping = (resolvedValue: string | undefined): boolean => {
+    return typeof resolvedValue === 'string' && resolvedValue.trim() !== '';
+  };
+
   const includedMappingTypeSet = useMemo(() => {
     const available = (mappingTypeConfig?.availableTypes || []).map(normalizeMappingType).filter(Boolean);
     const included = (mappingTypeConfig?.includedTypes || []).map(normalizeMappingType).filter(Boolean);
@@ -814,7 +818,7 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
 
       f.values.forEach(v => {
         const resolved = resolveValueMapping(effectiveMapping?.valueMappings, v);
-        const isValueMapped = selectedAttribute !== 'UNMAPPED' && resolved !== undefined;
+        const isValueMapped = selectedAttribute !== 'UNMAPPED' && hasResolvedValueMapping(resolved);
         if (!isValueMapped) {
           valueCount += 1;
         }
@@ -1066,6 +1070,13 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
                    {isGenerationBlocked ? 'Mapping generation in progress - editing temporarily disabled' : isLockedByMe ? (isDirty ? 'Unsaved overrides detected' : 'Synchronized with defaults') : lockOwner ? 'Wait for release to modify' : 'Sign on to enable edits'}
                 </p>
              </div>
+             {item && (
+               <div className={`ml-4 flex items-center gap-3 text-[9px] font-bold ${isLockedByMe || lockOwner ? 'text-white/70' : 'text-slate-500'}`}>
+                 <span className="border-l border-current/20 pl-3">{item.itemId}</span>
+                 {item.category && <span className="border-l border-current/20 pl-3">{item.category}</span>}
+                 {item.productType && <span className="border-l border-current/20 pl-3">{item.productType}</span>}
+               </div>
+             )}
           </div>
           
           <div className="flex items-center gap-3">
@@ -1421,7 +1432,7 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
               }
             }
             const featureHasUnmappedAttribute = selectedAttribute === 'UNMAPPED';
-            const featureHasUnmappedValues = f.values.some(v => resolveValueMapping(effectiveMapping?.valueMappings, v) === undefined);
+            const featureHasUnmappedValues = f.values.some(v => !hasResolvedValueMapping(resolveValueMapping(effectiveMapping?.valueMappings, v)));
 
             if (showUnmappedOnly && !featureHasUnmappedAttribute && !featureHasUnmappedValues) {
               return null;
@@ -1477,6 +1488,15 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
                       <div>
                         <p className={`text-sm font-black leading-tight ${attributeTone === 'mapped' ? 'text-emerald-900' : attributeTone === 'notRequired' ? 'text-amber-900' : 'text-rose-900'}`}>{f.featureId}</p>
                         <p className="text-[9px] text-slate-400 font-bold uppercase tracking-wider mt-0.5">{f.description}</p>
+                        {f.condition && (
+                          <p className="text-[8px] text-indigo-500 font-bold mt-0.5" title="Condition">{f.condition}</p>
+                        )}
+                        {f.formula && (
+                          <p className="text-[8px] text-purple-500 font-bold mt-0.5" title="Formula">{f.formula}</p>
+                        )}
+                        {f.formula && (
+                          <p className="text-[8px] text-purple-500 font-bold mt-0.5" title="Formula">{f.formula}</p>
+                        )}
                       </div>
                     </div>
 
@@ -1524,7 +1544,7 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
                     <div className="mt-4 space-y-2">
                       {f.values.map((v, vidx) => {
                         const resolvedVal = resolveValueMapping(effectiveMapping?.valueMappings, v);
-                        const isValueMapped = selectedAttribute !== 'UNMAPPED' && resolvedVal !== undefined;
+                        const isValueMapped = selectedAttribute !== 'UNMAPPED' && hasResolvedValueMapping(resolvedVal);
                         const mappedValue = isValueMapped ? resolvedVal! : '';
                         const valueTone: Tone = attributeTone === 'notRequired'
                           ? 'notRequired'

@@ -4,6 +4,7 @@ import { dbService, DashboardMetricsResponse, DashboardItemMetrics } from '../se
 interface MappingDashboardProps {
   categories: string[];
   productLines: string[];
+  priorities: number[];
   onClose: () => void;
 }
 
@@ -65,9 +66,10 @@ const DonutStat: React.FC<DonutStatProps> = ({ label, value, primaryColor, secon
   );
 };
 
-const MappingDashboard: React.FC<MappingDashboardProps> = ({ categories, productLines, onClose }) => {
+const MappingDashboard: React.FC<MappingDashboardProps> = ({ categories, productLines, priorities, onClose }) => {
   const [selectedCategory, setSelectedCategory] = useState(SELECT_ALL);
   const [selectedProductLine, setSelectedProductLine] = useState(SELECT_ALL);
+  const [selectedPriority, setSelectedPriority] = useState(SELECT_ALL);
   const [itemFilter, setItemFilter] = useState('');
   const [includeExcluded, setIncludeExcluded] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
@@ -110,7 +112,8 @@ const MappingDashboard: React.FC<MappingDashboardProps> = ({ categories, product
     try {
       const category = selectedCategory === SELECT_ALL ? undefined : selectedCategory;
       const productLine = selectedProductLine === SELECT_ALL ? undefined : selectedProductLine;
-      const response = await dbService.fetchDashboardMetrics({ category, productLine, includeExcluded, forceRecompute });
+      const priority = selectedPriority === SELECT_ALL ? undefined : parseInt(selectedPriority, 10);
+      const response = await dbService.fetchDashboardMetrics({ category, productLine, priority, includeExcluded, forceRecompute });
       timers.forEach(clearTimeout);
       setProgress(100);
       setProgressPhase('Done');
@@ -143,7 +146,8 @@ const MappingDashboard: React.FC<MappingDashboardProps> = ({ categories, product
     try {
       const category = selectedCategory === SELECT_ALL ? undefined : selectedCategory;
       const productLine = selectedProductLine === SELECT_ALL ? undefined : selectedProductLine;
-      const response = await dbService.fetchDashboardMetrics({ category, productLine, includeExcluded: next });
+      const priority = selectedPriority === SELECT_ALL ? undefined : parseInt(selectedPriority, 10);
+      const response = await dbService.fetchDashboardMetrics({ category, productLine, priority, includeExcluded: next });
       timers.forEach(clearTimeout);
       setProgress(100);
       setProgressPhase('Done');
@@ -185,7 +189,7 @@ const MappingDashboard: React.FC<MappingDashboardProps> = ({ categories, product
         </header>
 
         <div className="px-6 py-4 bg-white border-b border-slate-200">
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-3 items-end">
+          <div className="grid grid-cols-1 md:grid-cols-4 gap-3 items-end">
             <div>
               <label className="block text-[9px] font-black text-slate-400 uppercase tracking-widest mb-1">Category</label>
               <select
@@ -212,6 +216,20 @@ const MappingDashboard: React.FC<MappingDashboardProps> = ({ categories, product
                 <option value={SELECT_ALL}>All Product Lines</option>
                 {productLines.map((value) => (
                   <option key={value} value={value}>{value}</option>
+                ))}
+              </select>
+            </div>
+
+            <div>
+              <label className="block text-[9px] font-black text-slate-400 uppercase tracking-widest mb-1">Priority</label>
+              <select
+                value={selectedPriority}
+                onChange={(e) => setSelectedPriority(e.target.value)}
+                className="w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs text-slate-700 font-semibold focus:outline-none focus:ring-2 focus:ring-indigo-300"
+              >
+                <option value={SELECT_ALL}>All Priorities</option>
+                {priorities.map((value) => (
+                  <option key={value} value={String(value)}>Priority {value}</option>
                 ))}
               </select>
             </div>

@@ -40,6 +40,7 @@ class BomItem(Base):
     description = Column(String, nullable=True)
     category = Column(String, index=True, nullable=True)
     product_type = Column(String, index=True, nullable=True)
+    priority = Column(Integer, index=True, nullable=True)
 
     features = relationship("BomFeature", back_populates="item", cascade="all, delete-orphan")
 
@@ -57,6 +58,8 @@ class BomFeature(Base):
     feature_id = Column(String, index=True, nullable=False)
     description = Column(String, nullable=True)
     unit = Column(String, nullable=True)
+    condition = Column(String, nullable=True)
+    formula = Column(String, nullable=True)
     values = Column("values_json", JSON, nullable=True)
 
     item = relationship("BomItem", back_populates="features")
@@ -110,6 +113,8 @@ class WorkspaceMapping(Base):
     new_attribute_id = Column(String, nullable=False)
     new_value = Column(String, nullable=False, default="")
     attribute_type = Column(String, nullable=False, default="")
+    condition = Column(String, nullable=True)
+    formula = Column(String, nullable=True)
     mapped_from = Column(String, nullable=False, default="global")
     signed_on_by_user_id = Column(String, index=True, nullable=True)
     signed_on_by_username = Column(String, nullable=True)
@@ -182,6 +187,24 @@ class TokenBlacklist(Base):
     id = Column(Integer, primary_key=True, index=True)
     jti = Column(String, unique=True, nullable=False, index=True)
     expires_at = Column(Float, nullable=False)
+
+
+class BomHierarchy(Base):
+    """BOM hierarchy rows uploaded via CSV."""
+
+    __tablename__ = "bom_hierarchy"
+
+    id = Column(Integer, primary_key=True, index=True)
+    level = Column(Integer, nullable=True)
+    parent_bom = Column(String, index=True, nullable=True)
+    item_id = Column(String, index=True, nullable=False)
+    description = Column(String, nullable=True)
+    qty = Column(Float, nullable=True)
+    unit = Column(String, nullable=True)
+    condition = Column(String, nullable=True)
+    formula = Column(String, nullable=True)
+    created_at = Column(Float, nullable=True)
+    created_by = Column(String, nullable=True)
 
 
 class AuditLog(Base):

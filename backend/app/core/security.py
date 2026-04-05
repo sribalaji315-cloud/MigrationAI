@@ -6,6 +6,7 @@ from typing import Optional
 from fastapi import Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer
 from jose import jwt, JWTError
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from .config import settings
@@ -64,8 +65,11 @@ def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(
     return user
 
 
-def blacklist_token(token: str, db: Session):
-    """Add a token's jti to the blacklist so it can no longer be used."""
+def blacklist_token(token: str, db: Session) -> bool:
+    """Add a token's jti to the blacklist so it can no longer be used.
+
+    Returns True if the token was newly blacklisted, False if it was already
+    blacklisted (duplicate). Raises nothing on race conditions."""
     try:
         payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[ALGORITHM])
         jti = payload.get("jti")
@@ -73,9 +77,14 @@ def blacklist_token(token: str, db: Session):
         if jti:
             entry = models.TokenBlacklist(jti=jti, expires_at=float(exp))
             db.add(entry)
-            db.commit()
+            try:
+                db.commit()
+            except IntegrityError:
+                db.rollback()
+                return False
     except JWTError:
         pass
+    return True
 
 
 def cleanup_expired_blacklist(db: Session):

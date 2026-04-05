@@ -102,7 +102,9 @@ def refresh_token(body: dict, db: Session = Depends(get_db)):
         raise HTTPException(status_code=401, detail="User not found")
 
     # Blacklist the old refresh token (rotation — each refresh token is single-use)
-    blacklist_token(refresh, db)
+    if not blacklist_token(refresh, db):
+        # Another concurrent request already consumed this refresh token
+        raise HTTPException(status_code=401, detail="Refresh token already used")
 
     # Issue new pair
     access_token_expires = timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)

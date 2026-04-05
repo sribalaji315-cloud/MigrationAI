@@ -1,9 +1,12 @@
 
-import { GlobalMapping, DatabaseState, User, ConnectionMode, NewAttribute, WorkspaceMappingRow, MappingGenerationProgress, ValueListGroup, ValueListRow, NewClassification } from '../types';
+import { GlobalMapping, DatabaseState, User, ConnectionMode, NewAttribute, WorkspaceMappingRow, MappingGenerationProgress, ValueListGroup, ValueListRow, NewClassification, BomHierarchyItem } from '../types';
 
 export interface SaveAllResult {
   mode: ConnectionMode;
   mappingGenerationJobId?: number | null;
+  mappingsReceived?: number;
+  globalMappingsInserted?: number;
+  globalMappingsTotal?: number;
 }
 
 export interface DashboardItemMetrics {
@@ -263,9 +266,12 @@ export const dbService = {
     category?: string;
     productType?: string;
     userId?: string;
+    search?: string;
+    priority?: number;
+    unmappedOnly?: boolean;
     limit?: number;
     offset?: number;
-  }): Promise<{ items: DatabaseState['bom']; signedOnCount: number }> {
+  }): Promise<{ items: DatabaseState['bom']; signedOnCount: number; totalCount: number }> {
     if (!SQL_ENDPOINT) {
       throw new Error('Database connection not available.');
     }
@@ -273,6 +279,9 @@ export const dbService = {
     if (options?.category) params.set('category', options.category);
     if (options?.productType) params.set('productType', options.productType);
     if (options?.userId) params.set('userId', options.userId);
+    if (options?.search) params.set('search', options.search);
+    if (options?.priority != null) params.set('priority', String(options.priority));
+    if (options?.unmappedOnly) params.set('unmappedOnly', 'true');
     if (options?.limit != null) params.set('limit', String(options.limit));
     if (options?.offset != null) params.set('offset', String(options.offset));
     const query = params.toString();
@@ -305,13 +314,14 @@ export const dbService = {
     };
   },
 
-  async fetchBomFilters(options?: { category?: string; productType?: string }): Promise<{ categories: string[]; productTypes: string[] }> {
+  async fetchBomFilters(options?: { category?: string; productType?: string; priority?: number }): Promise<{ categories: string[]; productTypes: string[]; priorities: number[] }> {
     if (!SQL_ENDPOINT) {
       throw new Error('Database connection not available.');
     }
     const params = new URLSearchParams();
     if (options?.category) params.set('category', options.category);
     if (options?.productType) params.set('productType', options.productType);
+    if (options?.priority != null) params.set('priority', String(options.priority));
     const query = params.toString();
     return this._cachedFetch(`${SQL_ENDPOINT}/bom/filters${query ? `?${query}` : ''}`, { headers: this._authHeaders() });
   },
@@ -333,7 +343,7 @@ export const dbService = {
     return resp.json();
   },
 
-  async fetchBomItems(category?: string, productType?: string, options?: { limit?: number; offset?: number; search?: string }): Promise<DatabaseState['bom']> {
+  async fetchBomItems(category?: string, productType?: string, options?: { limit?: number; offset?: number; search?: string; priority?: number; unmappedOnly?: boolean }): Promise<DatabaseState['bom']> {
     if (!SQL_ENDPOINT) {
       throw new Error('Database connection not available.');
     }
@@ -343,11 +353,13 @@ export const dbService = {
     if (options?.limit) params.set('limit', String(options.limit));
     if (options?.offset) params.set('offset', String(options.offset));
     if (options?.search) params.set('search', options.search);
+    if (options?.priority != null) params.set('priority', String(options.priority));
+    if (options?.unmappedOnly) params.set('unmappedOnly', 'true');
     const query = params.toString();
     return this._cachedFetch(`${SQL_ENDPOINT}/bom/items${query ? `?${query}` : ''}`, { headers: this._authHeaders(), _ttlMs: 15000 });
   },
 
-  async fetchBomCount(category?: string, productType?: string, search?: string): Promise<number> {
+  async fetchBomCount(category?: string, productType?: string, search?: string, priority?: number, unmappedOnly?: boolean): Promise<number> {
     if (!SQL_ENDPOINT) {
       throw new Error('Database connection not available.');
     }
@@ -355,6 +367,8 @@ export const dbService = {
     if (category) params.set('category', category);
     if (productType) params.set('productType', productType);
     if (search) params.set('search', search);
+    if (priority != null) params.set('priority', String(priority));
+    if (unmappedOnly) params.set('unmappedOnly', 'true');
     const query = params.toString();
     const data = await this._cachedFetch(`${SQL_ENDPOINT}/bom/count${query ? `?${query}` : ''}`, { headers: this._authHeaders() });
     return data?.total ?? 0;
@@ -370,6 +384,39 @@ export const dbService = {
     if (options?.search) params.set('search', options.search);
     const query = params.toString();
     return this._cachedFetch(`${SQL_ENDPOINT}/global-mappings${query ? `?${query}` : ''}`, { headers: this._authHeaders() });
+  },
+
+  async upsertGlobalMapping(record: GlobalMapping): Promise<{ ok: boolean; item: GlobalMapping; globalMappingsTotal: number }> {
+    if (!SQL_ENDPOINT) {
+      throw new Error('Database connection not available.');
+    }
+    const resp = await fetch(`${SQL_ENDPOINT}/global-mappings/upsert`, {
+      method: 'POST',
+      headers: { ...this._authHeaders(), 'Content-Type': 'application/json' },
+      body: JSON.stringify(record),
+    });
+    if (!resp.ok) {
+      const errText = await resp.text();
+      throw new Error(`Failed to save global mapping: ${resp.status} ${errText}`);
+    }
+    this._invalidateCache();
+    return resp.json();
+  },
+
+  async deleteGlobalMapping(id: number): Promise<{ ok: boolean; deletedId: number; globalMappingsTotal: number }> {
+    if (!SQL_ENDPOINT) {
+      throw new Error('Database connection not available.');
+    }
+    const resp = await fetch(`${SQL_ENDPOINT}/global-mappings/${id}`, {
+      method: 'DELETE',
+      headers: this._authHeaders(),
+    });
+    if (!resp.ok) {
+      const errText = await resp.text();
+      throw new Error(`Failed to delete global mapping: ${resp.status} ${errText}`);
+    }
+    this._invalidateCache();
+    return resp.json();
   },
 
   async fetchClassificationsPaginated(options?: { limit?: number; offset?: number; search?: string }): Promise<{ items: NewClassification[]; total: number }> {
@@ -456,24 +503,32 @@ export const dbService = {
     return resp.json();
   },
 
-  async fetchDashboardMetrics(options?: { category?: string; productLine?: string; includeExcluded?: boolean; forceRecompute?: boolean }): Promise<DashboardMetricsResponse> {
+  async fetchDashboardMetrics(options?: { category?: string; productLine?: string; priority?: number; includeExcluded?: boolean; forceRecompute?: boolean }): Promise<DashboardMetricsResponse> {
     if (!SQL_ENDPOINT) {
       throw new Error('Database connection not available.');
     }
     const params = new URLSearchParams();
     if (options?.category) params.set('category', options.category);
     if (options?.productLine) params.set('productLine', options.productLine);
+    if (options?.priority != null) params.set('priority', String(options.priority));
     if (options?.includeExcluded) params.set('includeExcluded', 'true');
     if (options?.forceRecompute) params.set('forceRecompute', 'true');
     const query = params.toString();
-    return this._cachedFetch(`${SQL_ENDPOINT}/dashboard/metrics${query ? `?${query}` : ''}`, { headers: this._authHeaders(), _timeoutMs: 120000 });
+    return this._cachedFetch(`${SQL_ENDPOINT}/dashboard/metrics${query ? `?${query}` : ''}`, {
+      headers: this._authHeaders(),
+      _timeoutMs: 120000,
+      _ttlMs: 0,
+    });
   },
 
   async fetchItemStatuses(): Promise<Record<string, 'mapped' | 'unmapped' | 'notRequired'>> {
     if (!SQL_ENDPOINT) {
       throw new Error('Database connection not available.');
     }
-    const data = await this._cachedFetch(`${SQL_ENDPOINT}/item-statuses`, { headers: this._authHeaders() });
+    const data = await this._cachedFetch(`${SQL_ENDPOINT}/item-statuses`, {
+      headers: this._authHeaders(),
+      _ttlMs: 0,
+    });
     return data?.statuses || {};
   },
 
@@ -581,12 +636,23 @@ export const dbService = {
     const mappingGenerationJobId = typeof syncResult?.mappingGenerationJobId === 'number'
       ? syncResult.mappingGenerationJobId
       : null;
+    const mappingsReceived = typeof syncResult?.mappingsReceived === 'number'
+      ? syncResult.mappingsReceived
+      : undefined;
+    const globalMappingsInserted = typeof syncResult?.globalMappingsInserted === 'number'
+      ? syncResult.globalMappingsInserted
+      : undefined;
+    const globalMappingsTotal = typeof syncResult?.globalMappingsTotal === 'number'
+      ? syncResult.globalMappingsTotal
+      : undefined;
 
     // After syncing the generic state, push classification list separately
-    // but only when the current user is an administrator. Non-admin users
-    // should still be able to save BOM and mappings without hitting the
-    // admin-only classifications endpoint.
-    if (userRole === 'admin') {
+    // but only when the current user is an administrator AND classifications
+    // were explicitly included in the payload (i.e. the caller is saving
+    // classification data). When saving other categories (mapping, bom, etc.)
+    // classifications are omitted from `data` to avoid overwriting the full
+    // table with a partial page of 20 records.
+    if (userRole === 'admin' && data.classifications !== undefined) {
       try {
         console.log('Sending classifications to bulk endpoint:', data.classifications);
         const clsResp = await fetch(`${SQL_ENDPOINT}/classifications/bulk`, {
@@ -597,7 +663,13 @@ export const dbService = {
         
         if (clsResp.status === 403) {
           alert('Only administrators are allowed to modify shared classifications.');
-          return { mode: 'REMOTE_SQL', mappingGenerationJobId };
+          return {
+            mode: 'REMOTE_SQL',
+            mappingGenerationJobId,
+            mappingsReceived,
+            globalMappingsInserted,
+            globalMappingsTotal,
+          };
         }
         
         if (!clsResp.ok) {
@@ -616,7 +688,13 @@ export const dbService = {
     }
     
     this._invalidateCache();
-    return { mode: 'REMOTE_SQL', mappingGenerationJobId };
+    return {
+      mode: 'REMOTE_SQL',
+      mappingGenerationJobId,
+      mappingsReceived,
+      globalMappingsInserted,
+      globalMappingsTotal,
+    };
   },
 
   async acquireLock(itemId: string, userId: string, userName: string): Promise<{ acquired: boolean; reason?: string }> {
@@ -775,5 +853,72 @@ export const dbService = {
       throw new Error(`Failed to save value lists: ${resp.status} ${errText}`);
     }
     return resp.json();
+  },
+
+  // --- BOM Hierarchy ---
+
+  async fetchBomHierarchy(limit = 500, offset = 0): Promise<{ items: BomHierarchyItem[]; total: number }> {
+    if (!SQL_ENDPOINT) throw new Error('Database connection not available.');
+    return this._cachedFetch(
+      `${SQL_ENDPOINT}/bom/hierarchy?limit=${limit}&offset=${offset}`,
+      { headers: this._authHeaders(), _ttlMs: 15000 },
+    );
+  },
+
+  async saveBomHierarchy(items: BomHierarchyItem[]): Promise<{ ok: boolean; rowsInserted: number }> {
+    if (!SQL_ENDPOINT) throw new Error('Database connection not available.');
+    const resp = await fetch(`${SQL_ENDPOINT}/bom/hierarchy`, {
+      method: 'POST',
+      headers: { ...this._authHeaders(), 'Content-Type': 'application/json' },
+      body: JSON.stringify(items),
+    });
+    if (!resp.ok) {
+      const errText = await resp.text();
+      throw new Error(`Failed to save BOM hierarchy: ${resp.status} ${errText}`);
+    }
+    this._invalidateCache();
+    return resp.json();
+  },
+
+  async deleteBomHierarchy(): Promise<{ ok: boolean }> {
+    if (!SQL_ENDPOINT) throw new Error('Database connection not available.');
+    const resp = await fetch(`${SQL_ENDPOINT}/bom/hierarchy`, {
+      method: 'DELETE',
+      headers: this._authHeaders(),
+    });
+    if (!resp.ok) {
+      const errText = await resp.text();
+      throw new Error(`Failed to delete BOM hierarchy: ${resp.status} ${errText}`);
+    }
+    this._invalidateCache();
+    return resp.json();
+  },
+
+  async fetchHierarchyRoots(): Promise<{ roots: string[]; allBomNodes: string[] }> {
+    if (!SQL_ENDPOINT) throw new Error('Database connection not available.');
+    return this._cachedFetch(
+      `${SQL_ENDPOINT}/bom/hierarchy/roots`,
+      { headers: this._authHeaders(), _ttlMs: 15000 },
+    );
+  },
+
+  async fetchHierarchyChildren(parentId: string): Promise<{ items: BomHierarchyItem[]; total: number }> {
+    if (!SQL_ENDPOINT) throw new Error('Database connection not available.');
+    return this._cachedFetch(
+      `${SQL_ENDPOINT}/bom/hierarchy/children/${encodeURIComponent(parentId)}`,
+      { headers: this._authHeaders(), _ttlMs: 15000 },
+    );
+  },
+
+  async searchBomHierarchyItems(query: string, limit = 30): Promise<{ items: { itemId: string; description: string }[]; total: number }> {
+    if (!SQL_ENDPOINT) throw new Error('Database connection not available.');
+    const params = new URLSearchParams();
+    if (query) params.set('q', query);
+    params.set('limit', String(limit));
+    const qs = params.toString();
+    return this._cachedFetch(
+      `${SQL_ENDPOINT}/bom/hierarchy/search${qs ? `?${qs}` : ''}`,
+      { headers: this._authHeaders(), _ttlMs: 0 },
+    );
   },
 };
