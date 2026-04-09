@@ -3,10 +3,13 @@ from sqlalchemy.orm import relationship
 from .session import Base
 
 
-class AppState(Base):
-    __tablename__ = "app_state"
+class AppConfig(Base):
+    """Single-row application configuration (replaces the old AppState JSON blob)."""
+
+    __tablename__ = "app_config"
+
     id = Column(Integer, primary_key=True, index=True)
-    state = Column(JSON, nullable=True)
+    mapping_type_config = Column(JSON, nullable=True)
 
 
 class User(Base):
@@ -15,6 +18,7 @@ class User(Base):
     username = Column(String, unique=True, index=True, nullable=False)
     password_hash = Column(String, nullable=False)
     role = Column(String, default="user")
+    approval_status = Column(String, default="pending")
 
 
 class Classification(Base):
@@ -41,6 +45,8 @@ class BomItem(Base):
     category = Column(String, index=True, nullable=True)
     product_type = Column(String, index=True, nullable=True)
     priority = Column(Integer, index=True, nullable=True)
+    classification = Column(String, index=True, nullable=True)
+    ml_predictions = Column(JSON, nullable=True)
 
     features = relationship("BomFeature", back_populates="item", cascade="all, delete-orphan")
 
@@ -218,3 +224,78 @@ class AuditLog(Base):
     username = Column(String, nullable=True)
     action = Column(String, nullable=False)
     detail = Column(String, nullable=True)
+
+
+class ItemClassAttributeValue(Base):
+    """Per-item user-entered values for target-only class attributes.
+
+    When a user assigns a classification to a BOM item and fills in values
+    for target attributes that have no legacy feature source, each value is
+    stored here.  ``class_id`` is a lookup column so values are scoped per
+    classification — switching classes preserves previously-entered values.
+    """
+
+    __tablename__ = "item_class_attribute_values"
+    __table_args__ = (
+        UniqueConstraint(
+            "item_id",
+            "class_id",
+            "attribute_id",
+            name="uq_item_class_attr_val",
+        ),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    item_id = Column(String, index=True, nullable=False)
+    class_id = Column(String, index=True, nullable=False)
+    attribute_id = Column(String, nullable=False)
+    value = Column(String, nullable=False, default="")
+
+
+class FeatureCombinationJob(Base):
+    """Tracks async feature-combination build job state."""
+
+    __tablename__ = "feature_combination_jobs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    status = Column(String, index=True, nullable=False)  # queued|running|completed|failed
+    triggered_by_user_id = Column(String, nullable=True)
+    triggered_by_username = Column(String, nullable=True)
+    total_features = Column(Integer, nullable=False, default=0)
+    processed_features = Column(Integer, nullable=False, default=0)
+    generated_rows = Column(Integer, nullable=False, default=0)
+    started_at = Column(Float, nullable=True)
+    finished_at = Column(Float, nullable=True)
+    updated_at = Column(Float, nullable=False, default=0)
+    error_message = Column(String, nullable=True)
+
+
+class FeatureCombination(Base):
+    """Pre-built summary: one row per unique feature_id + normalized value set.
+
+    The ``normalized_values_key`` is a deterministic string built by sorting,
+    deduplicating and joining the feature values so that order-insensitive
+    comparison is a simple string equality check.
+    """
+
+    __tablename__ = "feature_combinations"
+    __table_args__ = (
+        Index("ix_feature_combinations_feature_key", "feature_id", "normalized_values_key"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    feature_id = Column(String, index=True, nullable=False)
+    description = Column(String, nullable=True)
+    unit = Column(String, nullable=True)
+    attribute_type = Column(String, index=True, nullable=True)
+    normalized_values_key = Column(String, nullable=False)
+    normalized_values_json = Column(JSON, nullable=False)
+    item_count = Column(Integer, nullable=False, default=0)
+    legacy_value_count = Column(Integer, nullable=False, default=0)
+    d365_attribute_id = Column(String, nullable=True)
+    d365_values_json = Column(JSON, nullable=True)  # { legacyVal: d365Val }
+    mapped_value_count = Column(Integer, nullable=False, default=0)
+    mapping_status = Column(String, index=True, nullable=False, default="unmapped")  # complete|partial|unmapped
+    priorities_json = Column(JSON, nullable=True)
+    item_ids_json = Column(JSON, nullable=True)  # list of item_id strings in this combo
+    built_at = Column(Float, nullable=True)

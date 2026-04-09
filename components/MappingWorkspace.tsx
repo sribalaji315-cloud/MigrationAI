@@ -1,8 +1,9 @@
 
 import React, { useState, useEffect, useMemo, useRef } from 'react';
-import { LegacyItem, NewClassification, GlobalMapping, LocalItemMappings, NewAttribute, ItemLock, User, FeatureFlags, MappingTypeConfig } from '../types';
+import { LegacyItem, NewClassification, GlobalMapping, LocalItemMappings, NewAttribute, ItemLock, User, FeatureFlags, MappingTypeConfig, MLPrediction } from '../types';
+import { dbService } from '../services/dbService';
 
-type Tone = 'mapped' | 'unmapped' | 'notRequired';
+type Tone = 'mapped' | 'unmapped' | 'notRequired' | 'partial';
 
 const toneTheme: Record<Tone, {
   trigger: string;
@@ -56,12 +57,30 @@ const toneTheme: Record<Tone, {
     valueInput: 'bg-amber-50 border-amber-300 text-amber-800 focus:ring-amber-300 focus:border-amber-300',
     valueButton: 'border-amber-200 text-amber-700',
   },
+  partial: {
+    trigger: 'bg-orange-50 border-orange-300 text-orange-800 focus:ring-orange-400 focus:border-orange-400',
+    dropdownBorder: 'border-orange-200',
+    optionActive: 'bg-orange-100 text-orange-800',
+    optionHover: 'hover:bg-orange-100',
+    card: 'bg-orange-50/60 border-orange-200',
+    accent: 'bg-orange-500',
+    attrReadonly: 'border-orange-200 bg-orange-50 text-orange-800',
+    valueWrapper: 'bg-orange-50 border border-orange-100',
+    valueReadonly: 'bg-orange-500 text-white',
+    valueInput: 'bg-orange-50 border-orange-300 text-orange-800 focus:ring-orange-300 focus:border-orange-300',
+    valueButton: 'border-orange-200 text-orange-700',
+  },
 };
 
-const SearchableSelect = ({ value, options, onChange, tone = 'mapped' }: { value: string, options: string[], onChange: (val: string) => void, tone?: Tone }) => {
+const SearchableSelect = ({ value, onChange, tone = 'mapped', featureId, classId }: { value: string, onChange: (val: string) => void, tone?: Tone, featureId: string, classId?: string | null }) => {
   const [isOpen, setIsOpen] = useState(false);
   const [search, setSearch] = useState('');
+  const [options, setOptions] = useState<string[]>([]);
+  const [globalSet, setGlobalSet] = useState<Set<string>>(new Set());
+  const [warningSet, setWarningSet] = useState<Set<string>>(new Set());
+  const [loading, setLoading] = useState(false);
   const wrapperRef = useRef<HTMLDivElement>(null);
+  const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const palette = toneTheme[tone];
 
   useEffect(() => {
@@ -74,13 +93,59 @@ const SearchableSelect = ({ value, options, onChange, tone = 'mapped' }: { value
     return () => document.removeEventListener('mousedown', handleClickOutside);
   }, []);
 
-  const filteredOptions = options.filter(opt => opt.toLowerCase().includes(search.toLowerCase()));
+  const fetchOptions = (searchQuery?: string) => {
+    setLoading(true);
+    dbService.fetchAttributeOptions(featureId, classId, searchQuery || undefined)
+      .then(result => {
+        const seen = new Set<string>();
+        const ordered: string[] = ['UNMAPPED', 'NOT REQUIRED'];
+        seen.add('UNMAPPED'); seen.add('NOT REQUIRED');
+        const gSet = new Set<string>();
+        const wSet = new Set<string>();
+        const wIds = new Set((result.warningIds || []).map(w => w.toUpperCase().replace(/\s+/g, '')));
+        // Global candidates first
+        (result.globalCandidates || []).forEach(a => {
+          if (!seen.has(a)) { seen.add(a); ordered.push(a); gSet.add(a); }
+          if (wIds.has(a.toUpperCase().replace(/\s+/g, ''))) wSet.add(a);
+        });
+        // Then class attributes
+        (result.classAttributes || []).forEach(a => {
+          if (!seen.has(a)) { seen.add(a); ordered.push(a); }
+        });
+        // Ensure current value is in the list
+        if (value && !seen.has(value) && value !== 'UNMAPPED' && value !== 'NOT REQUIRED') {
+          ordered.push(value);
+        }
+        setOptions(ordered);
+        setGlobalSet(gSet);
+        setWarningSet(wSet);
+        setLoading(false);
+      })
+      .catch(() => setLoading(false));
+  };
+
+  const handleOpen = () => {
+    if (!isOpen) {
+      setSearch('');
+      fetchOptions();
+    }
+    setIsOpen(!isOpen);
+  };
+
+  const handleSearchChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const q = e.target.value;
+    setSearch(q);
+    if (debounceRef.current) clearTimeout(debounceRef.current);
+    debounceRef.current = setTimeout(() => {
+      fetchOptions(q || undefined);
+    }, 250);
+  };
 
   return (
     <div ref={wrapperRef} className="relative mb-2">
       <div 
         className={`w-full px-3 py-2 pr-8 border-2 rounded-lg text-[10px] font-black uppercase tracking-tight cursor-pointer transition-colors outline-none flex items-center justify-between ${palette.trigger}`}
-        onClick={() => { setIsOpen(!isOpen); setSearch(''); }}
+        onClick={handleOpen}
       >
         <span className="truncate">{value}</span>
         <div className="absolute right-2 top-1/2 -translate-y-1/2 pointer-events-none text-emerald-600">
@@ -98,24 +163,36 @@ const SearchableSelect = ({ value, options, onChange, tone = 'mapped' }: { value
               className="w-full px-2 py-1.5 text-[10px] font-bold text-slate-700 bg-white border border-slate-200 rounded outline-none focus:border-emerald-400 focus:ring-1 focus:ring-emerald-400"
               placeholder="Search attributes..."
               value={search}
-              onChange={(e) => setSearch(e.target.value)}
+              onChange={handleSearchChange}
               onClick={(e) => e.stopPropagation()}
               autoFocus
             />
           </div>
           <div className="overflow-y-auto flex-1">
-            {filteredOptions.length > 0 ? filteredOptions.map((opt, idx) => (
+            {loading ? (
+              <div className="px-3 py-3 text-[10px] font-bold text-slate-400 text-center">Loading...</div>
+            ) : options.length > 0 ? options.map((opt, idx) => {
+              const isPriority = globalSet.has(opt);
+              const isWarning = warningSet.has(opt);
+              return (
               <div
                 key={idx}
-                className={`px-3 py-2 text-[10px] font-black uppercase tracking-tight cursor-pointer ${palette.optionHover} ${opt === value ? palette.optionActive : 'text-slate-700'}`}
+                className={`px-3 py-2 text-[10px] font-black uppercase tracking-tight cursor-pointer flex items-center gap-1.5 ${isWarning ? 'bg-rose-50 text-rose-700' : isPriority ? 'bg-indigo-50' : ''} ${palette.optionHover} ${opt === value ? palette.optionActive : 'text-slate-700'}`}
                 onClick={() => {
                   onChange(opt);
                   setIsOpen(false);
                 }}
               >
                 {opt}
+                {isWarning && (
+                  <span className="ml-auto px-1.5 py-0.5 bg-rose-100 text-rose-600 text-[7px] font-black rounded-full tracking-wider shrink-0">NOT IN CLASS</span>
+                )}
+                {isPriority && !isWarning && (
+                  <span className="ml-auto px-1.5 py-0.5 bg-indigo-100 text-indigo-600 text-[7px] font-black rounded-full tracking-wider shrink-0">GLOBAL</span>
+                )}
               </div>
-            )) : (
+              );
+            }) : (
               <div className="px-3 py-3 text-[10px] font-bold text-slate-400 text-center">No results found</div>
             )}
           </div>
@@ -138,7 +215,10 @@ const ClassDomainSelect = ({
 }) => {
   const [isOpen, setIsOpen] = useState(false);
   const [search, setSearch] = useState('');
+  const [searchResults, setSearchResults] = useState<{ classId: string; className: string }[] | null>(null);
+  const [searching, setSearching] = useState(false);
   const wrapperRef = useRef<HTMLDivElement | null>(null);
+  const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
     const handleClickOutside = (event: MouseEvent) => {
@@ -150,7 +230,7 @@ const ClassDomainSelect = ({
     return () => document.removeEventListener('mousedown', handleClickOutside);
   }, []);
 
-  const allOptions = useMemo(
+  const initialOptions = useMemo(
     () => [
       { classId: 'UNCLASSIFIED', className: 'Universal Schema' },
       ...classes.map(c => ({ classId: c.classId, className: c.className })),
@@ -158,14 +238,46 @@ const ClassDomainSelect = ({
     [classes]
   );
 
-  const filtered = useMemo(() => {
-    const q = search.toLowerCase();
-    return allOptions.filter(o =>
-      o.className.toLowerCase().includes(q) || o.classId.toLowerCase().includes(q)
-    );
-  }, [allOptions, search]);
+  const displayOptions = useMemo(() => {
+    if (searchResults !== null) {
+      return [
+        { classId: 'UNCLASSIFIED', className: 'Universal Schema' },
+        ...searchResults.filter(r => r.classId !== 'UNCLASSIFIED'),
+      ].filter(o => {
+        const q = search.toLowerCase();
+        return !q || o.className.toLowerCase().includes(q) || o.classId.toLowerCase().includes(q);
+      });
+    }
+    return initialOptions;
+  }, [initialOptions, searchResults, search]);
 
-  const selected = allOptions.find(o => o.classId === (value || 'UNCLASSIFIED')) || allOptions[0];
+  const selected = useMemo(() => {
+    const id = value || 'UNCLASSIFIED';
+    return displayOptions.find(o => o.classId === id) || initialOptions.find(o => o.classId === id) || initialOptions[0];
+  }, [value, displayOptions, initialOptions]);
+
+  const handleSearchChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const q = e.target.value;
+    setSearch(q);
+    if (debounceRef.current) clearTimeout(debounceRef.current);
+    if (!q.trim()) {
+      setSearchResults(null);
+      setSearching(false);
+      return;
+    }
+    setSearching(true);
+    debounceRef.current = setTimeout(() => {
+      dbService.searchClassificationNames(q.trim(), 20)
+        .then(res => {
+          setSearchResults(res.items || []);
+          setSearching(false);
+        })
+        .catch(() => {
+          setSearchResults([]);
+          setSearching(false);
+        });
+    }, 250);
+  };
 
   return (
     <div ref={wrapperRef} className="relative">
@@ -176,6 +288,7 @@ const ClassDomainSelect = ({
           if (disabled) return;
           setIsOpen(o => !o);
           setSearch('');
+          setSearchResults(null);
         }}
         className={`w-40 h-8 pl-2 pr-6 rounded-lg text-[9px] font-black transition-all appearance-none outline-none border flex items-center justify-between $${''}
           ${disabled ? 'bg-slate-50 border-transparent text-slate-700 cursor-not-allowed' : 'bg-white border-indigo-400 text-indigo-900 hover:bg-indigo-50'}`}
@@ -194,13 +307,16 @@ const ClassDomainSelect = ({
             <input
               type="text"
               value={search}
-              onChange={(e) => setSearch(e.target.value)}
+              onChange={handleSearchChange}
               className="w-full px-2 py-1.5 text-[9px] font-bold text-slate-700 bg-white border border-slate-200 rounded outline-none focus:border-indigo-400 focus:ring-1 focus:ring-indigo-400"
               placeholder="Search classes..."
+              autoFocus
             />
           </div>
           <div className="max-h-52 overflow-y-auto">
-            {filtered.map(opt => (
+            {searching ? (
+              <div className="px-3 py-2 text-[9px] font-bold text-slate-400 text-center">Searching...</div>
+            ) : displayOptions.length > 0 ? displayOptions.map(opt => (
               <button
                 key={opt.classId}
                 type="button"
@@ -216,8 +332,7 @@ const ClassDomainSelect = ({
               >
                 {opt.className}
               </button>
-            ))}
-            {filtered.length === 0 && (
+            )) : (
               <div className="px-3 py-2 text-[9px] font-bold text-slate-400 text-center">No matches</div>
             )}
           </div>
@@ -425,17 +540,17 @@ interface MappingWorkspaceProps {
   globalMappings: GlobalMapping[];
   mappingTypeConfig?: MappingTypeConfig;
   localItemMappings: LocalItemMappings;
-  classAttributeValues: Record<string, Record<string, string>>;
   assignedClassId?: string | null;
   isLockedByMe: boolean;
   lockOwner: ItemLock | null;
   currentUser: User;
   featureFlags: FeatureFlags;
-  onToggleNewClassTargetMapping: () => void;
+  onToggleNewClassTargetMapping: (forceValue?: boolean) => void;
   onSignOn: () => Promise<void>;
   onSignOff: () => Promise<void>;
   onSaveChanges: (updates: any) => Promise<void>;
   onSyncFromDB: () => void;
+  onRevertItem?: (itemId: string) => Promise<void>;
   isGenerationActive: boolean;
 }
 
@@ -445,7 +560,6 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
   globalMappings, 
   mappingTypeConfig,
   localItemMappings, 
-  classAttributeValues,
   assignedClassId,
   isLockedByMe,
   lockOwner,
@@ -456,6 +570,7 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
   onSignOff,
   onSaveChanges,
   onSyncFromDB,
+  onRevertItem,
   isGenerationActive
 }) => {
   const { useNewClassTargetMapping } = featureFlags;
@@ -517,38 +632,109 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
   const [manualInputs, setManualInputs] = useState<Record<string, string>>({});
   const [stagedLocalMappings, setStagedLocalMappings] = useState<GlobalMapping[]>([]);
   const [stagedClassId, setStagedClassId] = useState<string | null>(null);
+  const [mlPredicting, setMlPredicting] = useState(false);
+  const [mlPredictions, setMlPredictions] = useState<MLPrediction[]>([]);
   const [legacyFilter, setLegacyFilter] = useState('');
   const [showUnmappedOnly, setShowUnmappedOnly] = useState(false);
   const [expandedFeatures, setExpandedFeatures] = useState<Record<string, boolean>>({});
   const [unmappedTargetsExpanded, setUnmappedTargetsExpanded] = useState(true);
   const isEditingRef = useRef(false);
+  const prevItemIdRef = useRef<string | null>(null);
+  const previousClassIdRef = useRef<string | null>(null);
+
+  // On-demand fetched classifications (keyed by classId)
+  const [fetchedClasses, setFetchedClasses] = useState<Record<string, NewClassification>>({});
+  const fetchingClassRef = useRef<string | null>(null);
+
+  // Merge prop classes with on-demand fetched classes
+  const mergedClasses = useMemo(() => {
+    const byId = new Map<string, NewClassification>();
+    classes.forEach(c => byId.set(c.classId, c));
+    Object.values(fetchedClasses).forEach(c => { if (!byId.has(c.classId)) byId.set(c.classId, c); });
+    return Array.from(byId.values());
+  }, [classes, fetchedClasses]);
+
+  // Fetch class on demand when stagedClassId isn't in the preloaded set
+  useEffect(() => {
+    const classId = stagedClassId;
+    if (!classId || classId === 'UNCLASSIFIED') return;
+    // Already available in props or fetched cache
+    if (classes.some(c => c.classId === classId) || fetchedClasses[classId]) return;
+    // Already fetching this one
+    if (fetchingClassRef.current === classId) return;
+    fetchingClassRef.current = classId;
+    dbService.fetchClassification(classId)
+      .then(cls => {
+        if (fetchingClassRef.current !== classId) return;
+        setFetchedClasses(prev => ({ ...prev, [classId]: cls }));
+      })
+      .catch(err => console.warn(`Failed to fetch classification '${classId}':`, err))
+      .finally(() => { if (fetchingClassRef.current === classId) fetchingClassRef.current = null; });
+  }, [stagedClassId, classes, fetchedClasses]);
+
+  // Per-item global mapping candidates fetched from the API
+  const [globalByFeatureMap, setGlobalByFeatureMap] = useState<Record<string, GlobalMapping[]>>({});
+  const globalByFeatureFetchRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    if (!item) { setGlobalByFeatureMap({}); return; }
+    const featureIds = item.features.map(f => f.featureId);
+    if (featureIds.length === 0) { setGlobalByFeatureMap({}); return; }
+    const key = `${item.itemId}::${featureIds.join(',')}`;
+    if (globalByFeatureFetchRef.current === key) return;
+    globalByFeatureFetchRef.current = key;
+    dbService.fetchGlobalMappingsByFeatures(featureIds)
+      .then(result => {
+        if (globalByFeatureFetchRef.current !== key) return;
+        setGlobalByFeatureMap(result);
+      })
+      .catch(err => console.warn('Failed to fetch global mappings by features', err));
+  }, [item]);
 
   // Initialize workspace when item changes
   useEffect(() => {
     if (item) {
-      // Always re-initialize view state when the selected item or backing data changes.
+      const itemChanged = prevItemIdRef.current !== item.itemId;
+      prevItemIdRef.current = item.itemId;
+
       isEditingRef.current = false;
       setStagedClassId(assignedClassId || 'UNCLASSIFIED');
+      previousClassIdRef.current = assignedClassId || null;
+      setMlPredictions(item.mlPredictions || []);
       setStagedLocalMappings(
         JSON.parse(JSON.stringify(localItemMappings[item.itemId] || [])).map((m: GlobalMapping) => ({
           ...m,
           attributeType: m.attributeType || '',
         }))
       );
-      const existingAttrValues = classAttributeValues[item.itemId] || {};
-      const nextManual: Record<string, string> = {};
-      Object.entries(existingAttrValues).forEach(([attrId, val]) => {
-        if (val !== undefined && val !== null && String(val).trim() !== '') {
-          nextManual[`UNMAPPED::${attrId}`] = String(val);
+      // Fetch class attribute values from dedicated table
+      dbService.getClassAttributeValues(item.itemId)
+        .then(({ values }) => {
+          const nextManual: Record<string, string> = {};
+          Object.entries(values || {}).forEach(([attrId, val]) => {
+            if (val !== undefined && val !== null && String(val).trim() !== '') {
+              nextManual[`UNMAPPED::${attrId}`] = String(val);
+            }
+          });
+          setManualInputs(nextManual);
+        })
+        .catch(() => setManualInputs({}));
+      // Only reset UI view state when switching to a different item
+      if (itemChanged) {
+        setLegacyFilter('');
+        setShowUnmappedOnly(false);
+        setExpandedFeatures({});
+        // Auto-enable class view when item has an assigned class
+        if (assignedClassId && assignedClassId !== 'UNCLASSIFIED') {
+          onToggleNewClassTargetMapping(true);
         }
-      });
-      setManualInputs(nextManual);
-      setLegacyFilter('');
-      setShowUnmappedOnly(false);
-      setExpandedFeatures({});
+      }
     } else {
+      prevItemIdRef.current = null;
       isEditingRef.current = false;
       setStagedClassId(null);
+      previousClassIdRef.current = null;
+      setMlPredictions([]);
       setStagedLocalMappings([]);
       setManualInputs({});
       setLegacyFilter('');
@@ -563,12 +749,31 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
     setManualInputs(prev => ({ ...prev, [key]: value }));
   };
 
+  const handlePredictSingle = async () => {
+    if (!item) return;
+    setMlPredicting(true);
+    try {
+      const result = await dbService.predictClassification(item.itemId);
+      setMlPredictions(result.predictions || []);
+    } catch (err) {
+      console.error('ML prediction failed:', err);
+    } finally {
+      setMlPredicting(false);
+    }
+  };
+
+  const handlePickPrediction = (classId: string) => {
+    isEditingRef.current = true;
+    setStagedClassId(classId);
+  };
+
   const commitToSystem = async () => {
     if (!item) return;
     if (!canEdit) {
       alert('Mapping generation is running. Editing and save are temporarily disabled.');
       return;
     }
+    const classId = stagedClassId || 'UNCLASSIFIED';
     const manualForItem: Record<string, string> = {};
     Object.entries(manualInputs).forEach(([key, value]) => {
       if (!key.startsWith('UNMAPPED::')) return;
@@ -579,14 +784,35 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
         manualForItem[attrId] = trimmed;
       }
     });
+
+    // Save classification directly to bom_items table
+    await dbService.assignClassification(item.itemId, classId);
+
+    if (useNewClassTargetMapping) {
+      // Save class attribute values to dedicated table
+      await dbService.saveClassAttributeValues(
+        item.itemId,
+        classId,
+        previousClassIdRef.current,
+        manualForItem,
+      );
+    } else {
+      // Legacy view — remove any stored class attribute values for this item
+      await dbService.deleteClassAttributeValues(item.itemId);
+    }
+    previousClassIdRef.current = classId;
+
+    // Save local mappings + update in-memory classification via the existing onSaveChanges path
     await onSaveChanges({
       localMappings: { [item.itemId]: stagedLocalMappings },
-      itemClassifications: { [item.itemId]: stagedClassId || 'UNCLASSIFIED' },
-      classAttributeValues: manualForItem && Object.keys(manualForItem).length > 0
-        ? { [item.itemId]: manualForItem }
-        : { [item.itemId]: {} },
+      itemClassifications: { [item.itemId]: classId },
     });
     isEditingRef.current = false;
+
+    // Auto-enable class view after saving with an assigned class
+    if (classId !== 'UNCLASSIFIED') {
+      onToggleNewClassTargetMapping(true);
+    }
   };
 
   const handleExitSession = async () => {
@@ -597,6 +823,21 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
     }
     // Then sign off (this is async and should complete the lock release)
     await onSignOff();
+  };
+
+  const handleRevertItemToGlobal = async () => {
+    if (!item) return;
+    if (!confirm(`Revert all local overrides for "${item.itemId}" to global mappings? This cannot be undone.`)) return;
+    try {
+      await dbService.revertItemToGlobal(item.itemId);
+      if (onRevertItem) {
+        await onRevertItem(item.itemId);
+      } else {
+        onSyncFromDB();
+      }
+    } catch (e: any) {
+      alert(`Revert failed: ${e.message}`);
+    }
   };
 
   const handleDiscardSessionChanges = () => {
@@ -610,14 +851,17 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
           attributeType: m.attributeType || '',
         }))
       );
-      const existingAttrValues = classAttributeValues[item.itemId] || {};
-      const nextManual: Record<string, string> = {};
-      Object.entries(existingAttrValues).forEach(([attrId, val]) => {
-        if (val !== undefined && val !== null && String(val).trim() !== '') {
-          nextManual[`UNMAPPED::${attrId}`] = String(val);
-        }
-      });
-      setManualInputs(nextManual);
+      dbService.getClassAttributeValues(item.itemId)
+        .then(({ values }) => {
+          const nextManual: Record<string, string> = {};
+          Object.entries(values || {}).forEach(([attrId, val]) => {
+            if (val !== undefined && val !== null && String(val).trim() !== '') {
+              nextManual[`UNMAPPED::${attrId}`] = String(val);
+            }
+          });
+          setManualInputs(nextManual);
+        })
+        .catch(() => setManualInputs({}));
     }
   };
 
@@ -629,7 +873,7 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
 
   const allSystemAttributes = useMemo(() => {
     const attrMap = new Map<string, NewAttribute & { sourceClass?: string }>();
-    classes.forEach(c => {
+    mergedClasses.forEach(c => {
       c.attributes.forEach(a => {
         if (!attrMap.has(a.attributeId)) {
           attrMap.set(a.attributeId, { ...a, sourceClass: c.className });
@@ -637,7 +881,7 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
       });
     });
     return Array.from(attrMap.values());
-  }, [classes]);
+  }, [mergedClasses]);
 
   const targetAttributes = useMemo(() => {
     const classId = stagedClassId || 'UNCLASSIFIED';
@@ -645,7 +889,7 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
     if (classId === 'UNCLASSIFIED') {
       attrs = [...allSystemAttributes];
     } else {
-      const selectedClass = classes.find(c => c.classId === classId);
+      const selectedClass = mergedClasses.find(c => c.classId === classId);
       attrs = selectedClass ? [...selectedClass.attributes] : [];
     }
     const seen = new Set<string>();
@@ -657,7 +901,7 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
       }
     });
     return unique;
-  }, [stagedClassId, classes, allSystemAttributes]);
+  }, [stagedClassId, mergedClasses, allSystemAttributes]);
 
   const classAttributeKeys = useMemo(() => {
     const set = new Set<string>();
@@ -683,7 +927,7 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
     });
 
     // Merge in classification allowedValues, if present
-    classes.forEach(cls => {
+    mergedClasses.forEach(cls => {
       cls.attributes.forEach(attr => {
         if (!attr.allowedValues || attr.allowedValues.length === 0) return;
         const list = (byAttr[attr.attributeId] = byAttr[attr.attributeId] || []);
@@ -694,7 +938,7 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
     });
 
     return byAttr;
-  }, [engineeringGlobalMappings, classes]);
+  }, [engineeringGlobalMappings, mergedClasses]);
 
   const legacyFilterOptions = useMemo(() => {
     if (!item) return [] as string[];
@@ -752,10 +996,9 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
       });
       attributeOptions = Array.from(new Set(attributeOptions));
 
-      const defaultGlobalAttribute = attributeOptions.length > 0 ? attributeOptions[0] : 'UNMAPPED';
+      let defaultGlobalAttribute = attributeOptions.length > 0 ? attributeOptions[0] : 'UNMAPPED';
 
       const usingClassScope = useNewClassTargetMapping && (stagedClassId || 'UNCLASSIFIED') !== 'UNCLASSIFIED';
-      let isUnmapped = attributeOptions.length === 0;
 
       if (usingClassScope) {
         const matchedForClass = attributeOptions.filter(a => {
@@ -764,33 +1007,9 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
         });
 
         if (matchedForClass.length > 0) {
-          attributeOptions = matchedForClass;
-          isUnmapped = false;
-        } else {
-          // none of the global candidates belong to this class – treat as unmapped
-          attributeOptions = [];
-          isUnmapped = true;
+          defaultGlobalAttribute = matchedForClass[0];
         }
       }
-
-      if (isUnmapped) {
-        attributeOptions = ['UNMAPPED', ...targetAttributes.map(a => a.attributeId)];
-      }
-
-      if (localOverride && localOverride.newAttributeId !== 'UNMAPPED' && !attributeOptions.includes(localOverride.newAttributeId)) {
-        attributeOptions.push(localOverride.newAttributeId);
-      }
-
-      if (localOverride && localOverride.newAttributeId === 'UNMAPPED' && !attributeOptions.includes('UNMAPPED')) {
-        attributeOptions = ['UNMAPPED', ...attributeOptions];
-      }
-
-      if ((isUnmapped || attributeOptions.length > 1 || !!localOverride) && !attributeOptions.includes('UNMAPPED')) {
-        attributeOptions = ['UNMAPPED', ...attributeOptions];
-      }
-
-      // Deduplicate while preserving order so the dropdown only shows unique attribute IDs
-      attributeOptions = Array.from(new Set(attributeOptions));
 
       let selectedAttribute = localOverride?.newAttributeId || defaultGlobalAttribute;
 
@@ -967,16 +1186,12 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
       let nextValueMappings: Record<string, string> = {};
 
       if (attrId === 'NOT REQUIRED') {
-        // When an attribute is marked as NOT REQUIRED, automatically
-        // mark all of its existing legacy values as NOT REQUIRED too
-        // so they count as fully mapped and disappear when filtering
-        // by "Unmapped Only".
         featureValues.forEach(v => {
           nextValueMappings[v] = 'NOT REQUIRED';
         });
-      } else if (globalRef && globalRef.valueMappings) {
-        nextValueMappings = { ...globalRef.valueMappings };
       }
+      // Value mappings are auto-populated by the backend from global
+      // mappings on save — no need to load them on the frontend.
 
       return [
         ...filtered,
@@ -1088,7 +1303,7 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
                  </span>
                  <button
                    type="button"
-                   onClick={onToggleNewClassTargetMapping}
+                   onClick={() => onToggleNewClassTargetMapping()}
                    className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full border text-[7px] font-black uppercase tracking-widest transition-colors ${
                      useNewClassTargetMapping
                        ? 'bg-emerald-600 border-emerald-500 text-white'
@@ -1111,13 +1326,49 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
                </div>
                <ClassDomainSelect
                  value={stagedClassId}
-                 classes={classes}
+                 classes={mergedClasses}
                  disabled={isReadOnly}
                  onChange={(classId) => {
                    isEditingRef.current = true;
                    setStagedClassId(classId);
                  }}
                />
+               {/* ML Predictions quick-pick */}
+               <div className="flex items-center gap-1.5 mt-1">
+                 <button
+                   type="button"
+                   onClick={handlePredictSingle}
+                   disabled={isReadOnly || mlPredicting || !item}
+                   className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full border text-[7px] font-black uppercase tracking-widest transition-colors ${
+                     mlPredicting
+                       ? 'bg-violet-100 border-violet-200 text-violet-400 cursor-wait animate-pulse'
+                       : 'bg-violet-50 border-violet-200 text-violet-700 hover:bg-violet-100'
+                   }`}
+                   title="Run ML prediction for this item"
+                 >
+                   <svg className="w-2.5 h-2.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M9.663 17h4.673M12 3v1m6.364 1.636l-.707.707M21 12h-1M4 12H3m3.343-5.657l-.707-.707m2.828 9.9a5 5 0 117.072 0l-.548.547A3.374 3.374 0 0014 18.469V19a2 2 0 11-4 0v-.531c0-.895-.356-1.754-.988-2.386l-.548-.547z" />
+                   </svg>
+                   {mlPredicting ? 'Predicting...' : 'Predict'}
+                 </button>
+                 {mlPredictions.length > 0 && mlPredictions.map((pred, i) => (
+                   <button
+                     key={pred.classId + i}
+                     type="button"
+                     disabled={isReadOnly}
+                     onClick={() => handlePickPrediction(pred.classId)}
+                     className={`inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded-full border text-[7px] font-black uppercase tracking-widest transition-colors ${
+                       stagedClassId === pred.classId
+                         ? 'bg-violet-600 border-violet-500 text-white'
+                         : 'bg-white border-violet-200 text-violet-700 hover:bg-violet-50'
+                     }`}
+                     title={`${pred.className}: ${Math.round(pred.confidence * 100)}% confidence`}
+                   >
+                     <span className="truncate max-w-[80px]">{pred.className}</span>
+                     <span className={`text-[6px] ${stagedClassId === pred.classId ? 'text-violet-200' : 'text-violet-400'}`}>{Math.round(pred.confidence * 100)}%</span>
+                   </button>
+                 ))}
+               </div>
              </div>
 
              <div className="flex gap-2">
@@ -1134,6 +1385,9 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
              )}
              {isLockedByMe && (
                 <>
+                  <button type="button" onClick={handleRevertItemToGlobal} disabled={isGenerationBlocked} className={`px-3 py-1.5 text-[9px] font-black rounded-lg transition-all uppercase tracking-widest ${isGenerationBlocked ? 'bg-white/5 text-white/30 cursor-not-allowed' : 'bg-amber-500/20 border border-amber-400/40 text-amber-200 hover:bg-amber-500/30'}`}>
+                    Revert to Global
+                  </button>
                   <button type="button" onClick={handleDiscardSessionChanges} disabled={!isDirty || isGenerationBlocked} className={`px-3 py-1.5 text-[9px] font-black rounded-lg transition-all uppercase tracking-widest ${isDirty && !isGenerationBlocked ? 'bg-white/10 border border-white/20 text-white hover:bg-white/20' : 'bg-white/5 text-white/30 cursor-not-allowed'}`}>
                     Reset
                   </button>
@@ -1271,139 +1525,49 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
               const groupLabel = typeKey === 'uncategorized' ? 'Uncategorized' : typeKey.toUpperCase();
 
               const renderedCards = groupFeatures.map((f, idx) => {
-              // Find ALL global mappings for this feature
-              const globalMappingsForFeature = globalByFeature[f.featureId] || [];
+              // Find ALL global mappings for this feature — use the per-item API result
+              const globalMappingsForFeature = globalByFeatureMap[f.featureId] || globalByFeature[f.featureId] || [];
               const globalMapping = globalMappingsForFeature[0] || null;
               const localOverride = localByFeature[f.featureId];
 
             // Collect target attributes from ALL global mappings for this feature
-            let attributeOptions: string[] = [];
+            // sourced from the per-item by-features API call.
+            let globalCandidates: string[] = [];
             globalMappingsForFeature.forEach(gm => {
               const parts = (gm.newAttributeId || '').replace(/\s+/g, '').split(';').map(a => a.trim()).filter(a => a && a !== 'UNMAPPED');
-              attributeOptions.push(...parts);
+              globalCandidates.push(...parts);
             });
-            attributeOptions = Array.from(new Set(attributeOptions));
+            globalCandidates = Array.from(new Set(globalCandidates));
 
             const usingClassScope = useNewClassTargetMapping && (stagedClassId || 'UNCLASSIFIED') !== 'UNCLASSIFIED';
 
-            // The default selected attribute if there is no local override. This may be
-            // updated in class-scoped mode to the first candidate that actually exists
-            // in the selected class.
-            let defaultGlobalAttribute = attributeOptions.length > 0 ? attributeOptions[0] : 'UNMAPPED';
+            let defaultGlobalAttribute = globalCandidates.length > 0 ? globalCandidates[0] : 'UNMAPPED';
 
-            // If there are no options (unmapped), we should provide ALL attributes from the classification table
-            let isUnmapped = attributeOptions.length === 0;
-
+            // When using class scope, prefer a global candidate that also exists in the class
             if (usingClassScope) {
-              // In class view, try to keep the original GLOBAL mapping semantics by
-              // first filtering the semicolon-separated candidates down to only
-              // those attributes that exist in the selected class. If at least one
-              // survives this filter, we treat the feature as mapped and prefer the
-              // first matching candidate (for ACTRM this becomes COLOROFPLASTICPARTS
-              // when it is the only member present in the class).
-              const matchedForClass = attributeOptions.filter(a => {
+              const matchedForClass = globalCandidates.filter(a => {
                 const key = normalizeAttrId(a);
                 return key && classAttributeKeys.has(key);
               });
-
               if (matchedForClass.length > 0) {
-                attributeOptions = matchedForClass;
                 defaultGlobalAttribute = matchedForClass[0];
-                isUnmapped = false;
-              } else {
-                // None of the global candidates belong to this class – fall back to
-                // offering all attributes from the class and mark as unmapped.
-                attributeOptions = targetAttributes.map(a => a.attributeId);
-                isUnmapped = attributeOptions.length === 0;
               }
             }
 
-            if (isUnmapped) {
-              attributeOptions = ['UNMAPPED', ...targetAttributes.map(a => a.attributeId)];
-            }
-
-            // Ensure local override is in the options if it exists
-            if (localOverride && localOverride.newAttributeId !== 'UNMAPPED' && !attributeOptions.includes(localOverride.newAttributeId)) {
-              attributeOptions.push(localOverride.newAttributeId);
-            }
-
-            // If there is a local override that is 'UNMAPPED', we need to ensure 'UNMAPPED' is in the options
-            // so the user can switch back to the global mapping
-            if (localOverride && localOverride.newAttributeId === 'UNMAPPED' && !attributeOptions.includes('UNMAPPED')) {
-              attributeOptions = ['UNMAPPED', ...attributeOptions];
-            }
-
-            // It has multiple options if it's unmapped (all attributes) OR if the global mapping had multiple options OR if there's a local override
-            const hasMultipleOptions = isUnmapped || attributeOptions.length > 1 || !!localOverride;
-
-            if (hasMultipleOptions && !attributeOptions.includes('UNMAPPED')) {
-              attributeOptions = ['UNMAPPED', ...attributeOptions];
-            }
-
-            // Deduplicate while preserving order so the dropdown only shows unique attribute IDs
-            attributeOptions = Array.from(new Set(attributeOptions));
-
-            // When using class-scoped view, only offer target attributes that are not
-            // already used by other features on this item (keep this feature's current
-            // selection in the list so we don't strand existing mappings).
-            if (usingClassScope) {
-              const usedAttributeKeys = new Set<string>();
-              item.features.forEach(otherFeature => {
-                const otherGms = globalByFeature[otherFeature.featureId] || [];
-                const lo = localByFeature[otherFeature.featureId];
-                let baseOptions: string[] = [];
-                otherGms.forEach(gm => {
-                  const parts = (gm.newAttributeId || '').replace(/\s+/g, '').split(';').map(a => a.trim()).filter(a => a && a !== 'UNMAPPED');
-                  baseOptions.push(...parts);
-                });
-                baseOptions = Array.from(new Set(baseOptions));
-                const defaultAttr = baseOptions.length > 0 ? baseOptions[0] : 'UNMAPPED';
-                const sel = lo?.newAttributeId || defaultAttr;
-
-                if (sel && sel !== 'UNMAPPED' && sel !== 'NOT REQUIRED') {
-                  const key = normalizeAttrId(sel);
-                  if (key && classAttributeKeys.has(key)) usedAttributeKeys.add(key);
-                }
-              });
-
-              const currentSelectedForFeature = localOverride?.newAttributeId || defaultGlobalAttribute;
-              const currentKey = normalizeAttrId(currentSelectedForFeature);
-              attributeOptions = attributeOptions.filter(attrId => {
-                // Always allow control options
-                if (attrId === 'UNMAPPED' || attrId === 'NOT REQUIRED') return true;
-                const key = normalizeAttrId(attrId);
-                return key === currentKey || !usedAttributeKeys.has(key);
-              });
-
-              // Also allow the user to repoint to any class attributes that are
-              // currently unused on this item ("unmapped" at the class level).
-              if (unmappedTargetAttributes.length > 0) {
-                unmappedTargetAttributes.forEach(attr => {
-                  if (!attributeOptions.includes(attr.attributeId)) {
-                    attributeOptions.push(attr.attributeId);
-                  }
-                });
-              }
-
-              // Deduplicate again after appending extra options.
-              attributeOptions = Array.from(new Set(attributeOptions));
-            }
-
-            // Ensure "Not required" is always an explicit choice that counts as mapped
-            if (!attributeOptions.includes('NOT REQUIRED')) {
-              const otherOptions = attributeOptions.filter(a => a !== 'UNMAPPED');
-              attributeOptions = ['UNMAPPED', 'NOT REQUIRED', ...otherOptions];
-            }
+            // Always show the dropdown when the item is locked (server handles search)
+            const hasMultipleOptions = true;
 
             // The currently selected attribute is the local override, OR the default global attribute
             let selectedAttribute = localOverride?.newAttributeId || defaultGlobalAttribute;
 
             if (usingClassScope) {
               const selectedKey = normalizeAttrId(selectedAttribute);
+              const isGlobalCandidate = globalCandidates.some(gc => normalizeAttrId(gc) === selectedKey);
               if (
                 selectedAttribute &&
                 selectedAttribute !== 'UNMAPPED' &&
                 selectedAttribute !== 'NOT REQUIRED' &&
+                !isGlobalCandidate &&
                 (!selectedKey || !classAttributeKeys.has(selectedKey))
               ) {
                 selectedAttribute = 'UNMAPPED';
@@ -1450,6 +1614,8 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
               ? 'unmapped'
               : selectedAttribute === 'NOT REQUIRED'
               ? 'notRequired'
+              : featureHasUnmappedValues
+              ? 'partial'
               : 'mapped';
             const attributePalette = toneTheme[attributeTone];
             const isExpanded = !!expandedFeatures[f.featureId];
@@ -1486,7 +1652,7 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
                         </svg>
                       </button>
                       <div>
-                        <p className={`text-sm font-black leading-tight ${attributeTone === 'mapped' ? 'text-emerald-900' : attributeTone === 'notRequired' ? 'text-amber-900' : 'text-rose-900'}`}>{f.featureId}</p>
+                        <p className={`text-sm font-black leading-tight ${attributeTone === 'mapped' ? 'text-emerald-900' : attributeTone === 'partial' ? 'text-orange-900' : attributeTone === 'notRequired' ? 'text-amber-900' : 'text-rose-900'}`}>{f.featureId}</p>
                         <p className="text-[9px] text-slate-400 font-bold uppercase tracking-wider mt-0.5">{f.description}</p>
                         {f.condition && (
                           <p className="text-[8px] text-indigo-500 font-bold mt-0.5" title="Condition">{f.condition}</p>
@@ -1525,8 +1691,9 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
                           <SearchableSelect
                             tone={attributeTone}
                             value={selectedAttribute}
-                            options={attributeOptions}
                             onChange={(val) => handleUpdateLinkage(f.featureId, val)}
+                            featureId={f.featureId}
+                            classId={stagedClassId && stagedClassId !== 'UNCLASSIFIED' ? stagedClassId : undefined}
                           />
                         ) : (
                           <p
@@ -1662,7 +1829,7 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
               <div className="space-y-2">
                 {ignoredFeatures.map((f, idx) => {
                   const localOverride = stagedLocalMappings.find(m => (m.legacyFeatureIds || []).includes(f.featureId));
-                  const globalOverride = allGlobalMappingsByFeature[f.featureId];
+                  const globalOverride = (globalByFeatureMap[f.featureId] || [])[0] || allGlobalMappingsByFeature[f.featureId];
                   const effective = localOverride || globalOverride;
                   const target = effective?.newAttributeId || 'UNMAPPED';
                   const type = normalizeMappingType(effective?.attributeType) || 'blank';

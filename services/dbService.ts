@@ -1,5 +1,5 @@
 
-import { GlobalMapping, DatabaseState, User, ConnectionMode, NewAttribute, WorkspaceMappingRow, MappingGenerationProgress, ValueListGroup, ValueListRow, NewClassification, BomHierarchyItem } from '../types';
+import { GlobalMapping, DatabaseState, User, ConnectionMode, NewAttribute, WorkspaceMappingRow, MappingGenerationProgress, ValueListGroup, ValueListRow, NewClassification, BomHierarchyItem, MLPrediction, MLSettings, FeatureCombinationJobProgress, FeatureCombinationRow, FeatureCombinationItem } from '../types';
 
 export interface SaveAllResult {
   mode: ConnectionMode;
@@ -64,6 +64,7 @@ export const dbService = {
   _modeCache: null as ConnectionMode | null,
   _modeCacheExpiresAt: 0,
   _modePromise: null as Promise<ConnectionMode> | null,
+  _refreshPromise: null as Promise<boolean> | null,
 
   // --- Request caching & deduplication ---
   _cache: new Map<string, { data: any; expiresAt: number }>(),
@@ -93,7 +94,7 @@ export const dbService = {
     const promise = (async () => {
       try {
         const { _ttlMs: _, _timeoutMs: _t, ...fetchOpts } = options || {} as any;
-        const resp = await fetch(url, { ...fetchOpts, signal: controller.signal });
+        const resp = await this._fetchWithRefresh(url, { ...fetchOpts, signal: controller.signal });
         clearTimeout(timeoutId);
         if (!resp.ok) {
           const errText = await resp.text();
@@ -167,6 +168,35 @@ export const dbService = {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ username, password, role })
     });
+    if (!resp.ok) {
+      const errorText = await resp.text();
+      throw new Error(JSON.parse(errorText)?.detail || 'Registration failed');
+    }
+    return resp.json();
+  },
+
+  async updateUser(userId: number, data: { role?: string; approval_status?: string }) {
+    const resp = await this._fetchWithRefresh(`${SQL_ENDPOINT}/auth/users/${userId}`, {
+      method: 'PUT',
+      headers: { ...this._authHeaders(), 'Content-Type': 'application/json' },
+      body: JSON.stringify(data)
+    });
+    if (!resp.ok) {
+      const err = await resp.text();
+      throw new Error(`Failed to update user: ${resp.status} ${err}`);
+    }
+    return resp.json();
+  },
+
+  async deleteUser(userId: number) {
+    const resp = await this._fetchWithRefresh(`${SQL_ENDPOINT}/auth/users/${userId}`, {
+      method: 'DELETE',
+      headers: this._authHeaders()
+    });
+    if (!resp.ok) {
+      const err = await resp.text();
+      throw new Error(`Failed to delete user: ${resp.status} ${err}`);
+    }
     return resp.json();
   },
 
@@ -188,25 +218,29 @@ export const dbService = {
   },
 
   async refreshAccessToken(): Promise<boolean> {
+    if (this._refreshPromise) return this._refreshPromise;
     const refreshToken = localStorage.getItem(REFRESH_TOKEN_KEY);
     if (!refreshToken) return false;
-    try {
-      const resp = await fetch(`${SQL_ENDPOINT}/auth/refresh`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ refresh_token: refreshToken }),
-      });
-      if (!resp.ok) {
-        localStorage.removeItem(REFRESH_TOKEN_KEY);
+    this._refreshPromise = (async () => {
+      try {
+        const resp = await fetch(`${SQL_ENDPOINT}/auth/refresh`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ refresh_token: refreshToken }),
+        });
+        if (!resp.ok) {
+          localStorage.removeItem(REFRESH_TOKEN_KEY);
+          return false;
+        }
+        const data = await resp.json();
+        if (data?.access_token) localStorage.setItem(TOKEN_KEY, data.access_token);
+        if (data?.refresh_token) localStorage.setItem(REFRESH_TOKEN_KEY, data.refresh_token);
+        return true;
+      } catch {
         return false;
       }
-      const data = await resp.json();
-      if (data?.access_token) localStorage.setItem(TOKEN_KEY, data.access_token);
-      if (data?.refresh_token) localStorage.setItem(REFRESH_TOKEN_KEY, data.refresh_token);
-      return true;
-    } catch {
-      return false;
-    }
+    })();
+    return this._refreshPromise.finally(() => { this._refreshPromise = null; });
   },
 
   async _fetchWithRefresh(url: string, init?: RequestInit): Promise<Response> {
@@ -233,7 +267,7 @@ export const dbService = {
     const includeBom = options?.includeBom ?? true;
     
     if (mode === 'REMOTE_SQL' && SQL_ENDPOINT) {
-      const response = await fetch(`${SQL_ENDPOINT}/state?include_bom=${includeBom ? 'true' : 'false'}`, { headers: this._authHeaders() });
+      const response = await this._fetchWithRefresh(`${SQL_ENDPOINT}/state?include_bom=${includeBom ? 'true' : 'false'}`, { headers: this._authHeaders() });
       if (!response.ok) {
         throw new Error(`Failed to fetch state from database: ${response.status}`);
       }
@@ -255,7 +289,7 @@ export const dbService = {
     if (!SQL_ENDPOINT) {
       throw new Error('Database connection not available.');
     }
-    const resp = await fetch(`${SQL_ENDPOINT}/init`, { headers: this._authHeaders() });
+    const resp = await this._fetchWithRefresh(`${SQL_ENDPOINT}/init`, { headers: this._authHeaders() });
     if (!resp.ok) {
       throw new Error(`Failed to fetch init: ${resp.status}`);
     }
@@ -297,7 +331,7 @@ export const dbService = {
     }
     const urlClass = encodeURIComponent(classId);
     const urlAttr = encodeURIComponent(attributeId);
-    const resp = await fetch(`${SQL_ENDPOINT}/classifications/${urlClass}/attributes/${urlAttr}`, {
+    const resp = await this._fetchWithRefresh(`${SQL_ENDPOINT}/classifications/${urlClass}/attributes/${urlAttr}`, {
       headers: this._authHeaders()
     });
     if (!resp.ok) {
@@ -331,7 +365,7 @@ export const dbService = {
       throw new Error('Database connection not available.');
     }
     if (!itemIds.length) return [];
-    const resp = await fetch(`${SQL_ENDPOINT}/bom/items/by-ids`, {
+    const resp = await this._fetchWithRefresh(`${SQL_ENDPOINT}/bom/items/by-ids`, {
       method: 'POST',
       headers: { ...this._authHeaders(), 'Content-Type': 'application/json' },
       body: JSON.stringify(itemIds),
@@ -386,11 +420,46 @@ export const dbService = {
     return this._cachedFetch(`${SQL_ENDPOINT}/global-mappings${query ? `?${query}` : ''}`, { headers: this._authHeaders() });
   },
 
+  async fetchGlobalMappingsByFeatures(featureIds: string[]): Promise<Record<string, GlobalMapping[]>> {
+    if (!SQL_ENDPOINT) {
+      throw new Error('Database connection not available.');
+    }
+    const resp = await this._fetchWithRefresh(`${SQL_ENDPOINT}/global-mappings/by-features`, {
+      method: 'POST',
+      headers: { ...this._authHeaders(), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ featureIds }),
+    });
+    if (!resp.ok) {
+      const errText = await resp.text();
+      throw new Error(`Failed to fetch global mappings by features: ${resp.status} ${errText}`);
+    }
+    return resp.json();
+  },
+
+  async fetchAttributeOptions(featureId: string, classId?: string | null, search?: string): Promise<{ globalCandidates: string[]; classAttributes: string[]; warningIds: string[] }> {
+    if (!SQL_ENDPOINT) {
+      throw new Error('Database connection not available.');
+    }
+    const body: Record<string, string> = { featureId };
+    if (classId) body.classId = classId;
+    if (search) body.search = search;
+    const resp = await this._fetchWithRefresh(`${SQL_ENDPOINT}/attribute-options`, {
+      method: 'POST',
+      headers: { ...this._authHeaders(), 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (!resp.ok) {
+      const errText = await resp.text();
+      throw new Error(`Failed to fetch attribute options: ${resp.status} ${errText}`);
+    }
+    return resp.json();
+  },
+
   async upsertGlobalMapping(record: GlobalMapping): Promise<{ ok: boolean; item: GlobalMapping; globalMappingsTotal: number }> {
     if (!SQL_ENDPOINT) {
       throw new Error('Database connection not available.');
     }
-    const resp = await fetch(`${SQL_ENDPOINT}/global-mappings/upsert`, {
+    const resp = await this._fetchWithRefresh(`${SQL_ENDPOINT}/global-mappings/upsert`, {
       method: 'POST',
       headers: { ...this._authHeaders(), 'Content-Type': 'application/json' },
       body: JSON.stringify(record),
@@ -407,7 +476,7 @@ export const dbService = {
     if (!SQL_ENDPOINT) {
       throw new Error('Database connection not available.');
     }
-    const resp = await fetch(`${SQL_ENDPOINT}/global-mappings/${id}`, {
+    const resp = await this._fetchWithRefresh(`${SQL_ENDPOINT}/global-mappings/${id}`, {
       method: 'DELETE',
       headers: this._authHeaders(),
     });
@@ -442,11 +511,29 @@ export const dbService = {
     return this._cachedFetch(`${SQL_ENDPOINT}/classifications/filters${query ? `?${query}` : ''}`, { headers: this._authHeaders() });
   },
 
+  async searchClassificationNames(search?: string, limit = 20): Promise<{ items: { classId: string; className: string }[] }> {
+    if (!SQL_ENDPOINT) throw new Error('Database connection not available.');
+    const params = new URLSearchParams();
+    if (search) params.set('search', search);
+    params.set('limit', String(limit));
+    const query = params.toString();
+    const resp = await this._fetchWithRefresh(`${SQL_ENDPOINT}/classifications/search?${query}`, { headers: this._authHeaders() });
+    if (!resp.ok) throw new Error(`Classification search failed: ${resp.status}`);
+    return resp.json();
+  },
+
+  async fetchClassification(classId: string): Promise<NewClassification> {
+    if (!SQL_ENDPOINT) throw new Error('Database connection not available.');
+    const resp = await this._fetchWithRefresh(`${SQL_ENDPOINT}/classifications/${encodeURIComponent(classId)}`, { headers: this._authHeaders() });
+    if (!resp.ok) throw new Error(`Failed to fetch classification '${classId}': ${resp.status}`);
+    return resp.json();
+  },
+
   async fetchWorkspaceMappings(itemId: string): Promise<WorkspaceMappingRow[]> {
     if (!SQL_ENDPOINT) {
       throw new Error('Database connection not available.');
     }
-    const resp = await fetch(`${SQL_ENDPOINT}/workspace-mappings/${encodeURIComponent(itemId)}`, {
+    const resp = await this._fetchWithRefresh(`${SQL_ENDPOINT}/workspace-mappings/${encodeURIComponent(itemId)}`, {
       headers: this._authHeaders(),
     });
     if (!resp.ok) {
@@ -460,7 +547,7 @@ export const dbService = {
     if (!SQL_ENDPOINT) {
       throw new Error('Database connection not available.');
     }
-    const resp = await fetch(`${SQL_ENDPOINT}/workspace-mappings/${encodeURIComponent(itemId)}`, {
+    const resp = await this._fetchWithRefresh(`${SQL_ENDPOINT}/workspace-mappings/${encodeURIComponent(itemId)}`, {
       method: 'PUT',
       headers: { ...this._authHeaders(), 'Content-Type': 'application/json' },
       body: JSON.stringify({ rows }),
@@ -473,11 +560,39 @@ export const dbService = {
     return resp.json();
   },
 
+  async revertItemToGlobal(itemId: string): Promise<{ ok: boolean; rowsDeleted: number; rowsGenerated: number }> {
+    if (!SQL_ENDPOINT) throw new Error('Database connection not available.');
+    const resp = await this._fetchWithRefresh(
+      `${SQL_ENDPOINT}/workspace-mappings/${encodeURIComponent(itemId)}/revert-to-global`,
+      { method: 'POST', headers: this._authHeaders() },
+    );
+    if (!resp.ok) {
+      const errText = await resp.text();
+      throw new Error(`Failed to revert to global: ${resp.status} ${errText}`);
+    }
+    this._invalidateCache();
+    return resp.json();
+  },
+
+  async revertAllToGlobal(): Promise<{ ok: boolean; localRowsDeleted: number; mappingGenerationJobId: number }> {
+    if (!SQL_ENDPOINT) throw new Error('Database connection not available.');
+    const resp = await this._fetchWithRefresh(
+      `${SQL_ENDPOINT}/workspace-mappings/revert-all-to-global`,
+      { method: 'POST', headers: this._authHeaders() },
+    );
+    if (!resp.ok) {
+      const errText = await resp.text();
+      throw new Error(`Failed to revert all to global: ${resp.status} ${errText}`);
+    }
+    this._invalidateCache();
+    return resp.json();
+  },
+
   async fetchMappingGenerationProgress(): Promise<MappingGenerationProgress> {
     if (!SQL_ENDPOINT) {
       throw new Error('Database connection not available.');
     }
-    const resp = await fetch(`${SQL_ENDPOINT}/mapping-generation/progress`, {
+    const resp = await this._fetchWithRefresh(`${SQL_ENDPOINT}/mapping-generation/progress`, {
       headers: this._authHeaders(),
     });
     if (!resp.ok) {
@@ -491,7 +606,7 @@ export const dbService = {
     if (!SQL_ENDPOINT) {
       throw new Error('Database connection not available.');
     }
-    const resp = await fetch(`${SQL_ENDPOINT}/mapping-generation/trigger`, {
+    const resp = await this._fetchWithRefresh(`${SQL_ENDPOINT}/mapping-generation/trigger`, {
       method: 'POST',
       headers: this._authHeaders(),
     });
@@ -556,7 +671,7 @@ export const dbService = {
     if (filters?.productType) params.set('productType', filters.productType);
     if (filters?.search) params.set('search', filters.search);
     const query = params.toString();
-    const resp = await fetch(`${SQL_ENDPOINT}/export/bom-csv${query ? `?${query}` : ''}`, { headers: this._authHeaders() });
+    const resp = await this._fetchWithRefresh(`${SQL_ENDPOINT}/export/bom-csv${query ? `?${query}` : ''}`, { headers: this._authHeaders() });
     if (!resp.ok) {
       const errText = await resp.text();
       throw new Error(`Failed to export BOM CSV: ${resp.status} ${errText}`);
@@ -572,7 +687,7 @@ export const dbService = {
     if (filters?.search) params.set('search', filters.search);
     if (filters?.classId) params.set('classId', filters.classId);
     const query = params.toString();
-    const resp = await fetch(`${SQL_ENDPOINT}/export/classifications-csv${query ? `?${query}` : ''}`, { headers: this._authHeaders() });
+    const resp = await this._fetchWithRefresh(`${SQL_ENDPOINT}/export/classifications-csv${query ? `?${query}` : ''}`, { headers: this._authHeaders() });
     if (!resp.ok) {
       const errText = await resp.text();
       throw new Error(`Failed to export classifications CSV: ${resp.status} ${errText}`);
@@ -588,7 +703,7 @@ export const dbService = {
     if (filters?.search) params.set('search', filters.search);
     if (filters?.valuelistId) params.set('valuelistId', filters.valuelistId);
     const query = params.toString();
-    const resp = await fetch(`${SQL_ENDPOINT}/export/valuelists-csv${query ? `?${query}` : ''}`, { headers: this._authHeaders() });
+    const resp = await this._fetchWithRefresh(`${SQL_ENDPOINT}/export/valuelists-csv${query ? `?${query}` : ''}`, { headers: this._authHeaders() });
     if (!resp.ok) {
       const errText = await resp.text();
       throw new Error(`Failed to export valuelists CSV: ${resp.status} ${errText}`);
@@ -600,7 +715,7 @@ export const dbService = {
     if (!SQL_ENDPOINT) {
       throw new Error('Database connection not available.');
     }
-    const resp = await fetch(`${SQL_ENDPOINT}/wipe-bom`, { method: 'POST', headers: this._authHeaders() });
+    const resp = await this._fetchWithRefresh(`${SQL_ENDPOINT}/wipe-bom`, { method: 'POST', headers: this._authHeaders() });
     if (!resp.ok) {
       const errText = await resp.text();
       throw new Error(`Failed to wipe BOM data: ${resp.status} ${errText}`);
@@ -619,7 +734,7 @@ export const dbService = {
       throw new Error('Database connection not available. Cannot save data.');
     }
 
-    const response = await fetch(`${SQL_ENDPOINT}/sync`, {
+    const response = await this._fetchWithRefresh(`${SQL_ENDPOINT}/sync`, {
       method: 'POST',
       headers: { ...this._authHeaders(), 'Content-Type': 'application/json' },
       // backend expects a wrapper { state: { ... } }
@@ -655,7 +770,7 @@ export const dbService = {
     if (userRole === 'admin' && data.classifications !== undefined) {
       try {
         console.log('Sending classifications to bulk endpoint:', data.classifications);
-        const clsResp = await fetch(`${SQL_ENDPOINT}/classifications/bulk`, {
+        const clsResp = await this._fetchWithRefresh(`${SQL_ENDPOINT}/classifications/bulk`, {
           method: 'POST',
           headers: { ...this._authHeaders(), 'Content-Type': 'application/json' },
           body: JSON.stringify(data.classifications || [])
@@ -703,7 +818,7 @@ export const dbService = {
     }
 
     try {
-      const response = await fetch(`${SQL_ENDPOINT}/lock`, {
+      const response = await this._fetchWithRefresh(`${SQL_ENDPOINT}/lock`, {
         method: 'POST',
         headers: { ...this._authHeaders(), 'Content-Type': 'application/json' },
         body: JSON.stringify({ itemId, userId, userName, action: 'acquire' })
@@ -728,7 +843,7 @@ export const dbService = {
     }
 
     try {
-      const response = await fetch(`${SQL_ENDPOINT}/lock`, {
+      const response = await this._fetchWithRefresh(`${SQL_ENDPOINT}/lock`, {
         method: 'POST',
         headers: { ...this._authHeaders(), 'Content-Type': 'application/json' },
         body: JSON.stringify({ itemId, userId, action: 'release' })
@@ -751,7 +866,7 @@ export const dbService = {
     }
 
     try {
-      const response = await fetch(`${SQL_ENDPOINT}/lock`, {
+      const response = await this._fetchWithRefresh(`${SQL_ENDPOINT}/lock`, {
         method: 'POST',
         headers: { ...this._authHeaders(), 'Content-Type': 'application/json' },
         body: JSON.stringify({ itemId, userId: 'force', action: 'force-release' })
@@ -773,7 +888,7 @@ export const dbService = {
       throw new Error('Database connection not available');
     }
 
-    await fetch(`${SQL_ENDPOINT}/reset`, { 
+    await this._fetchWithRefresh(`${SQL_ENDPOINT}/reset`, { 
       method: 'POST', 
       headers: this._authHeaders() 
     });
@@ -816,7 +931,7 @@ export const dbService = {
     const headers: Record<string, string> = {};
     const auth = this._authHeaders();
     if (auth.Authorization) headers.Authorization = auth.Authorization;
-    const resp = await fetch(`${SQL_ENDPOINT}/valuelists/upload-csv`, {
+    const resp = await this._fetchWithRefresh(`${SQL_ENDPOINT}/valuelists/upload-csv`, {
       method: 'POST',
       headers,
       body: formData,
@@ -830,7 +945,7 @@ export const dbService = {
 
   async deleteValueList(valuelistId: string): Promise<{ ok: boolean; rowsDeleted: number }> {
     if (!SQL_ENDPOINT) throw new Error('Database connection not available.');
-    const resp = await fetch(`${SQL_ENDPOINT}/valuelists/${encodeURIComponent(valuelistId)}`, {
+    const resp = await this._fetchWithRefresh(`${SQL_ENDPOINT}/valuelists/${encodeURIComponent(valuelistId)}`, {
       method: 'DELETE',
       headers: this._authHeaders(),
     });
@@ -843,7 +958,7 @@ export const dbService = {
 
   async saveValueListsBulk(rows: ValueListRow[]): Promise<{ ok: boolean; rowsInserted: number }> {
     if (!SQL_ENDPOINT) throw new Error('Database connection not available.');
-    const resp = await fetch(`${SQL_ENDPOINT}/valuelists/bulk`, {
+    const resp = await this._fetchWithRefresh(`${SQL_ENDPOINT}/valuelists/bulk`, {
       method: 'POST',
       headers: { ...this._authHeaders(), 'Content-Type': 'application/json' },
       body: JSON.stringify(rows),
@@ -867,7 +982,7 @@ export const dbService = {
 
   async saveBomHierarchy(items: BomHierarchyItem[]): Promise<{ ok: boolean; rowsInserted: number }> {
     if (!SQL_ENDPOINT) throw new Error('Database connection not available.');
-    const resp = await fetch(`${SQL_ENDPOINT}/bom/hierarchy`, {
+    const resp = await this._fetchWithRefresh(`${SQL_ENDPOINT}/bom/hierarchy`, {
       method: 'POST',
       headers: { ...this._authHeaders(), 'Content-Type': 'application/json' },
       body: JSON.stringify(items),
@@ -882,7 +997,7 @@ export const dbService = {
 
   async deleteBomHierarchy(): Promise<{ ok: boolean }> {
     if (!SQL_ENDPOINT) throw new Error('Database connection not available.');
-    const resp = await fetch(`${SQL_ENDPOINT}/bom/hierarchy`, {
+    const resp = await this._fetchWithRefresh(`${SQL_ENDPOINT}/bom/hierarchy`, {
       method: 'DELETE',
       headers: this._authHeaders(),
     });
@@ -920,5 +1035,178 @@ export const dbService = {
       `${SQL_ENDPOINT}/bom/hierarchy/search${qs ? `?${qs}` : ''}`,
       { headers: this._authHeaders(), _ttlMs: 0 },
     );
+  },
+
+  // --- ML Classification ---
+
+  async predictClassification(itemId: string): Promise<{ itemId: string; predictions: MLPrediction[] }> {
+    if (!SQL_ENDPOINT) throw new Error('Database connection not available.');
+    const resp = await this._fetchWithRefresh(`${SQL_ENDPOINT}/ml/predict/${encodeURIComponent(itemId)}`, {
+      method: 'POST',
+      headers: { ...this._authHeaders(), 'Content-Type': 'application/json' },
+    });
+    if (!resp.ok) {
+      const errText = await resp.text();
+      throw new Error(`ML prediction failed: ${resp.status} ${errText}`);
+    }
+    this._invalidateCache();
+    return resp.json();
+  },
+
+  async predictAllClassifications(): Promise<{ status: string; progress: number; total: number; processed: number; error?: string }> {
+    if (!SQL_ENDPOINT) throw new Error('Database connection not available.');
+    const resp = await this._fetchWithRefresh(`${SQL_ENDPOINT}/ml/predict-all`, {
+      method: 'POST',
+      headers: { ...this._authHeaders(), 'Content-Type': 'application/json' },
+    });
+    if (!resp.ok) {
+      const errText = await resp.text();
+      throw new Error(`ML predict-all failed: ${resp.status} ${errText}`);
+    }
+    this._invalidateCache();
+    return resp.json();
+  },
+
+  async getPredictAllStatus(): Promise<{ status: string; progress: number; total: number; processed: number; error?: string }> {
+    if (!SQL_ENDPOINT) throw new Error('Database connection not available.');
+    return this._cachedFetch(`${SQL_ENDPOINT}/ml/predict-all/status`, { headers: this._authHeaders(), _ttlMs: 2000 });
+  },
+
+  async assignClassification(itemId: string, classId: string): Promise<{ ok: boolean; itemId: string; classification: string }> {
+    if (!SQL_ENDPOINT) throw new Error('Database connection not available.');
+    const resp = await this._fetchWithRefresh(`${SQL_ENDPOINT}/ml/classify/${encodeURIComponent(itemId)}`, {
+      method: 'PUT',
+      headers: { ...this._authHeaders(), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ classId }),
+    });
+    if (!resp.ok) {
+      const errText = await resp.text();
+      throw new Error(`Classification assignment failed: ${resp.status} ${errText}`);
+    }
+    this._invalidateCache();
+    return resp.json();
+  },
+
+  async getClassAttributeValues(itemId: string): Promise<{ classId: string | null; values: Record<string, string> }> {
+    if (!SQL_ENDPOINT) throw new Error('Database connection not available.');
+    const resp = await this._fetchWithRefresh(`${SQL_ENDPOINT}/items/${encodeURIComponent(itemId)}/class-attribute-values`, {
+      headers: this._authHeaders(),
+    });
+    if (!resp.ok) {
+      const errText = await resp.text();
+      throw new Error(`Failed to fetch class attribute values: ${resp.status} ${errText}`);
+    }
+    return resp.json();
+  },
+
+  async saveClassAttributeValues(
+    itemId: string,
+    classId: string,
+    previousClassId: string | null,
+    values: Record<string, string>,
+  ): Promise<{ ok: boolean }> {
+    if (!SQL_ENDPOINT) throw new Error('Database connection not available.');
+    const resp = await this._fetchWithRefresh(`${SQL_ENDPOINT}/items/${encodeURIComponent(itemId)}/class-attribute-values`, {
+      method: 'PUT',
+      headers: { ...this._authHeaders(), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ classId, previousClassId, values }),
+    });
+    if (!resp.ok) {
+      const errText = await resp.text();
+      throw new Error(`Failed to save class attribute values: ${resp.status} ${errText}`);
+    }
+    this._invalidateCache();
+    return resp.json();
+  },
+
+  async deleteClassAttributeValues(itemId: string): Promise<{ ok: boolean; deleted: number }> {
+    if (!SQL_ENDPOINT) throw new Error('Database connection not available.');
+    const resp = await this._fetchWithRefresh(`${SQL_ENDPOINT}/items/${encodeURIComponent(itemId)}/class-attribute-values`, {
+      method: 'DELETE',
+      headers: this._authHeaders(),
+    });
+    if (!resp.ok) {
+      const errText = await resp.text();
+      throw new Error(`Failed to delete class attribute values: ${resp.status} ${errText}`);
+    }
+    this._invalidateCache();
+    return resp.json();
+  },
+
+  async getMLSettings(): Promise<MLSettings> {
+    if (!SQL_ENDPOINT) throw new Error('Database connection not available.');
+    const resp = await this._fetchWithRefresh(`${SQL_ENDPOINT}/ml/settings`, { headers: this._authHeaders() });
+    if (!resp.ok) throw new Error(`Failed to fetch ML settings: ${resp.status}`);
+    return resp.json();
+  },
+
+  async updateMLSettings(patch: Partial<MLSettings>): Promise<MLSettings> {
+    if (!SQL_ENDPOINT) throw new Error('Database connection not available.');
+    const resp = await this._fetchWithRefresh(`${SQL_ENDPOINT}/ml/settings`, {
+      method: 'PUT',
+      headers: { ...this._authHeaders(), 'Content-Type': 'application/json' },
+      body: JSON.stringify(patch),
+    });
+    if (!resp.ok) throw new Error(`Failed to update ML settings: ${resp.status}`);
+    return resp.json();
+  },
+
+  // --- Feature Combinations ---
+
+  async triggerFeatureCombinationBuild(): Promise<{ ok: boolean; jobId: number | null }> {
+    if (!SQL_ENDPOINT) throw new Error('Database connection not available.');
+    const resp = await this._fetchWithRefresh(`${SQL_ENDPOINT}/feature-combinations/trigger`, {
+      method: 'POST',
+      headers: this._authHeaders(),
+    });
+    if (!resp.ok) {
+      const errText = await resp.text();
+      throw new Error(`Failed to trigger feature combination build: ${resp.status} ${errText}`);
+    }
+    this._invalidateCache();
+    return resp.json();
+  },
+
+  async fetchFeatureCombinationProgress(): Promise<FeatureCombinationJobProgress> {
+    if (!SQL_ENDPOINT) throw new Error('Database connection not available.');
+    return this._cachedFetch(`${SQL_ENDPOINT}/feature-combinations/progress`, {
+      headers: this._authHeaders(),
+      _ttlMs: 0,
+    });
+  },
+
+  async fetchFeatureCombinations(options?: { search?: string; featureId?: string; attributeType?: string; priority?: number; status?: string; sortBy?: string; sortDir?: string; limit?: number; offset?: number }): Promise<{ items: FeatureCombinationRow[]; total: number }> {
+    if (!SQL_ENDPOINT) throw new Error('Database connection not available.');
+    const params = new URLSearchParams();
+    if (options?.search) params.set('search', options.search);
+    if (options?.featureId) params.set('featureId', options.featureId);
+    if (options?.attributeType) params.set('attributeType', options.attributeType);
+    if (options?.priority != null) params.set('priority', String(options.priority));
+    if (options?.status) params.set('status', options.status);
+    if (options?.sortBy) params.set('sortBy', options.sortBy);
+    if (options?.sortDir) params.set('sortDir', options.sortDir);
+    if (options?.limit != null) params.set('limit', String(options.limit));
+    if (options?.offset != null) params.set('offset', String(options.offset));
+    const query = params.toString();
+    return this._cachedFetch(`${SQL_ENDPOINT}/feature-combinations/list${query ? `?${query}` : ''}`, {
+      headers: this._authHeaders(),
+      _ttlMs: 5000,
+    });
+  },
+
+  async fetchFeatureCombinationFilters(): Promise<{ featureIds: string[]; attributeTypes: string[]; priorities: number[]; statuses: string[] }> {
+    if (!SQL_ENDPOINT) throw new Error('Database connection not available.');
+    return this._cachedFetch(`${SQL_ENDPOINT}/feature-combinations/filters`, {
+      headers: this._authHeaders(),
+      _ttlMs: 10000,
+    });
+  },
+
+  async fetchFeatureCombinationItems(comboId: number): Promise<{ items: FeatureCombinationItem[] }> {
+    if (!SQL_ENDPOINT) throw new Error('Database connection not available.');
+    return this._cachedFetch(`${SQL_ENDPOINT}/feature-combinations/${comboId}/items`, {
+      headers: this._authHeaders(),
+      _ttlMs: 10000,
+    });
   },
 };

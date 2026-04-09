@@ -4,7 +4,7 @@ import BOMHeader from './components/BOMHeader';
 import ItemSidebar from './components/ItemSidebar';
 import LoginSignUp from './components/LoginSignUp';
 import { dbService } from './services/dbService';
-import { GlobalMapping, DataCategory, DatabaseState, User, ConnectionMode, LocalItemMappings, FeatureFlags, ClassAttributeValues, MappingTypeConfig, MappingGenerationProgress, WorkspaceMappingRow } from './types';
+import { GlobalMapping, DataCategory, DatabaseState, User, ConnectionMode, LocalItemMappings, FeatureFlags, MappingTypeConfig, MappingGenerationProgress, WorkspaceMappingRow } from './types';
 import { useBomPagination } from './hooks/useBomPagination';
 import { useLocking } from './hooks/useLocking';
 import { useItemStatusTracking } from './hooks/useItemStatusTracking';
@@ -14,6 +14,7 @@ const MappingWorkspace = lazy(() => import('./components/MappingWorkspace'));
 const DataInspector = lazy(() => import('./components/DataInspector'));
 const MappingDashboard = lazy(() => import('./components/MappingDashboard'));
 const BOMHierarchy = lazy(() => import('./components/BOMHierarchy'));
+const FeatureCombinations = lazy(() => import('./components/FeatureCombinations'));
 
 const LazyFallback = () => (
   <div className="flex items-center justify-center p-8">
@@ -54,11 +55,13 @@ const App: React.FC = () => {
   const [activeInspector, setActiveInspector] = useState<DataCategory | null>(null);
   const [showDashboard, setShowDashboard] = useState(false);
   const [showHierarchy, setShowHierarchy] = useState(false);
+  const [showFeatureCombinations, setShowFeatureCombinations] = useState(false);
   const [showUnmappedOnlyInSidebar, setShowUnmappedOnlyInSidebar] = useState(false);
   const [featureFlags, setFeatureFlags] = useState<FeatureFlags>(() => ({
     useNewClassTargetMapping: import.meta.env.VITE_USE_NEW_CLASS_TARGET_MAPPING === 'true',
   }));
   const [mappingGenerationProgress, setMappingGenerationProgress] = useState<MappingGenerationProgress | null>(null);
+  const [mlPredictionProgress, setMlPredictionProgress] = useState<{ status: string; progress: number; total: number; processed: number } | null>(null);
   const [mappingTotalCount, setMappingTotalCount] = useState(0);
   const [classificationTotalCount, setClassificationTotalCount] = useState(0);
   const [isDataLoading, setIsDataLoading] = useState(false);
@@ -177,6 +180,14 @@ const App: React.FC = () => {
       if (event.payload?.status === 'completed') {
         fetchFromDBRef.current();
       }
+    } else if (event.type === 'ml_prediction_progress') {
+      const p = event.payload;
+      if (p) {
+        setMlPredictionProgress({ status: p.status, progress: p.progress ?? 0, total: p.total ?? 0, processed: p.processed ?? 0 });
+        if (p.status === 'completed') {
+          fetchFromDBRef.current();
+        }
+      }
     }
   }, []);
   useWebSocket(currentUser?.userId ?? null, handleWsEvent);
@@ -265,7 +276,6 @@ const App: React.FC = () => {
         classifications: 'items' in classResult ? classResult.items : [],
         mappingTypeConfig: init.mappingTypeConfig,
         localMappings: {},
-        classAttributeValues: {},
         itemClassifications: init.itemClassifications || {},
         locks: init.locks || {},
         users: init.users || [],
@@ -349,7 +359,6 @@ const App: React.FC = () => {
     localMappings?: LocalItemMappings;
     itemClassifications?: Record<string, string>;
     globalMappings?: GlobalMapping[];
-    classAttributeValues?: ClassAttributeValues;
   }) => {
     if (!dbState) return;
     setIsRefreshing(true);
@@ -359,22 +368,36 @@ const App: React.FC = () => {
       localMappings: { ...dbState.localMappings, ...updates.localMappings },
       itemClassifications: { ...dbState.itemClassifications, ...updates.itemClassifications },
       mappings: updates.globalMappings || dbState.mappings,
-      classAttributeValues: {
-        ...(dbState.classAttributeValues || {}),
-        ...(updates.classAttributeValues || {}),
-      },
     };
 
-    // Never send the partial session BOM (only signed-on items) to the sync endpoint —
-    // doing so would wipe every other item from the database.  BOM is managed exclusively
-    // through the DataInspector CSV upload / Synchronize flow.
-    const { bom: _bom, ...stateWithoutBom } = nextState as any;
+    // Never send the partial session BOM, classifications, or mappings to the sync endpoint —
+    // doing so would create duplicate global mapping rows from the paginated subset.
+    // BOM is managed via DataInspector CSV upload; classifications via their own bulk endpoint;
+    // global mappings via the DataInspector mapping tab.
+    const { bom: _bom, classifications: _cls, mappings: _mappings, ...stateWithoutBom } = nextState as any;
     const saveResult = await dbService.saveAll(stateWithoutBom as DatabaseState, currentUser?.role);
     setConnectionMode(saveResult.mode);
-    setDbState(nextState);
+    // Invalidate cached localMappings for saved items so the useEffect
+    // re-fetches from the backend (which now has auto-populated values).
+    const savedItemIds = Object.keys(updates.localMappings || {});
+    const refreshedLocalMappings = { ...nextState.localMappings };
+    savedItemIds.forEach(id => { delete refreshedLocalMappings[id]; });
+    setDbState({ ...nextState, localMappings: refreshedLocalMappings });
     setIsRefreshing(false);
     setShowSuccess(true);
     setTimeout(() => setShowSuccess(false), 3000);
+  };
+
+  const handleRevertItemToGlobal = async (itemId: string) => {
+    // Targeted refresh: invalidate cached local mappings for reverted item
+    // so the useEffect re-fetches from backend. Don't reset pagination.
+    setDbState(prev => {
+      if (!prev) return prev;
+      const updated = { ...prev.localMappings };
+      delete updated[itemId];
+      return { ...prev, localMappings: updated };
+    });
+    await refreshItemStatuses();
   };
 
   const handleCommit = async () => {
@@ -519,6 +542,59 @@ const App: React.FC = () => {
     }
   };
 
+  const handleRevertAllToGlobal = async () => {
+    if (!confirm('Delete ALL local overrides and regenerate everything from global mappings? This cannot be undone.')) return;
+    try {
+      const result = await dbService.revertAllToGlobal();
+      if (result.mappingGenerationJobId) {
+        setMappingGenerationProgress(prev => ({
+          id: result.mappingGenerationJobId,
+          status: 'queued',
+          isActive: true,
+          progress: 0,
+          totalFeatures: prev?.totalFeatures || 0,
+          processedFeatures: 0,
+          totalValues: prev?.totalValues || 0,
+          processedValues: 0,
+          generatedRows: 0,
+          triggeredByUserId: currentUser?.userId || null,
+          triggeredByUsername: currentUser?.userName || null,
+          startedAt: null,
+          finishedAt: null,
+          updatedAt: Date.now(),
+          error: null,
+        }));
+      }
+    } catch (err: any) {
+      alert(`Failed to revert all to global: ${err?.message || String(err)}`);
+    }
+  };
+
+  const handlePredictAll = async () => {
+    if (!confirm('Run ML classification prediction on all BOM items? This may take a while.')) return;
+    try {
+      const result = await dbService.predictAllClassifications();
+      setMlPredictionProgress({ status: result.status, progress: result.progress, total: result.total, processed: result.processed });
+      // Poll for progress
+      const pollInterval = setInterval(async () => {
+        try {
+          const status = await dbService.getPredictAllStatus();
+          setMlPredictionProgress({ status: status.status, progress: status.progress, total: status.total, processed: status.processed });
+          if (status.status === 'completed' || status.status === 'failed' || status.status === 'idle') {
+            clearInterval(pollInterval);
+            if (status.status === 'completed') {
+              handleFetchFromDB();
+            }
+          }
+        } catch {
+          clearInterval(pollInterval);
+        }
+      }, 3000);
+    } catch (err: any) {
+      alert(`Failed to start ML prediction: ${err?.message || String(err)}`);
+    }
+  };
+
   // Wire useLocking hook
   const { handleSignOn, handleSignOff } = useLocking(dbState, currentUser, setIsRefreshing, handleFetchFromDB);
 
@@ -595,10 +671,10 @@ const App: React.FC = () => {
   const currentLock = selectedItemId ? dbState.locks[selectedItemId] : null;
   const isLockedByMe = currentLock?.userId === currentUser.userId;
 
-  const handleToggleNewClassTargetMapping = () => {
+  const handleToggleNewClassTargetMapping = (forceValue?: boolean) => {
     setFeatureFlags(prev => ({
       ...prev,
-      useNewClassTargetMapping: !prev.useNewClassTargetMapping,
+      useNewClassTargetMapping: forceValue !== undefined ? forceValue : !prev.useNewClassTargetMapping,
     }));
   };
 
@@ -631,9 +707,15 @@ const App: React.FC = () => {
         onOpenHierarchy={() => {
           setShowHierarchy(true);
         }}
+        onOpenFeatureCombinations={() => {
+          setShowFeatureCombinations(true);
+        }}
         mappingGenerationProgress={mappingGenerationProgress}
         onRetriggerGeneration={handleRetriggerGeneration}
+        onRevertAllToGlobal={handleRevertAllToGlobal}
         isMappingGenerationActive={isMappingGenerationActive}
+        onPredictAll={handlePredictAll}
+        mlPredictionProgress={mlPredictionProgress}
       />
       
       <main className="flex flex-1 overflow-hidden relative">
@@ -692,7 +774,6 @@ const App: React.FC = () => {
             globalMappings={dbState.mappings}
             mappingTypeConfig={dbState.mappingTypeConfig}
             localItemMappings={dbState.localMappings}
-            classAttributeValues={dbState.classAttributeValues || {}}
             assignedClassId={selectedItemId ? dbState.itemClassifications[selectedItemId] : null}
             isLockedByMe={isLockedByMe}
             lockOwner={currentLock}
@@ -703,6 +784,7 @@ const App: React.FC = () => {
             onSignOff={async () => selectedItemId && (await handleSignOffWithSidebar(selectedItemId))}
             onSaveChanges={handleSaveWorkspaceChanges}
             onSyncFromDB={handleFetchFromDB}
+            onRevertItem={handleRevertItemToGlobal}
             isGenerationActive={isMappingGenerationActive}
           />
           )}
@@ -761,6 +843,15 @@ const App: React.FC = () => {
             <BOMHierarchy
               currentUser={currentUser}
               onClose={() => setShowHierarchy(false)}
+            />
+          </Suspense>
+        )}
+
+        {showFeatureCombinations && (
+          <Suspense fallback={<LazyFallback />}>
+            <FeatureCombinations
+              currentUser={currentUser}
+              onClose={() => setShowFeatureCombinations(false)}
             />
           </Suspense>
         )}

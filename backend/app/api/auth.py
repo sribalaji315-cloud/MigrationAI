@@ -6,7 +6,7 @@ from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy.orm import Session
 from ..db import models
 from ..db.session import get_db
-from ..schemas import UserCreate, Token, UserOut
+from ..schemas import UserCreate, Token, UserOut, UserUpdate
 from passlib.context import CryptContext
 from ..core.security import create_access_token, create_refresh_token, get_current_user, oauth2_scheme, blacklist_token, ALGORITHM
 from ..core.config import settings
@@ -47,7 +47,12 @@ def register(user_in: UserCreate, request: Request, db: Session = Depends(get_db
     user = db.query(models.User).filter(models.User.username == user_in.username).first()
     if user:
         raise HTTPException(status_code=400, detail="Username already registered")
-    user = models.User(username=user_in.username, password_hash=get_password_hash(user_in.password), role=user_in.role)
+    user = models.User(
+        username=user_in.username, 
+        password_hash=get_password_hash(user_in.password), 
+        role=user_in.role,
+        approval_status="pending"
+    )
     db.add(user)
     db.commit()
     db.refresh(user)
@@ -60,6 +65,13 @@ def login(request: Request, form_data: OAuth2PasswordRequestForm = Depends(), db
     user = db.query(models.User).filter(models.User.username == form_data.username).first()
     if not user or not verify_password(form_data.password, user.password_hash):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
+    
+    if user.approval_status != "approved":
+        if user.approval_status == "rejected":
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Account has been rejected")
+        else:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Account pending admin approval")
+            
     access_token_expires = timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
     access_token = create_access_token(data={"sub": user.username}, expires_delta=access_token_expires)
     refresh_token = create_refresh_token(data={"sub": user.username})
@@ -116,3 +128,47 @@ def refresh_token(body: dict, db: Session = Depends(get_db)):
 @router.get("/me", response_model=UserOut)
 def me(current_user: models.User = Depends(get_current_user)):
     return current_user
+
+
+@router.get("/users", response_model=list[UserOut])
+def get_users(current_user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
+    if getattr(current_user, "role", "user") != "admin":
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin privileges required")
+    return db.query(models.User).all()
+
+
+@router.put("/users/{user_id}", response_model=UserOut)
+def update_user(user_id: int, user_update: UserUpdate, current_user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
+    if getattr(current_user, "role", "user") != "admin":
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin privileges required")
+    
+    user = db.query(models.User).filter(models.User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+        
+    if user_update.role is not None:
+        user.role = user_update.role
+    if user_update.approval_status is not None:
+        user.approval_status = user_update.approval_status
+        
+    db.commit()
+    db.refresh(user)
+    return user
+
+
+@router.delete("/users/{user_id}")
+def delete_user(user_id: int, current_user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
+    if getattr(current_user, "role", "user") != "admin":
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin privileges required")
+        
+    if current_user.id == user_id:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Cannot delete your own account")
+        
+    user = db.query(models.User).filter(models.User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+        
+    db.delete(user)
+    db.commit()
+    return {"detail": "User deleted successfully"}
+

@@ -98,7 +98,7 @@ const LegacyValueSelector: React.FC<LegacyValueSelectorProps> = ({ value, option
           </button>
         )}
       </div>
-      {open && filteredOptions.length > 0 && (
+      {open && (
         <div className="absolute z-20 mt-1 w-full bg-white border border-slate-200 rounded-md shadow-lg max-h-56 overflow-y-auto">
           <div className="p-1 border-b border-slate-100">
             <input
@@ -106,21 +106,26 @@ const LegacyValueSelector: React.FC<LegacyValueSelectorProps> = ({ value, option
               onChange={(e) => setSearch(e.target.value)}
               placeholder="Filter values..."
               className="w-full px-2 py-1 text-[9px] rounded-md border border-slate-200 outline-none focus:border-indigo-400"
+              autoFocus
             />
           </div>
-          <ul className="py-1 text-[9px]">
-            {filteredOptions.map(opt => (
-              <li key={opt}>
-                <button
-                  type="button"
-                  onClick={() => handleSelect(opt)}
-                  className="w-full text-left px-2 py-1 hover:bg-indigo-50 text-slate-700"
-                >
-                  {opt}
-                </button>
-              </li>
-            ))}
-          </ul>
+          {filteredOptions.length > 0 ? (
+            <ul className="py-1 text-[9px]">
+              {filteredOptions.map(opt => (
+                <li key={opt}>
+                  <button
+                    type="button"
+                    onClick={() => handleSelect(opt)}
+                    className="w-full text-left px-2 py-1 hover:bg-indigo-50 text-slate-700"
+                  >
+                    {opt}
+                  </button>
+                </li>
+              ))}
+            </ul>
+          ) : (
+            <div className="px-2 py-2 text-[9px] text-slate-400 text-center">No matches</div>
+          )}
         </div>
       )}
     </div>
@@ -1242,12 +1247,13 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
     URL.revokeObjectURL(url);
   };
 
-  const handleExportRawMappings = () => {
+  const handleExportRawMappings = async () => {
     if (category !== 'mapping') return;
 
+    const allMappings = await fetchAllGlobalMappings();
     const rows: string[][] = [['legacyFeatureIds', 'newAttributeId', 'attributeType', 'legacy value', 'new value']];
 
-    localMapping.forEach(m => {
+    allMappings.forEach(m => {
       if (!isTypeIncludedInExport(m.attributeType)) return;
       const featureCell = (m.legacyFeatureIds || []).join('|');
       const targetCell = m.newAttributeId || '';
@@ -1276,12 +1282,13 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
     URL.revokeObjectURL(url);
   };
 
-  const handleExportExpandedMappings = () => {
+  const handleExportExpandedMappings = async () => {
     if (category !== 'mapping') return;
 
+    const allMappings = await fetchAllGlobalMappings();
     const rows: string[][] = [['legacyFeatureId', 'newAttributeId', 'attributeType', 'legacy value', 'new value']];
 
-    localMapping.forEach(m => {
+    allMappings.forEach(m => {
       if (!isTypeIncludedInExport(m.attributeType)) return;
       const featureIds = (m.legacyFeatureIds || []).filter(Boolean);
       const targetCell = m.newAttributeId || '';
@@ -1793,7 +1800,24 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
       setLocalBom(next);
       setSelectedBomItemId('NEW-ITEM');
     } else if (category === 'users') {
-      setLocalUsers([...localUsers, { userId: `USR-${Date.now()}`, userName: 'new_user', password: 'password', role: 'user' }]);
+      const username = prompt('Enter a new username:');
+      if (!username || !username.trim()) return;
+      const pass = prompt('Enter a password:');
+      if (!pass || !pass.trim()) return;
+      
+      try {
+        dbService.register(username.trim(), pass.trim(), 'user').then(() => {
+          alert('User registered successfully.');
+          // Best effort refresh from dbService if init is available (will just re-render next fetch)
+          dbService.fetchInit().then(initResp => {
+            setLocalUsers(initResp.users || []);
+          });
+        }).catch(err => {
+          alert(`Failed to add user: ${err?.message || String(err)}`);
+        });
+      } catch (err: any) {
+        alert(`Failed to add user: ${err?.message || String(err)}`);
+      }
     }
   };
 
@@ -1837,7 +1861,32 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
           setServerBomTotal(prev => Math.max(0, prev - 1));
         }
       }
-      if (category === 'users') setLocalUsers(localUsers.filter((_, i) => i !== index));
+      if (category === 'users') {
+        const u = localUsers[index];
+        if (u && u.userId.startsWith('USR-')) {
+          const numId = parseInt(u.userId.split('-')[1]);
+          dbService.deleteUser(numId).then(async () => {
+            // refresh exact state from DB and push to parent
+            try {
+              const initResp = await dbService.fetchInit();
+              const freshUsers = initResp.users || [];
+              setLocalUsers(freshUsers);
+              await onSave('users', freshUsers, { closeInspector: false, source: 'auto' });
+            } catch (e) {}
+          }).catch(async (err) => {
+            // refresh exact state from DB on error
+            try {
+              const initResp = await dbService.fetchInit();
+              const freshUsers = initResp.users || [];
+              setLocalUsers(freshUsers);
+              await onSave('users', freshUsers, { closeInspector: false, source: 'auto' });
+            } catch (e) {}
+            alert(`Failed to delete user: ${err?.message || String(err)}`);
+          });
+        } else {
+          setLocalUsers(localUsers.filter((_, i) => i !== index));
+        }
+      }
     }
   };
 
@@ -2298,6 +2347,7 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
                       <th className="px-6 py-4 text-[10px] font-black text-slate-400 uppercase tracking-widest">Username</th>
                       <th className="px-6 py-4 text-[10px] font-black text-slate-400 uppercase tracking-widest">Security Token</th>
                       <th className="px-6 py-4 text-[10px] font-black text-slate-400 uppercase tracking-widest">Authority</th>
+                      <th className="px-6 py-4 text-[10px] font-black text-slate-400 uppercase tracking-widest">Approval Status</th>
                       <th className="px-6 py-4 text-center text-[10px] font-black text-slate-400 uppercase tracking-widest">Action</th>
                     </tr>
                   </thead>
@@ -2340,6 +2390,25 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
                            >
                              <option value="user">USER</option>
                              <option value="admin">ADMIN</option>
+                           </select>
+                        </td>
+                        <td className="px-6 py-3">
+                           <select 
+                             value={user.approvalStatus || 'approved'}
+                             onChange={(e) => {
+                               const next = [...localUsers];
+                               next[idx].approvalStatus = e.target.value as 'pending' | 'approved' | 'rejected';
+                               setLocalUsers(next);
+                             }}
+                             className={`text-[9px] font-black uppercase px-2 py-0.5 rounded-[4px] outline-none transition-all ${
+                               user.approvalStatus === 'pending' ? 'bg-amber-100 text-amber-700' :
+                               user.approvalStatus === 'rejected' ? 'bg-red-100 text-red-700' :
+                               'bg-emerald-100 text-emerald-700'
+                             }`}
+                           >
+                             <option value="pending">PENDING</option>
+                             <option value="approved">APPROVED</option>
+                             <option value="rejected">REJECTED</option>
                            </select>
                         </td>
                         <td className="px-6 py-3 flex items-center justify-center gap-2">
@@ -3578,13 +3647,59 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
           >
             Discard
           </button>
-          {currentUser.role === 'admin' && hasCsvUploaded && (
+          {currentUser.role === 'admin' && hasCsvUploaded && category !== 'users' && (
             <button 
               onClick={handleSave}
               disabled={isSaving}
               className="px-6 py-2 bg-blue-600 text-white rounded-lg text-[10px] font-black hover:bg-blue-700 shadow-md transition-all active:scale-95 uppercase tracking-widest disabled:opacity-60 disabled:cursor-not-allowed"
             >
               {isSaving ? 'Synchronizing...' : 'Synchronize'}
+            </button>
+          )}
+          {currentUser.role === 'admin' && category === 'users' && (
+            <button 
+              onClick={async () => {
+                try {
+                  setIsSaving(true);
+                  // Find all users that exist in our database (USR- prefix implies persisted)
+                  for (let i = 0; i < localUsers.length; i++) {
+                    const u = localUsers[i];
+                    if (u.userId.startsWith('USR-')) {
+                      const numId = parseInt(u.userId.split('-')[1]);
+                      await dbService.updateUser(numId, {
+                        role: u.role,
+                        approval_status: u.approvalStatus || 'approved'
+                      });
+                    }
+                  }
+                  
+                  // Reload user state from DB and push to parent
+                  const initResp = await dbService.fetchInit();
+                  const freshUsers = initResp.users || [];
+                  setLocalUsers(freshUsers);
+                  // Push fresh users to parent state so hydration effect doesn't overwrite
+                  await onSave('users', freshUsers, { closeInspector: false, source: 'auto' });
+                  
+                  alert('User updates saved successfully.');
+                } catch (err: any) {
+                  // Reload user state from DB to revert any partial/failed changes
+                  try {
+                    const initResp = await dbService.fetchInit();
+                    const freshUsers = initResp.users || [];
+                    setLocalUsers(freshUsers);
+                    await onSave('users', freshUsers, { closeInspector: false, source: 'auto' });
+                  } catch (e) {
+                    /* best effort */
+                  }
+                  alert(`Failed to save users: ${err?.message || String(err)}`);
+                } finally {
+                  setIsSaving(false);
+                }
+              }}
+              disabled={isSaving}
+              className="px-6 py-2 bg-indigo-600 text-white rounded-lg text-[10px] font-black hover:bg-indigo-700 shadow-md transition-all active:scale-95 uppercase tracking-widest disabled:opacity-60 disabled:cursor-not-allowed"
+            >
+              {isSaving ? 'Saving...' : 'Save Changes'}
             </button>
           )}
         </div>

@@ -41,11 +41,16 @@ def run(dry_run: bool = False):
     Session = sessionmaker(bind=engine)
     session = Session()
 
-    # 1. Collect all feature IDs already covered by a global mapping
+    # 1. Collect all feature IDs already covered by a global mapping.
+    #    Also index existing rows for merging new values.
     covered_features: set[str] = set()
+    existing_gm_by_feature: dict[str, GlobalMapping] = {}
     for gm in session.query(GlobalMapping).all():
         for fid in (gm.legacy_feature_ids or []):
-            covered_features.add(str(fid).strip())
+            norm_fid = str(fid).strip()
+            covered_features.add(norm_fid)
+            if norm_fid not in existing_gm_by_feature:
+                existing_gm_by_feature[norm_fid] = gm
 
     print(f"Global mappings already cover {len(covered_features)} unique feature IDs.")
 
@@ -60,21 +65,46 @@ def run(dry_run: bool = False):
     )
     print(f"Found {len(uncat_rows)} uncategorized workspace mapping rows.")
 
-    # 3. Group by legacy_feature_id, collecting value mappings
+    # 3. Group by legacy_feature_id, collecting value mappings.
+    #    Separate into "new" features and "covered" features (for merging).
     feature_values: dict[str, dict[str, str]] = defaultdict(dict)
+    features_to_merge: dict[str, dict[str, str]] = defaultdict(dict)
     for row in uncat_rows:
         fid = str(row.legacy_feature_id or "").strip()
         if not fid:
             continue
-        if fid in covered_features:
-            continue
         legacy_val = row.legacy_value or ""
         new_val = row.new_value or ""
+        target = features_to_merge[fid] if fid in covered_features else feature_values[fid]
         # Keep the first non-empty new_value seen for each legacy value
-        if legacy_val not in feature_values[fid] or (
-            not feature_values[fid][legacy_val] and new_val
-        ):
-            feature_values[fid][legacy_val] = new_val
+        if legacy_val not in target or (not target[legacy_val] and new_val):
+            target[legacy_val] = new_val
+
+    # 3b. Merge new values into existing global mappings for covered features
+    merged_count = 0
+    for fid, vals in features_to_merge.items():
+        gm = existing_gm_by_feature.get(fid)
+        if not gm:
+            continue
+        existing_vals = dict(gm.value_mappings or {})
+        added = 0
+        for k, v in vals.items():
+            if k not in existing_vals:
+                existing_vals[k] = v
+                added += 1
+            elif not existing_vals[k] and v:
+                existing_vals[k] = v
+                added += 1
+        if added:
+            merged_count += 1
+            if not dry_run:
+                gm.value_mappings = existing_vals
+    if merged_count:
+        if dry_run:
+            print(f"[DRY-RUN] Would merge new values into {merged_count} existing global mappings.")
+        else:
+            session.commit()
+            print(f"Merged new values into {merged_count} existing global mappings.")
 
     print(f"Found {len(feature_values)} uncovered feature IDs from workspace mappings.")
 

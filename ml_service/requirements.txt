@@ -1,0 +1,7 @@
+fastapi==0.115.7
+uvicorn==0.34.0
+websockets==15.0.1
+pandas==3.0.1
+scikit-learn==1.8.0
+joblib==1.4.2
+python-dotenv==1.0.1

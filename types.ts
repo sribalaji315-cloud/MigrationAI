@@ -7,6 +7,7 @@ export interface User {
   userName: string;
   password: string;
   role: 'admin' | 'user';
+  approvalStatus?: 'pending' | 'approved' | 'rejected';
 }
 
 export interface LegacyFeature {
@@ -20,12 +21,26 @@ export interface LegacyFeature {
   valueDescriptions?: Record<string, string>;
 }
 
+export interface MLPrediction {
+  classId: string;
+  className: string;
+  confidence: number;
+}
+
+export interface MLSettings {
+  useSynonymAssist: boolean;
+  synonymThreshold: number;
+  synonymWeight: number;
+}
+
 export interface LegacyItem {
   itemId: string;
   description: string;
   category?: string;
   productType?: string;
   priority?: number;
+  classification?: string;
+  mlPredictions?: MLPrediction[];
   features: LegacyFeature[];
 }
 
@@ -163,4 +178,46 @@ export interface BomHierarchyItem {
   formula?: string;
   createdAt?: number;
   createdBy?: string;
+}
+
+export interface FeatureCombinationJobProgress {
+  id?: number;
+  status: 'idle' | 'queued' | 'running' | 'completed' | 'failed';
+  isActive: boolean;
+  progress: number;
+  totalFeatures: number;
+  processedFeatures: number;
+  generatedRows: number;
+  startedAt?: number | null;
+  finishedAt?: number | null;
+  error?: string | null;
+}
+
+export interface FeatureCombinationRow {
+  id: number;
+  featureId: string;
+  description: string;
+  unit: string;
+  attributeType: string;
+  normalizedValues: string[];
+  normalizedValuesKey: string;
+  itemCount: number;
+  filteredItemCount?: number | null;
+  legacyValueCount: number;
+  comboCountForFeature: number;
+  d365AttributeId: string;
+  d365Values: Record<string, string>;
+  mappedValueCount: number;
+  mappingStatus: 'complete' | 'partial' | 'unmapped';
+  priorities: number[];
+  builtAt?: number | null;
+}
+
+export interface FeatureCombinationItem {
+  itemId: string;
+  description: string;
+  category: string;
+  productType: string;
+  priority?: number | null;
+  classification: string;
 }

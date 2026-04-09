@@ -1,6 +1,6 @@
 
-import React from 'react';
-import { DataCategory, User, MappingGenerationProgress } from '../types';
+import React, { useState, useEffect, useRef } from 'react';
+import { DataCategory, User, MappingGenerationProgress, MLSettings } from '../types';
 import { dbService } from '../services/dbService';
 
 interface BOMHeaderProps {
@@ -14,12 +14,16 @@ interface BOMHeaderProps {
   onExportBomCsv: () => void;
   onOpenDashboard: () => void;
   onOpenHierarchy: () => void;
+  onOpenFeatureCombinations: () => void;
   mappingGenerationProgress?: MappingGenerationProgress | null;
   onRetriggerGeneration?: () => void;
+  onRevertAllToGlobal?: () => void;
   isMappingGenerationActive?: boolean;
+  onPredictAll?: () => void;
+  mlPredictionProgress?: { status: string; progress: number; total: number; processed: number } | null;
 }
 
-const BOMHeader: React.FC<BOMHeaderProps> = ({ onRegenerate, isRefreshing, onInspectData, onCommit, currentUser, onLogout, onClearCache, onExportBomCsv, onOpenDashboard, onOpenHierarchy, mappingGenerationProgress, onRetriggerGeneration, isMappingGenerationActive }) => {
+const BOMHeader: React.FC<BOMHeaderProps> = ({ onRegenerate, isRefreshing, onInspectData, onCommit, currentUser, onLogout, onClearCache, onExportBomCsv, onOpenDashboard, onOpenHierarchy, onOpenFeatureCombinations, mappingGenerationProgress, onRetriggerGeneration, onRevertAllToGlobal, isMappingGenerationActive, onPredictAll, mlPredictionProgress }) => {
   const uploadOptions: { label: string; id: DataCategory; icon: string; adminOnly?: boolean }[] = [
     { label: 'Global Mapping', id: 'mapping', icon: 'M8 7v8a2 2 0 002 2h6M8 7V5a2 2 0 012-2h4.586a1 1 0 01.707.293l4.414 4.414a1 1 0 01.293.707V15a2 2 0 01-2 2h-2' },
     { label: 'Classifications', id: 'classification', icon: 'M4 6h16M4 10h16M4 14h16M4 18h16' },
@@ -33,6 +37,35 @@ const BOMHeader: React.FC<BOMHeaderProps> = ({ onRegenerate, isRefreshing, onIns
       await dbService.resetToDefaults();
       onRegenerate();
     }
+  };
+
+  // ML settings popover
+  const [mlSettingsOpen, setMlSettingsOpen] = useState(false);
+  const [mlSettings, setMlSettings] = useState<MLSettings>({ useSynonymAssist: true, synonymThreshold: 0.5, synonymWeight: 0.35 });
+  const [mlSettingsDirty, setMlSettingsDirty] = useState(false);
+  const mlPopoverRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (mlSettingsOpen && currentUser.role === 'admin') {
+      dbService.getMLSettings().then(setMlSettings).catch(() => {});
+    }
+  }, [mlSettingsOpen]);
+
+  useEffect(() => {
+    if (!mlSettingsOpen) return;
+    const handler = (e: MouseEvent) => {
+      if (mlPopoverRef.current && !mlPopoverRef.current.contains(e.target as Node)) setMlSettingsOpen(false);
+    };
+    document.addEventListener('mousedown', handler);
+    return () => document.removeEventListener('mousedown', handler);
+  }, [mlSettingsOpen]);
+
+  const saveMLSettings = async (patch: Partial<MLSettings>) => {
+    try {
+      const updated = await dbService.updateMLSettings(patch);
+      setMlSettings(updated);
+      setMlSettingsDirty(false);
+    } catch { /* ignore */ }
   };
 
   const generationPercent = Math.round(((mappingGenerationProgress?.progress || 0) * 100));
@@ -88,6 +121,117 @@ const BOMHeader: React.FC<BOMHeaderProps> = ({ onRegenerate, isRefreshing, onIns
                   </svg>
                   Regenerate
                 </button>
+              )}
+              {currentUser.role === 'admin' && onRevertAllToGlobal && (
+                <button
+                  type="button"
+                  onClick={onRevertAllToGlobal}
+                  disabled={isMappingGenerationActive}
+                  className={`ml-1 inline-flex items-center gap-1 px-2 py-0.5 border rounded-full text-[8px] font-black uppercase tracking-widest transition-colors ${
+                    isMappingGenerationActive
+                      ? 'bg-slate-50 border-slate-200 text-slate-300 cursor-not-allowed'
+                      : 'bg-amber-50 border-amber-200 text-amber-700 hover:bg-amber-100'
+                  }`}
+                  title="Delete all local overrides and regenerate everything from global mappings"
+                >
+                  <svg className="w-2.5 h-2.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M3 10h10a8 8 0 018 8v2M3 10l6 6m-6-6l6-6" />
+                  </svg>
+                  Revert All to Global
+                </button>
+              )}
+              {currentUser.role === 'admin' && onPredictAll && (
+                <div className="relative inline-flex items-center">
+                <button
+                  type="button"
+                  onClick={onPredictAll}
+                  disabled={mlPredictionProgress?.status === 'running' || mlPredictionProgress?.status === 'queued'}
+                  className={`ml-1 inline-flex items-center gap-1 px-2 py-0.5 border rounded-l-full text-[8px] font-black uppercase tracking-widest transition-colors ${
+                    mlPredictionProgress?.status === 'running' || mlPredictionProgress?.status === 'queued'
+                      ? 'bg-slate-50 border-slate-200 text-slate-300 cursor-not-allowed'
+                      : 'bg-violet-50 border-violet-200 text-violet-700 hover:bg-violet-100'
+                  }`}
+                  title="Run ML classification prediction on all BOM items"
+                >
+                  <svg className="w-2.5 h-2.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M9.663 17h4.673M12 3v1m6.364 1.636l-.707.707M21 12h-1M4 12H3m3.343-5.657l-.707-.707m2.828 9.9a5 5 0 117.072 0l-.548.547A3.374 3.374 0 0014 18.469V19a2 2 0 11-4 0v-.531c0-.895-.356-1.754-.988-2.386l-.548-.547z" />
+                  </svg>
+                  ML Predict All
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setMlSettingsOpen(!mlSettingsOpen)}
+                  className={`inline-flex items-center px-1.5 py-0.5 border border-l-0 rounded-r-full text-[8px] transition-colors ${
+                    mlSettingsOpen
+                      ? 'bg-violet-100 border-violet-300 text-violet-800'
+                      : 'bg-violet-50 border-violet-200 text-violet-500 hover:bg-violet-100'
+                  }`}
+                  title="ML prediction settings"
+                >
+                  <svg className="w-2.5 h-2.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.066 2.573c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.573 1.066c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.066-2.573c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
+                  </svg>
+                </button>
+                {mlSettingsOpen && (
+                  <div ref={mlPopoverRef} className="absolute top-full left-0 mt-1 z-50 bg-white border border-violet-200 rounded-lg shadow-lg p-3 w-64">
+                    <div className="text-[9px] font-black text-violet-700 uppercase tracking-widest mb-2">ML Prediction Settings</div>
+                    <label className="flex items-center gap-2 mb-2.5 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={mlSettings.useSynonymAssist}
+                        onChange={e => saveMLSettings({ useSynonymAssist: e.target.checked })}
+                        className="accent-violet-600 w-3 h-3"
+                      />
+                      <span className="text-[10px] font-bold text-slate-700">Synonym Assist</span>
+                    </label>
+                    <div className="mb-2">
+                      <div className="flex items-center justify-between mb-0.5">
+                        <span className="text-[9px] font-bold text-slate-500 uppercase">Threshold</span>
+                        <span className="text-[9px] font-black text-violet-700 tabular-nums">{mlSettings.synonymThreshold.toFixed(2)}</span>
+                      </div>
+                      <input
+                        type="range" min="0" max="1" step="0.05"
+                        value={mlSettings.synonymThreshold}
+                        onChange={e => { setMlSettings(s => ({ ...s, synonymThreshold: parseFloat(e.target.value) })); setMlSettingsDirty(true); }}
+                        onMouseUp={() => mlSettingsDirty && saveMLSettings({ synonymThreshold: mlSettings.synonymThreshold })}
+                        onTouchEnd={() => mlSettingsDirty && saveMLSettings({ synonymThreshold: mlSettings.synonymThreshold })}
+                        className="w-full h-1 bg-violet-100 rounded-full appearance-none cursor-pointer accent-violet-600"
+                        disabled={!mlSettings.useSynonymAssist}
+                      />
+                      <div className="flex justify-between text-[8px] text-slate-400"><span>Lenient</span><span>Strict</span></div>
+                    </div>
+                    <div>
+                      <div className="flex items-center justify-between mb-0.5">
+                        <span className="text-[9px] font-bold text-slate-500 uppercase">Weight</span>
+                        <span className="text-[9px] font-black text-violet-700 tabular-nums">{mlSettings.synonymWeight.toFixed(2)}</span>
+                      </div>
+                      <input
+                        type="range" min="0" max="1" step="0.05"
+                        value={mlSettings.synonymWeight}
+                        onChange={e => { setMlSettings(s => ({ ...s, synonymWeight: parseFloat(e.target.value) })); setMlSettingsDirty(true); }}
+                        onMouseUp={() => mlSettingsDirty && saveMLSettings({ synonymWeight: mlSettings.synonymWeight })}
+                        onTouchEnd={() => mlSettingsDirty && saveMLSettings({ synonymWeight: mlSettings.synonymWeight })}
+                        className="w-full h-1 bg-violet-100 rounded-full appearance-none cursor-pointer accent-violet-600"
+                        disabled={!mlSettings.useSynonymAssist}
+                      />
+                      <div className="flex justify-between text-[8px] text-slate-400"><span>Model Only</span><span>Synonym Only</span></div>
+                    </div>
+                  </div>
+                )}
+                </div>
+              )}
+              {mlPredictionProgress && (mlPredictionProgress.status === 'running' || mlPredictionProgress.status === 'queued' || mlPredictionProgress.status === 'completed' || mlPredictionProgress.status === 'failed') && (
+                <div className={`ml-2 inline-flex items-center gap-1 px-2 py-0.5 border rounded-full text-[8px] font-black uppercase tracking-widest ${
+                  mlPredictionProgress.status === 'failed'
+                    ? 'bg-rose-50 border-rose-200 text-rose-700'
+                    : mlPredictionProgress.status === 'completed'
+                      ? 'bg-emerald-50 border-emerald-200 text-emerald-700'
+                      : 'bg-violet-50 border-violet-200 text-violet-700'
+                }`}>
+                  <span>ML Predict</span>
+                  <span>{mlPredictionProgress.status === 'running' || mlPredictionProgress.status === 'queued' ? `${Math.round(mlPredictionProgress.progress * 100)}%` : mlPredictionProgress.status}</span>
+                </div>
               )}
             </div>
           </div>
@@ -183,6 +327,17 @@ const BOMHeader: React.FC<BOMHeaderProps> = ({ onRegenerate, isRefreshing, onIns
                       <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 6h16M4 10h16M4 14h16M4 18h16" />
                     </svg>
                     BOM Hierarchy
+                  </button>
+
+                  <button 
+                    type="button"
+                    onClick={onOpenFeatureCombinations}
+                    className="flex items-center gap-1.5 px-2.5 py-1.5 bg-teal-50 text-teal-700 border border-teal-100 hover:bg-teal-100 rounded-md text-[9px] font-black transition-all whitespace-nowrap uppercase tracking-wider"
+                  >
+                    <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10" />
+                    </svg>
+                    Feature Combos
                   </button>
 
                   <button 

@@ -75,6 +75,18 @@ function SidebarRow({ index, style, filteredItems, locks, currentUserId, selecte
             </span>
           )}
         </div>
+        {item.mlPredictions && item.mlPredictions.length > 0 && (
+          <div className="flex items-center gap-1 mt-1">
+            <span className="text-[8px] font-black text-violet-600 bg-violet-50 px-1.5 py-0.5 rounded-full truncate max-w-[100px]" title={`ML: ${item.mlPredictions[0].className} (${Math.round(item.mlPredictions[0].confidence * 100)}%)`}>
+              {item.mlPredictions[0].className} {Math.round(item.mlPredictions[0].confidence * 100)}%
+            </span>
+            {item.classification && (
+              <span className="text-[7px] font-black text-emerald-600 bg-emerald-50 px-1 py-0.5 rounded-full" title="Assigned class">
+                ✓
+              </span>
+            )}
+          </div>
+        )}
         {isLockedByOthers && (
           <p className="text-[8px] text-amber-600 font-black mt-1.5 flex items-center gap-1 uppercase tracking-wider">
             <span className="w-1 h-1 bg-amber-400 rounded-full animate-pulse"></span>

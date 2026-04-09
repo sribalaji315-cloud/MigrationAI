@@ -6,7 +6,7 @@ import uuid
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.gzip import GZipMiddleware
-from .api import auth, state, classifications, valuelists
+from .api import auth, state, classifications, valuelists, ml
 from .api.websocket import manager
 from .db.session import engine, Base, SessionLocal
 from .db import models
@@ -39,6 +39,7 @@ app.include_router(auth.router)
 app.include_router(state.router)
 app.include_router(classifications.router)
 app.include_router(valuelists.router)
+app.include_router(ml.router)
 
 
 @app.middleware("http")
@@ -93,6 +94,7 @@ def ensure_admin_user():
                 username=settings.ADMIN_EMAIL,
                 password_hash=pwd.hash(settings.ADMIN_PASSWORD),
                 role="admin",
+                approval_status="approved"
             )
             db.add(admin_user)
             db.commit()

@@ -39,26 +39,30 @@ def run(dry_run: bool = False):
     Session = sessionmaker(bind=engine)
     session = Session()
 
-    # 1. Collect all feature IDs already covered by a global mapping
+    # 1. Collect all feature IDs already covered by a global mapping.
+    #    Also build an index of existing global mappings by feature for
+    #    merging new values into existing rows instead of creating duplicates.
     covered_features: set[str] = set()
+    existing_gm_by_feature: dict[str, GlobalMapping] = {}
     for gm in session.query(GlobalMapping).all():
         for fid in (gm.legacy_feature_ids or []):
-            covered_features.add(str(fid).strip())
+            norm_fid = str(fid).strip()
+            covered_features.add(norm_fid)
+            # Keep the first (or best) match per feature for merging
+            if norm_fid not in existing_gm_by_feature:
+                existing_gm_by_feature[norm_fid] = gm
 
     print(f"Global mappings already cover {len(covered_features)} unique feature IDs.")
 
-    # 2. Collect all distinct feature IDs from BOM, along with their values
-    #    Multiple BOM items can share the same feature_id; we merge values.
+    # 2. Collect all distinct feature IDs from BOM, along with their values.
+    #    Features that already have a global mapping are collected separately
+    #    so their new values can be merged into the existing row.
     feature_values: dict[str, set[str]] = {}
+    features_to_merge: dict[str, set[str]] = {}
     for feat in session.query(BomFeature).yield_per(2000):
         fid = str(feat.feature_id or "").strip()
         if not fid:
             continue
-        if fid in covered_features:
-            continue
-
-        if fid not in feature_values:
-            feature_values[fid] = set()
 
         raw = feat.values
         if isinstance(raw, dict):
@@ -68,12 +72,43 @@ def run(dry_run: bool = False):
         else:
             vals = []
 
+        value_set: set[str] = set()
         for v in vals:
             sv = str(v).strip()
             if sv:
-                feature_values[fid].add(sv)
+                value_set.add(sv)
+
+        if fid in covered_features:
+            # Track values for merging into existing global mapping
+            features_to_merge.setdefault(fid, set()).update(value_set)
+        else:
+            feature_values.setdefault(fid, set()).update(value_set)
 
     print(f"Found {len(feature_values)} uncovered feature IDs in BOM.")
+    print(f"Found {len(features_to_merge)} covered features with potentially new values to merge.")
+
+    # 2b. Merge new values into existing global mappings
+    merged_count = 0
+    for fid, new_vals in features_to_merge.items():
+        gm = existing_gm_by_feature.get(fid)
+        if not gm:
+            continue
+        existing_vals = gm.value_mappings or {}
+        added = 0
+        for v in new_vals:
+            if v not in existing_vals:
+                existing_vals[v] = ""
+                added += 1
+        if added:
+            merged_count += 1
+            if not dry_run:
+                gm.value_mappings = existing_vals
+    if merged_count:
+        if dry_run:
+            print(f"[DRY-RUN] Would merge new values into {merged_count} existing global mappings.")
+        else:
+            session.commit()
+            print(f"Merged new values into {merged_count} existing global mappings.")
 
     if not feature_values:
         print("Nothing to do – all BOM features already have a global mapping.")

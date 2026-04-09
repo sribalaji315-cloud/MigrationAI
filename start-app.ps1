@@ -3,7 +3,8 @@
     Start, stop, or restart the ERP Data Migrator services.
 
 .DESCRIPTION
-    Manages the backend (FastAPI/uvicorn on port 8000) and frontend (Vite on port 3000).
+    Manages the backend (FastAPI/uvicorn on port 8000), the standalone ML prediction
+    service (port 8014), and frontend (Vite on port 3000).
     Environment variables are loaded from backend/.env automatically.
     The LAN IP is detected and added to ALLOWED_ORIGINS so both localhost
     and network clients can access the app.
@@ -15,9 +16,10 @@
     restart - Stop then start
 
 .PARAMETER Mode
-    all      - Both backend and frontend (default)
-    backend  - Backend only
-    frontend - Frontend only
+    all       - Backend, frontend, and ML service (default)
+    backend   - Backend only
+    frontend  - Frontend only
+    mlservice - ML classification service only
 
 .EXAMPLE
     .\start-app.ps1                            # Start everything
@@ -26,7 +28,8 @@
     .\start-app.ps1 -Action restart            # Restart everything
     .\start-app.ps1 -Action start -Mode backend   # Start backend only
     .\start-app.ps1 -Action stop  -Mode frontend  # Stop frontend only
-    .\start-app.ps1 -Action restart -Mode backend  # Restart backend only
+    .\.\start-app.ps1 -Action restart -Mode backend    # Restart backend only
+    .\.\start-app.ps1 -Action start -Mode mlservice   # Start ML service only
 
 .NOTES
     Prerequisites:
@@ -39,7 +42,7 @@ param(
     [ValidateSet("start", "stop", "restart")]
     [string]$Action = "start",
 
-    [ValidateSet("all", "backend", "frontend")]
+    [ValidateSet("all", "backend", "frontend", "mlservice")]
     [string]$Mode = "all"
 )
 
@@ -51,6 +54,8 @@ $venvPython = Join-Path $root ".venv\Scripts\python.exe"
 $pidDir = Join-Path $root ".pids"
 $backendPidFile = Join-Path $pidDir "backend.pid"
 $frontendPidFile = Join-Path $pidDir "frontend.pid"
+$mlservicePidFile = Join-Path $pidDir "mlservice.pid"
+$mlservicePath = Join-Path $root "ml_predict_service"
 
 # Ensure .pids directory exists
 if (-not (Test-Path $pidDir)) {
@@ -155,6 +160,11 @@ function Stop-Frontend {
     Stop-PortProcesses 5173
 }
 
+function Stop-MLService {
+    Stop-ServiceByPidFile $mlservicePidFile "ML Service"
+    Stop-PortProcesses 8014
+}
+
 # ---------------------------------------------------------------------------
 # Start helpers
 # ---------------------------------------------------------------------------
@@ -167,12 +177,32 @@ function Start-Backend {
         return
     }
 
+    # Run Alembic migrations before starting the server
+    Write-Host "Running database migrations..."
+    Push-Location $backendPath
+    $prevEAP = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    $alembicResult = & $venvPython -m alembic upgrade head 2>&1
+    $alembicExit = $LASTEXITCODE
+    $ErrorActionPreference = $prevEAP
+    Pop-Location
+    # alembic prints info to stderr on SQLite, so only fail on actual errors
+    $alembicErrors = $alembicResult | Where-Object { $_ -match "(?i)(error|exception|traceback|FAILED)" }
+    if ($alembicExit -ne 0 -and $alembicErrors) {
+        Write-Error "Alembic migration failed:`n$($alembicResult -join "`n")"
+        return
+    }
+    $alembicResult | ForEach-Object { Write-Host "  $_" }
+    Write-Host "Migrations complete."
+
     $backendCommand = @"
 Set-Location '$backendPath'
-`$env:SECRET_KEY       = '$($env:SECRET_KEY)'
-`$env:ADMIN_EMAIL      = '$($env:ADMIN_EMAIL)'
-`$env:ADMIN_PASSWORD   = '$($env:ADMIN_PASSWORD)'
-`$env:ALLOWED_ORIGINS  = '$($env:ALLOWED_ORIGINS)'
+`$env:SECRET_KEY            = '$($env:SECRET_KEY)'
+`$env:ADMIN_EMAIL           = '$($env:ADMIN_EMAIL)'
+`$env:ADMIN_PASSWORD        = '$($env:ADMIN_PASSWORD)'
+`$env:ALLOWED_ORIGINS       = '$($env:ALLOWED_ORIGINS)'
+`$env:ML_SERVICE_API_KEY    = '$($env:ML_SERVICE_API_KEY)'
+`$env:ML_SERVICE_URL        = '$($env:ML_SERVICE_URL)'
 & '$venvPython' -m uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 "@
 
@@ -186,6 +216,100 @@ Set-Location '$backendPath'
     Write-Host "  Local:   http://localhost:8000"
     if ($script:LanIP) {
         Write-Host "  Network: http://$($script:LanIP):8000"
+    }
+}
+
+function Start-MLService {
+    if (-not (Test-Path $venvPython)) {
+        Write-Error "Python venv not found at $venvPython."
+        return
+    }
+
+    # Pre-run the service module once to ensure .env (with API_KEY) is generated
+    $mlservicePathFwd = $mlservicePath -replace '\\', '/'
+    & $venvPython -c "import sys; sys.path.insert(0,'$mlservicePathFwd'); from app import ensure_env_file; ensure_env_file()" 2>$null
+
+    $mlCommand = @"
+Set-Location '$mlservicePath'
+& '$venvPython' -m uvicorn app:app --host 127.0.0.1 --port 8014
+"@
+
+    $proc = Start-Process -FilePath "powershell.exe" `
+        -ArgumentList "-NoExit", "-Command", $mlCommand `
+        -PassThru
+    $proc.Id | Out-File -FilePath $mlservicePidFile -Force
+
+    Write-Host ""
+    Write-Host "ML Service started (PID $($proc.Id))"
+    Write-Host "  Local:   http://localhost:8014"
+}
+
+# ---------------------------------------------------------------------------
+# Sync ML service API key into backend/.env so the backend can authenticate
+# ---------------------------------------------------------------------------
+function Sync-MLServiceApiKey {
+    $mlEnvFile = Join-Path $mlservicePath ".env"
+    $backendEnvFile = Join-Path $backendPath ".env"
+
+    if (-not (Test-Path $mlEnvFile)) {
+        Write-Host "ML Service .env not found at $mlEnvFile — skipping API key sync"
+        return
+    }
+
+    # Read API_KEY from ml_predict_service/.env
+    $mlApiKey = $null
+    foreach ($rawLine in (Get-Content $mlEnvFile)) {
+        $line = $rawLine.Trim()
+        if ($line -and -not $line.StartsWith("#")) {
+            $parts = $line -split "=", 2
+            if ($parts.Count -eq 2 -and $parts[0].Trim() -eq "API_KEY") {
+                $mlApiKey = $parts[1].Trim()
+            }
+        }
+    }
+
+    if (-not $mlApiKey) {
+        Write-Host "No API_KEY found in ML service .env — skipping sync"
+        return
+    }
+
+    # Upsert ML_SERVICE_API_KEY and ML_SERVICE_URL in backend/.env
+    $keysToSync = @{
+        "ML_SERVICE_API_KEY" = $mlApiKey
+        "ML_SERVICE_URL"     = "http://localhost:8014"
+    }
+
+    if (-not (Test-Path $backendEnvFile)) {
+        # Create a minimal backend .env with just these keys
+        $lines = @()
+        foreach ($k in $keysToSync.Keys) {
+            $lines += "$k=$($keysToSync[$k])"
+        }
+        # Write UTF-8 without BOM (PS 5.1's -Encoding utf8 adds BOM which breaks pydantic)
+        [System.IO.File]::WriteAllText($backendEnvFile, ($lines -join "`n") + "`n", (New-Object System.Text.UTF8Encoding $false))
+        Write-Host "Created backend/.env with ML_SERVICE_API_KEY and ML_SERVICE_URL"
+        return
+    }
+
+    $content = Get-Content $backendEnvFile -Raw
+    foreach ($k in $keysToSync.Keys) {
+        $v = $keysToSync[$k]
+        if ($content -match "(?m)^$k=") {
+            # Replace existing line
+            $content = $content -replace "(?m)^$k=.*$", "$k=$v"
+        } else {
+            # Append
+            if (-not $content.EndsWith("`n")) { $content += "`n" }
+            $content += "$k=$v`n"
+        }
+    }
+    # Write UTF-8 without BOM
+    [System.IO.File]::WriteAllText($backendEnvFile, $content, (New-Object System.Text.UTF8Encoding $false))
+    Write-Host "DEBUG: Syncing API KEY: '$mlApiKey'" ; Write-Host "Synced ML_SERVICE_API_KEY and ML_SERVICE_URL into backend/.env"
+
+    # Also set in current process so child inherits correct values
+    foreach ($k in $keysToSync.Keys) {
+        [Environment]::SetEnvironmentVariable($k, $keysToSync[$k], "Process")
     }
 }
 
@@ -212,16 +336,19 @@ $script:LanIP = Get-LanIP
 
 switch ($Action) {
     "stop" {
-        if ($Mode -in "all", "backend")  { Stop-Backend }
-        if ($Mode -in "all", "frontend") { Stop-Frontend }
+        if ($Mode -in "all", "backend")   { Stop-Backend }
+        if ($Mode -in "all", "mlservice") { Stop-MLService }
+        if ($Mode -in "all", "frontend")  { Stop-Frontend }
     }
     "start" {
-        if ($Mode -in "all", "backend")  { Start-Backend }
+        if ($Mode -in "all", "mlservice") { Start-MLService }
+        if ($Mode -in "all", "backend")  { Write-Host "Skipping ML Sync to prevent wipe" ; Start-Backend }
         if ($Mode -in "all", "frontend") { Start-Frontend }
     }
     "restart" {
-        if ($Mode -in "all", "backend")  { Stop-Backend;  Start-Sleep 2; Start-Backend }
-        if ($Mode -in "all", "frontend") { Stop-Frontend; Start-Sleep 2; Start-Frontend }
+        if ($Mode -in "all", "mlservice") { Stop-MLService;  Start-Sleep 2; Start-MLService }
+        if ($Mode -in "all", "backend")  { Stop-Backend;    Start-Sleep 2; Write-Host "Skipping ML Sync to prevent wipe" ; Start-Backend }
+        if ($Mode -in "all", "frontend") { Stop-Frontend;   Start-Sleep 2; Start-Frontend }
     }
 }
 

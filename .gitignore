@@ -44,3 +44,6 @@ state_after.json
 
 # PID files for start-app.ps1
 .pids/
+
+# ML model binary (large file)
+ml_service/model/model.joblib

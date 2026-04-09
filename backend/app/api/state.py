@@ -7,7 +7,7 @@ from typing import Dict, List, Any, Optional, Set
 import io, csv, time, hashlib, asyncio, logging
 from ..db import models
 from ..db.session import get_db, SessionLocal
-from ..schemas import StateIn
+from ..schemas import StateIn, ClassAttributeValuesIn
 from ..core.security import get_current_user
 from .websocket import broadcast_lock_change, broadcast_mapping_update, broadcast_generation_progress, broadcast_sync
 
@@ -16,6 +16,35 @@ router = APIRouter(tags=["state"])
 
 MAX_SEARCH_LENGTH = 100
 MAX_EXPORT_ROWS = 100_000
+
+
+def _get_mapping_type_config(db: Session) -> Optional[Dict[str, Any]]:
+    """Read mappingTypeConfig from the app_config table (auto-derive when missing)."""
+    cfg = db.query(models.AppConfig).filter(models.AppConfig.id == 1).first()
+    mapping_type_config = cfg.mapping_type_config if cfg else None
+    if not mapping_type_config:
+        raw_types = (
+            db.query(models.GlobalMapping.attribute_type)
+            .filter(models.GlobalMapping.attribute_type.isnot(None))
+            .filter(models.GlobalMapping.attribute_type != "")
+            .distinct()
+            .all()
+        )
+        available = sorted({(t[0] or "").strip().lower() for t in raw_types if (t[0] or "").strip()})
+        if available:
+            mapping_type_config = {
+                "availableTypes": available,
+                "includedTypes": available,
+            }
+    return mapping_type_config
+
+
+def _get_included_type_set(db: Session) -> Optional[Set[str]]:
+    """Return the set of included mapping attribute types, or None if unfiltered."""
+    mapping_type_config = _get_mapping_type_config(db) or {}
+    available_types = [str(v).strip().lower() for v in (mapping_type_config.get("availableTypes") or []) if str(v).strip()]
+    included_types = [str(v).strip().lower() for v in (mapping_type_config.get("includedTypes") or []) if str(v).strip()]
+    return set(included_types if included_types else available_types) if available_types else None
 
 # ---------------------------------------------------------------------------
 # In-memory dashboard metrics cache.  Keyed by a hash of the query params
@@ -201,6 +230,70 @@ def _build_latest_mapping_by_feature(mapping_rows: List[models.GlobalMapping]) -
     return mapping_by_feature
 
 
+def _deduplicate_global_mappings_in_db(db_session) -> int:
+    """Consolidate duplicate global mappings sharing the same natural key.
+
+    For each combination of ``legacy_feature_ids`` + ``new_attribute_id`` that
+    appears in multiple ``GlobalMapping`` rows, we keep only the single best
+    row — preferring non-empty ``attribute_type``, then highest
+    ``_global_mapping_model_rank``.
+
+    Value-mappings from inferior duplicates are merged into the winner so no
+    user work is lost.
+
+    Returns the number of duplicate rows deleted.
+    """
+    all_rows = db_session.query(models.GlobalMapping).all()
+    if not all_rows:
+        return 0
+
+    # Group by normalised feature-id set + new_attribute_id (the true natural key).
+    by_natural_key: Dict[str, List[models.GlobalMapping]] = {}
+    for row in all_rows:
+        feature_ids = _normalize_legacy_feature_ids(getattr(row, "legacy_feature_ids", []) or [])
+        new_attr = str(getattr(row, "new_attribute_id", "") or "").strip().lower()
+        natural_key = "|".join(feature_ids) + "||" + new_attr
+        by_natural_key.setdefault(natural_key, []).append(row)
+
+    ids_to_delete: List[int] = []
+
+    for _natural_key, group in by_natural_key.items():
+        if len(group) <= 1:
+            continue
+
+        # Pick the best row: prefer non-empty attribute_type, then highest rank.
+        def _sort_key(r: models.GlobalMapping):
+            attr_type = str(getattr(r, "attribute_type", "") or "").strip()
+            has_attr_type = 1 if attr_type else 0
+            has_target = 1 if str(getattr(r, "new_attribute_id", "") or "").strip() else 0
+            return (has_attr_type, has_target, _global_mapping_model_rank(r))
+
+        group.sort(key=_sort_key, reverse=True)
+        winner = group[0]
+
+        # Merge value_mappings from losers into winner (prefer non-empty values).
+        merged_values = dict(_normalize_value_mappings(getattr(winner, "value_mappings", {}) or {}))
+        for loser in group[1:]:
+            loser_values = _normalize_value_mappings(getattr(loser, "value_mappings", {}) or {})
+            for k, v in loser_values.items():
+                if k not in merged_values or (not merged_values[k] and v):
+                    merged_values[k] = v
+            ids_to_delete.append(int(loser.id))
+
+        if merged_values != _normalize_value_mappings(getattr(winner, "value_mappings", {}) or {}):
+            winner.value_mappings = merged_values
+            winner.modified_at = time.time()
+
+    if ids_to_delete:
+        db_session.query(models.GlobalMapping).filter(
+            models.GlobalMapping.id.in_(ids_to_delete)
+        ).delete(synchronize_session=False)
+        db_session.commit()
+        logger.info("deduplicated global mappings: removed %d duplicate rows", len(ids_to_delete))
+
+    return len(ids_to_delete)
+
+
 def _global_mapping_row_changed(
     row: models.GlobalMapping,
     legacy_feature_ids: List[str],
@@ -270,13 +363,33 @@ def _run_mapping_generation_job(job_id: int):
 
         # Full regeneration keeps the workspace mapping source aligned with
         # latest BOM uploads and global mapping rules.
-        db.query(models.WorkspaceMapping).delete()
+        # Preserve rows that were manually overridden (mapped_from == 'local').
+        db.query(models.WorkspaceMapping).filter(
+            models.WorkspaceMapping.mapped_from != "local"
+        ).delete(synchronize_session=False)
         db.commit()
+
+        # Collect (item_id, feature_id) pairs that have local overrides so the
+        # generation loop can skip them entirely.
+        _local_pairs_raw = (
+            db.query(
+                models.WorkspaceMapping.legacy_item_id,
+                models.WorkspaceMapping.legacy_feature_id,
+            )
+            .filter(models.WorkspaceMapping.mapped_from == "local")
+            .distinct()
+            .all()
+        )
+        local_override_pairs: set = {(r[0], r[1]) for r in _local_pairs_raw}
 
         item_id_by_pk = {
             row_id: item_id
             for row_id, item_id in scan_db.query(models.BomItem.id, models.BomItem.item_id).all()
         }
+
+        # Consolidate duplicate global mappings before building the index so
+        # regeneration always starts from a clean set of rules.
+        _dedup_removed = _deduplicate_global_mappings_in_db(db)
 
         mapping_by_feature = _build_latest_mapping_by_feature(scan_db.query(models.GlobalMapping).all())
 
@@ -328,7 +441,14 @@ def _run_mapping_generation_job(job_id: int):
                 processed_features += 1
                 continue
 
-            mapping = mapping_by_feature.get(str(getattr(feat, "feature_id", "") or "").strip())
+            feat_feature_id = str(getattr(feat, "feature_id", "") or "").strip()
+
+            # Skip features that have local overrides — those are user-managed.
+            if (legacy_item_id, feat_feature_id) in local_override_pairs:
+                processed_features += 1
+                continue
+
+            mapping = mapping_by_feature.get(feat_feature_id)
             target_attr = (getattr(mapping, "new_attribute_id", "") or "").strip() or "UNMAPPED"
             attr_type = (getattr(mapping, "attribute_type", "") or "").strip() if mapping else ""
             feat_condition = (getattr(feat, "condition", "") or "").strip() or None
@@ -450,6 +570,555 @@ def _prune_placeholder_global_mappings(mappings_payload: List[Dict]) -> List[Dic
             continue
         pruned.append(mapping)
     return pruned
+
+
+# ---------------------------------------------------------------------------
+# Feature-combination analysis (dedicated job + summary table)
+# ---------------------------------------------------------------------------
+
+_feature_combination_lock = asyncio.Lock()
+
+
+def _normalize_feature_values(raw_values: Any) -> List[str]:
+    """Return a deduplicated, sorted list of non-blank string values."""
+    if isinstance(raw_values, dict):
+        raw_list = raw_values.get("values") or []
+    elif isinstance(raw_values, list):
+        raw_list = raw_values
+    else:
+        raw_list = []
+    seen: Set[str] = set()
+    result: List[str] = []
+    for v in raw_list:
+        s = str(v or "").strip()
+        if s and s not in seen:
+            seen.add(s)
+            result.append(s)
+    result.sort()
+    return result
+
+
+def _make_values_key(sorted_values: List[str]) -> str:
+    """Deterministic string key from a sorted, deduped value list."""
+    return "|".join(sorted_values)
+
+
+def _run_feature_combination_job(job_id: int):
+    """Synchronous worker: scan BomFeature, group by feature_id+values, count items."""
+    db = SessionLocal()
+
+    def _safe_commit(session, max_retries: int = 5):
+        """Retry commit on SQLite 'database is locked' errors."""
+        for attempt in range(1, max_retries + 1):
+            try:
+                session.commit()
+                return
+            except OperationalError as exc:
+                session.rollback()
+                if "database is locked" not in str(exc).lower() or attempt >= max_retries:
+                    raise
+                time.sleep(0.25 * attempt)
+
+    scan_db = None
+    try:
+        job = db.query(models.FeatureCombinationJob).filter(models.FeatureCombinationJob.id == job_id).first()
+        if not job or job.status not in ("queued", "running"):
+            return
+        job.status = "running"
+        job.started_at = time.time()
+        job.updated_at = job.started_at
+        _safe_commit(db)
+
+        # Use a separate read session so the scan doesn't hold a write lock
+        scan_db = SessionLocal()
+
+        # Build item_id map (pk -> string item_id)
+        item_id_by_pk = {
+            row_id: item_id
+            for row_id, item_id in scan_db.query(models.BomItem.id, models.BomItem.item_id).all()
+        }
+
+        # Build priority map (string item_id -> priority)
+        priority_by_item = {
+            item_id: priority
+            for item_id, priority in scan_db.query(models.BomItem.item_id, models.BomItem.priority).all()
+            if priority is not None
+        }
+
+        # Build feature_id -> attribute_type from global mappings
+        attr_type_by_feature: Dict[str, str] = {}
+        for gm in scan_db.query(models.GlobalMapping).all():
+            at = (getattr(gm, "attribute_type", "") or "").strip()
+            for fid in (getattr(gm, "legacy_feature_ids", []) or []):
+                normalized_fid = str(fid or "").strip()
+                if normalized_fid and at:
+                    attr_type_by_feature.setdefault(normalized_fid, at)
+
+        # Build feature_id -> list of { attr, vm } from global mappings (supports multiple D365 attrs per feature)
+        d365_by_feature: Dict[str, List[Dict[str, Any]]] = {}
+        for gm in scan_db.query(models.GlobalMapping).all():
+            new_attr = (getattr(gm, "new_attribute_id", "") or "").strip()
+            vm = getattr(gm, "value_mappings", None) or {}
+            for fid in (getattr(gm, "legacy_feature_ids", []) or []):
+                normalized_fid = str(fid or "").strip()
+                if normalized_fid and new_attr:
+                    d365_by_feature.setdefault(normalized_fid, []).append({"attr": new_attr, "vm": dict(vm)})
+
+        total_features = int(scan_db.query(func.count(models.BomFeature.id)).scalar() or 0)
+        job.total_features = total_features
+        job.updated_at = time.time()
+        _safe_commit(db)
+
+        # combination key -> { feature_id, description, unit, values, item_ids set }
+        combos: Dict[str, Dict[str, Any]] = {}
+        processed = 0
+
+        for feat in scan_db.query(models.BomFeature).yield_per(1000):
+            legacy_item_id = item_id_by_pk.get(getattr(feat, "item_id", None))
+            if not legacy_item_id:
+                processed += 1
+                continue
+
+            feature_id = str(getattr(feat, "feature_id", "") or "").strip()
+            normalized = _normalize_feature_values(getattr(feat, "values", []))
+            values_key = _make_values_key(normalized)
+            combo_key = f"{feature_id}||{values_key}"
+
+            if combo_key not in combos:
+                combos[combo_key] = {
+                    "feature_id": feature_id,
+                    "description": str(getattr(feat, "description", "") or "").strip(),
+                    "unit": str(getattr(feat, "unit", "") or "").strip(),
+                    "values": normalized,
+                    "item_ids": set(),
+                }
+            combos[combo_key]["item_ids"].add(legacy_item_id)
+            processed += 1
+
+            if processed % 500 == 0:
+                job.processed_features = processed
+                job.updated_at = time.time()
+                _safe_commit(db)
+
+        scan_db.close()
+
+        # Rebuild summary table
+        db.query(models.FeatureCombination).delete()
+        built_at = time.time()
+        rows: List[Dict[str, Any]] = []
+        for combo in combos.values():
+            # Collect distinct priorities for items in this combo
+            combo_priorities = sorted(set(
+                priority_by_item[iid]
+                for iid in combo["item_ids"]
+                if iid in priority_by_item
+            ))
+            fid = combo["feature_id"]
+            legacy_vals = combo["values"]
+            legacy_count = len(legacy_vals)
+
+            # D365 mapping lookup (may have multiple D365 attributes per feature)
+            d365_entries = d365_by_feature.get(fid, [])
+            d365_attr_names = [e["attr"] for e in d365_entries]
+            d365_attr = "; ".join(d365_attr_names) if d365_attr_names else None
+            # Merge value mappings from all D365 attributes for this feature
+            d365_vm_merged: Dict[str, str] = {}
+            for entry in d365_entries:
+                d365_vm_merged.update(entry["vm"])
+            # Build per-value mapping: only include values present in this combo
+            d365_vals: Dict[str, str] = {}
+            mapped_count = 0
+            for lv in legacy_vals:
+                mapped_v = d365_vm_merged.get(lv)
+                if mapped_v is not None and str(mapped_v).strip():
+                    d365_vals[lv] = str(mapped_v).strip()
+                    mapped_count += 1
+            # Status: complete if all mapped, partial if some, unmapped if none
+            if not d365_attr:
+                status = "unmapped"
+            elif legacy_count == 0:
+                # Attribute-only mapping with no values to map — consider complete
+                status = "complete"
+            elif mapped_count == 0:
+                status = "unmapped"
+            elif mapped_count >= legacy_count:
+                status = "complete"
+            else:
+                status = "partial"
+
+            rows.append({
+                "feature_id": fid,
+                "description": combo["description"] or None,
+                "unit": combo["unit"] or None,
+                "attribute_type": attr_type_by_feature.get(fid) or None,
+                "normalized_values_key": _make_values_key(legacy_vals),
+                "normalized_values_json": legacy_vals,
+                "item_count": len(combo["item_ids"]),
+                "legacy_value_count": legacy_count,
+                "d365_attribute_id": d365_attr,
+                "d365_values_json": d365_vals if d365_vals else None,
+                "mapped_value_count": mapped_count,
+                "mapping_status": status,
+                "priorities_json": combo_priorities if combo_priorities else None,
+                "item_ids_json": sorted(combo["item_ids"]),
+                "built_at": built_at,
+            })
+        if rows:
+            db.bulk_insert_mappings(models.FeatureCombination, rows)
+
+        job.status = "completed"
+        job.processed_features = processed
+        job.generated_rows = len(rows)
+        job.finished_at = time.time()
+        job.updated_at = job.finished_at
+        _safe_commit(db)
+
+    except Exception as exc:
+        db.rollback()
+        logger.exception("feature combination job=%s failed: %s", job_id, exc)
+        fail_db = SessionLocal()
+        try:
+            failed_job = fail_db.query(models.FeatureCombinationJob).filter(models.FeatureCombinationJob.id == job_id).first()
+            if failed_job:
+                failed_job.status = "failed"
+                failed_job.error_message = str(exc)
+                failed_job.finished_at = time.time()
+                failed_job.updated_at = failed_job.finished_at
+                fail_db.commit()
+        except Exception:
+            fail_db.rollback()
+        finally:
+            fail_db.close()
+    finally:
+        if scan_db is not None:
+            scan_db.close()
+        db.close()
+
+
+async def _run_feature_combination_async(job_id: int):
+    async with _feature_combination_lock:
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, _run_feature_combination_job, job_id)
+
+
+def _start_feature_combination_job(job_id: int, background_tasks: Optional[BackgroundTasks] = None):
+    if background_tasks is not None:
+        background_tasks.add_task(_run_feature_combination_async, job_id)
+    else:
+        loop = asyncio.get_running_loop()
+        loop.create_task(_run_feature_combination_async(job_id))
+
+
+@router.post("/feature-combinations/trigger")
+def trigger_feature_combination_build(
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """Trigger a background job to rebuild the feature-combination summary table."""
+    active = (
+        db.query(models.FeatureCombinationJob)
+        .filter(models.FeatureCombinationJob.status.in_(["queued", "running"]))
+        .order_by(models.FeatureCombinationJob.updated_at.desc())
+        .first()
+    )
+    if active:
+        return {"ok": True, "jobId": int(active.id)}
+
+    job = models.FeatureCombinationJob(
+        status="queued",
+        triggered_by_user_id=f"USR-{current_user.id}",
+        triggered_by_username=getattr(current_user, "username", None),
+        total_features=0,
+        processed_features=0,
+        generated_rows=0,
+        started_at=None,
+        finished_at=None,
+        updated_at=time.time(),
+        error_message=None,
+    )
+    db.add(job)
+    db.commit()
+    db.refresh(job)
+    _start_feature_combination_job(int(job.id), background_tasks=background_tasks)
+    return {"ok": True, "jobId": int(job.id)}
+
+
+@router.get("/feature-combinations/progress")
+def get_feature_combination_progress(
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """Return the latest feature-combination job status."""
+    active = (
+        db.query(models.FeatureCombinationJob)
+        .filter(models.FeatureCombinationJob.status.in_(["queued", "running"]))
+        .order_by(models.FeatureCombinationJob.updated_at.desc())
+        .first()
+    )
+    job = active
+    is_active = True
+    if not job:
+        is_active = False
+        job = db.query(models.FeatureCombinationJob).order_by(models.FeatureCombinationJob.id.desc()).first()
+    if not job:
+        return {
+            "status": "idle", "isActive": False, "progress": 0.0,
+            "totalFeatures": 0, "processedFeatures": 0, "generatedRows": 0,
+            "startedAt": None, "finishedAt": None, "error": None,
+        }
+    total = int(getattr(job, "total_features", 0) or 0)
+    processed = int(getattr(job, "processed_features", 0) or 0)
+    progress = (processed / total) if total > 0 else (1.0 if job.status == "completed" else 0.0)
+    return {
+        "id": job.id,
+        "status": job.status,
+        "isActive": bool(is_active),
+        "progress": float(max(0.0, min(1.0, progress))),
+        "totalFeatures": total,
+        "processedFeatures": processed,
+        "generatedRows": int(getattr(job, "generated_rows", 0) or 0),
+        "startedAt": getattr(job, "started_at", None),
+        "finishedAt": getattr(job, "finished_at", None),
+        "error": getattr(job, "error_message", None),
+    }
+
+
+@router.get("/feature-combinations/filters")
+def get_feature_combination_filters(
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """Return distinct filter values for dropdowns."""
+    feature_ids = [
+        r[0] for r in
+        db.query(models.FeatureCombination.feature_id)
+        .distinct()
+        .order_by(models.FeatureCombination.feature_id)
+        .all()
+    ]
+    attribute_types = [
+        r[0] for r in
+        db.query(models.FeatureCombination.attribute_type)
+        .filter(models.FeatureCombination.attribute_type.isnot(None))
+        .filter(models.FeatureCombination.attribute_type != "")
+        .distinct()
+        .order_by(models.FeatureCombination.attribute_type)
+        .all()
+    ]
+    # Collect distinct priorities across all rows' priorities_json
+    priority_set: Set[int] = set()
+    for (pj,) in db.query(models.FeatureCombination.priorities_json).filter(
+        models.FeatureCombination.priorities_json.isnot(None)
+    ).all():
+        if isinstance(pj, list):
+            for p in pj:
+                if isinstance(p, int):
+                    priority_set.add(p)
+    return {
+        "featureIds": feature_ids,
+        "attributeTypes": attribute_types,
+        "priorities": sorted(priority_set),
+        "statuses": [
+            r[0] for r in
+            db.query(models.FeatureCombination.mapping_status)
+            .distinct()
+            .order_by(models.FeatureCombination.mapping_status)
+            .all()
+        ],
+    }
+
+
+@router.get("/feature-combinations/list")
+def list_feature_combinations(
+    search: Optional[str] = None,
+    featureId: Optional[str] = None,
+    attributeType: Optional[str] = None,
+    priority: Optional[int] = None,
+    status: Optional[str] = None,
+    sortBy: Optional[str] = None,
+    sortDir: Optional[str] = None,
+    limit: int = Query(50, ge=1, le=5000),
+    offset: int = Query(0, ge=0),
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """Paginated list of generated feature-combination summary rows."""
+    base = db.query(models.FeatureCombination)
+    if search:
+        if len(search) > MAX_SEARCH_LENGTH:
+            raise HTTPException(status_code=400, detail="search too long")
+        like = f"%{search}%"
+        base = base.filter(
+            or_(
+                models.FeatureCombination.feature_id.ilike(like),
+                models.FeatureCombination.description.ilike(like),
+                models.FeatureCombination.normalized_values_key.ilike(like),
+            )
+        )
+    # Multi-value filters: comma-separated strings
+    if featureId:
+        fids = [f.strip() for f in featureId.split(",") if f.strip()]
+        if len(fids) == 1:
+            base = base.filter(models.FeatureCombination.feature_id == fids[0])
+        elif fids:
+            base = base.filter(models.FeatureCombination.feature_id.in_(fids))
+    if attributeType:
+        ats = [a.strip() for a in attributeType.split(",") if a.strip()]
+        if len(ats) == 1:
+            base = base.filter(models.FeatureCombination.attribute_type == ats[0])
+        elif ats:
+            base = base.filter(models.FeatureCombination.attribute_type.in_(ats))
+    if status:
+        sts = [s.strip() for s in status.split(",") if s.strip()]
+        if len(sts) == 1:
+            base = base.filter(models.FeatureCombination.mapping_status == sts[0])
+        elif sts:
+            base = base.filter(models.FeatureCombination.mapping_status.in_(sts))
+    # For priority filter: use JSON contains via string match (SQLite doesn't have native JSON contains)
+    if priority is not None:
+        base = base.filter(
+            models.FeatureCombination.priorities_json.isnot(None),
+            cast(models.FeatureCombination.priorities_json, String).contains(str(priority)),
+        )
+    total = base.count()
+
+    # Sorting
+    sort_allowed = {
+        "itemCount": models.FeatureCombination.item_count,
+        "legacyValueCount": models.FeatureCombination.legacy_value_count,
+        "mappedValueCount": models.FeatureCombination.mapped_value_count,
+    }
+    sort_col = sort_allowed.get(sortBy) if sortBy else None
+    is_desc = (sortDir or "desc").lower() != "asc"
+
+    if sortBy == "comboCountForFeature":
+        # Sort by the number of combo rows sharing the same feature_id
+        from sqlalchemy import select
+        combo_count_sub = (
+            select(
+                models.FeatureCombination.feature_id,
+                func.count(models.FeatureCombination.id).label("cnt"),
+            )
+            .group_by(models.FeatureCombination.feature_id)
+            .subquery()
+        )
+        base = base.outerjoin(
+            combo_count_sub,
+            models.FeatureCombination.feature_id == combo_count_sub.c.feature_id,
+        )
+        order_expr = combo_count_sub.c.cnt.desc() if is_desc else combo_count_sub.c.cnt.asc()
+        rows = base.order_by(order_expr, models.FeatureCombination.feature_id).offset(offset).limit(limit).all()
+    elif sort_col is not None:
+        order = sort_col.desc() if is_desc else sort_col.asc()
+        rows = base.order_by(order, models.FeatureCombination.feature_id).offset(offset).limit(limit).all()
+    else:
+        rows = (
+            base
+            .order_by(models.FeatureCombination.item_count.desc(), models.FeatureCombination.feature_id)
+            .offset(offset)
+            .limit(limit)
+            .all()
+        )
+
+    # Pre-compute combo count per feature_id (how many combo rows share this feature_id)
+    feature_ids_in_page = list({r.feature_id for r in rows})
+    combo_count_map: Dict[str, int] = {}
+    if feature_ids_in_page:
+        counts = (
+            db.query(models.FeatureCombination.feature_id, func.count(models.FeatureCombination.id))
+            .filter(models.FeatureCombination.feature_id.in_(feature_ids_in_page))
+            .group_by(models.FeatureCombination.feature_id)
+            .all()
+        )
+        combo_count_map = {fid: cnt for fid, cnt in counts}
+
+    # When a priority filter is active, compute filtered item counts per combo
+    filtered_item_counts: Dict[int, int] = {}
+    if priority is not None and rows:
+        # Get all item_ids that belong to the selected priority
+        priority_item_ids: Set[str] = set(
+            iid for (iid,) in
+            db.query(models.BomItem.item_id).filter(models.BomItem.priority == priority).all()
+        )
+        for r in rows:
+            stored_ids = r.item_ids_json or []
+            filtered_item_counts[r.id] = len(set(stored_ids) & priority_item_ids)
+
+    items = [
+        {
+            "id": r.id,
+            "featureId": r.feature_id,
+            "description": r.description or "",
+            "unit": r.unit or "",
+            "attributeType": r.attribute_type or "",
+            "normalizedValues": r.normalized_values_json or [],
+            "normalizedValuesKey": r.normalized_values_key,
+            "itemCount": r.item_count,
+            "filteredItemCount": filtered_item_counts.get(r.id) if priority is not None else None,
+            "legacyValueCount": r.legacy_value_count if hasattr(r, "legacy_value_count") else len(r.normalized_values_json or []),
+            "comboCountForFeature": combo_count_map.get(r.feature_id, 1),
+            "d365AttributeId": r.d365_attribute_id or "",
+            "d365Values": r.d365_values_json or {},
+            "mappedValueCount": r.mapped_value_count if hasattr(r, "mapped_value_count") else 0,
+            "mappingStatus": r.mapping_status if hasattr(r, "mapping_status") else "unmapped",
+            "priorities": r.priorities_json or [],
+            "builtAt": r.built_at,
+        }
+        for r in rows
+    ]
+    return {"items": items, "total": total}
+
+
+@router.get("/feature-combinations/{combo_id}/items")
+def get_feature_combination_items(
+    combo_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """Return the BOM items whose features match the selected combination."""
+    combo = db.query(models.FeatureCombination).filter(models.FeatureCombination.id == combo_id).first()
+    if not combo:
+        raise HTTPException(status_code=404, detail="combination not found")
+
+    target_feature_id = combo.feature_id
+    target_key = combo.normalized_values_key
+
+    # Scan BomFeature rows for this feature_id, then filter by normalized key
+    features = (
+        db.query(models.BomFeature)
+        .filter(models.BomFeature.feature_id == target_feature_id)
+        .all()
+    )
+    matching_item_pks: Set[int] = set()
+    for feat in features:
+        normalized = _normalize_feature_values(getattr(feat, "values", []))
+        if _make_values_key(normalized) == target_key:
+            matching_item_pks.add(feat.item_id)
+
+    if not matching_item_pks:
+        return {"items": []}
+
+    bom_items = (
+        db.query(models.BomItem)
+        .filter(models.BomItem.id.in_(matching_item_pks))
+        .order_by(models.BomItem.item_id)
+        .all()
+    )
+    return {
+        "items": [
+            {
+                "itemId": itm.item_id,
+                "description": itm.description or "",
+                "category": itm.category or "",
+                "productType": itm.product_type or "",
+                "priority": itm.priority,
+                "classification": itm.classification or "",
+            }
+            for itm in bom_items
+        ]
+    }
+
 
 @router.get("/health")
 def health():
@@ -645,6 +1314,159 @@ def get_workspace_mappings_for_item(
     return result
 
 
+def _regenerate_item_from_global(item_id: str, user_id: str, username: str, db: Session):
+    """Delete ALL workspace_mapping rows for an item and regenerate from global mappings."""
+    deleted = (
+        db.query(models.WorkspaceMapping)
+        .filter(models.WorkspaceMapping.legacy_item_id == item_id)
+        .delete(synchronize_session=False)
+    )
+    db.commit()
+
+    # Look up the BomItem PK for this item_id
+    bom_item = db.query(models.BomItem).filter(models.BomItem.item_id == item_id).first()
+    if not bom_item:
+        return {"ok": True, "rowsDeleted": deleted, "rowsGenerated": 0}
+
+    mapping_by_feature = _build_latest_mapping_by_feature(db.query(models.GlobalMapping).all())
+    features = db.query(models.BomFeature).filter(models.BomFeature.item_id == bom_item.id).all()
+
+    signed_ts = time.time()
+    generated = 0
+    for feat in features:
+        feat_feature_id = str(getattr(feat, "feature_id", "") or "").strip()
+        mapping = mapping_by_feature.get(feat_feature_id)
+        target_attr = (getattr(mapping, "new_attribute_id", "") or "").strip() or "UNMAPPED"
+        attr_type = (getattr(mapping, "attribute_type", "") or "").strip() if mapping else ""
+        feat_condition = (getattr(feat, "condition", "") or "").strip() or None
+        feat_formula = (getattr(feat, "formula", "") or "").strip() or None
+        value_mappings = getattr(mapping, "value_mappings", {}) if mapping else {}
+
+        raw_values = getattr(feat, "values", []) or []
+        if isinstance(raw_values, dict):
+            values = [str(v) for v in (raw_values.get("values") or [])]
+        elif isinstance(raw_values, list):
+            values = [str(v) for v in raw_values]
+        else:
+            values = []
+
+        if not values:
+            db.add(models.WorkspaceMapping(
+                legacy_item_id=item_id,
+                legacy_feature_id=feat_feature_id,
+                legacy_value="",
+                new_attribute_id=target_attr,
+                new_value="",
+                attribute_type=attr_type,
+                condition=feat_condition,
+                formula=feat_formula,
+                mapped_from="global",
+                signed_on_by_user_id=user_id,
+                signed_on_by_username=username,
+                signed_on_at=signed_ts,
+                updated_at=time.time(),
+                version=1,
+                created_by=user_id,
+                modified_by=user_id,
+                modified_at=time.time(),
+            ))
+            generated += 1
+        else:
+            for legacy_value in values:
+                resolved = _resolve_value_mapping(value_mappings, legacy_value)
+                db.add(models.WorkspaceMapping(
+                    legacy_item_id=item_id,
+                    legacy_feature_id=feat_feature_id,
+                    legacy_value=str(legacy_value),
+                    new_attribute_id=target_attr,
+                    new_value=(resolved or ""),
+                    attribute_type=attr_type,
+                    condition=feat_condition,
+                    formula=feat_formula,
+                    mapped_from="global" if resolved else "",
+                    signed_on_by_user_id=user_id,
+                    signed_on_by_username=username,
+                    signed_on_at=signed_ts,
+                    updated_at=time.time(),
+                    version=1,
+                    created_by=user_id,
+                    modified_by=user_id,
+                    modified_at=time.time(),
+                ))
+                generated += 1
+
+    db.commit()
+    return {"ok": True, "rowsDeleted": deleted, "rowsGenerated": generated}
+
+
+@router.post("/workspace-mappings/{item_id}/revert-to-global")
+def revert_item_to_global(
+    item_id: str,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """Delete all workspace_mapping rows for an item and regenerate from global mappings."""
+    current_user_id = f"USR-{current_user.id}"
+    if getattr(current_user, "role", "user") != "admin":
+        lock_row = db.query(models.ItemLock).filter(models.ItemLock.item_id == item_id).first()
+        if not lock_row or lock_row.user_id != current_user_id:
+            raise HTTPException(status_code=403, detail="item must be signed on by current user")
+
+    return _regenerate_item_from_global(item_id, current_user_id, getattr(current_user, "username", None), db)
+
+
+@router.post("/workspace-mappings/revert-all-to-global")
+def revert_all_to_global(
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """Delete ALL local overrides and trigger full regeneration from global mappings."""
+    if getattr(current_user, "role", "user") != "admin":
+        raise HTTPException(status_code=403, detail="admin only")
+
+    # Delete all local override rows so regeneration replaces them
+    deleted = (
+        db.query(models.WorkspaceMapping)
+        .filter(models.WorkspaceMapping.mapped_from == "local")
+        .delete(synchronize_session=False)
+    )
+    db.commit()
+
+    # Trigger full regeneration (reuses existing job infrastructure)
+    _cleanup_stale_generation_jobs(db)
+    active_job = (
+        db.query(models.MappingGenerationJob)
+        .filter(models.MappingGenerationJob.status.in_(["queued", "running"]))
+        .first()
+    )
+    if active_job:
+        return {"ok": True, "localRowsDeleted": deleted, "mappingGenerationJobId": int(active_job.id)}
+
+    queued_job = models.MappingGenerationJob(
+        status="queued",
+        triggered_by_user_id=f"USR-{current_user.id}",
+        triggered_by_username=getattr(current_user, "username", None),
+        trigger_source="revert_all_to_global",
+        total_features=0,
+        processed_features=0,
+        total_values=0,
+        processed_values=0,
+        generated_rows=0,
+        started_at=None,
+        finished_at=None,
+        updated_at=time.time(),
+        error_message=None,
+    )
+    db.add(queued_job)
+    db.commit()
+    db.refresh(queued_job)
+    job_id = int(queued_job.id)
+    _start_generation_job(job_id, background_tasks=background_tasks)
+    invalidate_metrics_cache()
+    return {"ok": True, "localRowsDeleted": deleted, "mappingGenerationJobId": job_id}
+
+
 @router.put("/workspace-mappings/{item_id}")
 def put_workspace_mappings_for_item(
     item_id: str,
@@ -652,14 +1474,10 @@ def put_workspace_mappings_for_item(
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user),
 ):
-    record = db.query(models.AppState).filter(models.AppState.id == 1).first()
-    state_payload = dict(record.state) if record and record.state else {}
-    locks = state_payload.get("locks") or {}
-    lock = locks.get(item_id)
-
     current_user_id = f"USR-{current_user.id}"
     if getattr(current_user, "role", "user") != "admin":
-        if not lock or lock.get("userId") != current_user_id:
+        lock_row = db.query(models.ItemLock).filter(models.ItemLock.item_id == item_id).first()
+        if not lock_row or lock_row.user_id != current_user_id:
             raise HTTPException(status_code=403, detail="item must be signed on by current user")
 
     rows_payload = payload.get("rows") or []
@@ -737,48 +1555,57 @@ def get_state(
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user),
 ):
-    record = db.query(models.AppState).filter(models.AppState.id == 1).first()
-    # build base state from JSON store (omitting whatever classification list may accidentally be there)
-    if not record or not record.state:
-        state = {"bom": [], "mappings": [], "classifications": [], "localMappings": {}, "itemClassifications": {}, "locks": {}, "users": []}
-    else:
-        # copy so we can override classifications
-        state = dict(record.state)
-        # ensure keys exist
-        for key in ["bom", "mappings", "localMappings", "itemClassifications", "locks", "users"]:
-            if key not in state:
-                state[key] = [] if key in ["bom", "mappings", "users"] else {}
-        # drop any classifications that might reside here; they are now kept in a dedicated table
-        state["classifications"] = []
+    state: Dict[str, Any] = {
+        "bom": [],
+        "mappings": [],
+        "classifications": [],
+        "localMappings": {},
+        "itemClassifications": {},
+        "locks": {},
+        "users": [],
+    }
 
-    # override/merge classification list from classification table
+    # Classifications from dedicated table
     db_classes = db.query(models.Classification).all()
     state["classifications"] = [
         {"classId": c.class_id, "className": c.class_name, "attributes": c.attributes or []}
         for c in db_classes
     ]
 
-    # also surface auth users from the users table in the shared state so the
-    # User Identity Registry can see all accounts, not just those stored in
-    # the AppState JSON. Existing JSON users are kept, and DB users are
-    # merged in if they are missing.
-    json_users: List[Dict] = state.get("users") or []
-    # index existing JSON users by username for quick lookup
-    existing_by_name = {u.get("userName"): u for u in json_users if isinstance(u, dict)}
-
+    # Users from dedicated table
     db_users = db.query(models.User).all()
-    for u in db_users:
-        if u.username not in existing_by_name:
-            json_users.append({
-                "userId": f"USR-{u.id}",
-                "userName": u.username,
-                # we never expose the real password hash to the UI; this
-                # placeholder simply keeps the shape compatible
-                "password": "",
-                "role": u.role or "user",
-            })
+    state["users"] = [
+        {
+            "userId": f"USR-{u.id}",
+            "userName": u.username,
+            "password": "",
+            "role": u.role or "user",
+            "approvalStatus": getattr(u, "approval_status", "approved"),
+        }
+        for u in db_users
+    ]
 
-    state["users"] = json_users
+    # Locks from dedicated table
+    all_locks = db.query(models.ItemLock).all()
+    locks_dict: Dict[str, Any] = {}
+    for lock in all_locks:
+        locks_dict[lock.item_id] = {
+            "itemId": lock.item_id,
+            "userId": lock.user_id,
+            "userName": lock.user_name or "",
+            "timestamp": lock.acquired_at * 1000,
+        }
+    state["locks"] = locks_dict
+
+    # Item classifications from bom_items table
+    classified = db.query(models.BomItem.item_id, models.BomItem.classification).filter(
+        models.BomItem.classification.isnot(None),
+        models.BomItem.classification != "",
+    ).all()
+    state["itemClassifications"] = {row.item_id: row.classification for row in classified}
+
+    # Config from app_config table
+    state["mappingTypeConfig"] = _get_mapping_type_config(db)
 
     # --- Override BOM from dedicated tables --------------------------------------
     if include_bom:
@@ -894,12 +1721,7 @@ def _get_unmapped_item_ids(db: Session) -> Set[str]:
     Uses the workspace_mappings table with SQL aggregation for correctness
     and performance.
     """
-    state_record = db.query(models.AppState).filter(models.AppState.id == 1).first()
-    state_payload = dict(state_record.state) if state_record and state_record.state else {}
-    mapping_type_config = state_payload.get("mappingTypeConfig") or {}
-    available_types = [str(v).strip().lower() for v in (mapping_type_config.get("availableTypes") or []) if str(v).strip()]
-    included_types = [str(v).strip().lower() for v in (mapping_type_config.get("includedTypes") or []) if str(v).strip()]
-    included_type_set = set(included_types if included_types else available_types) if available_types else None
+    included_type_set = _get_included_type_set(db)
 
     all_item_ids = {row[0] for row in db.query(models.BomItem.item_id).all()}
     item_stats: Dict[str, Dict[str, int]] = {item_id: {"mapped": 0, "not_required": 0, "total": 0} for item_id in all_item_ids}
@@ -1068,15 +1890,20 @@ def get_init(
             "userName": u.username,
             "password": "",
             "role": u.role or "user",
+            "approvalStatus": getattr(u, "approval_status", "approved"),
         }
         for u in db_users
     ]
 
-    # Config from AppState JSON
-    record = db.query(models.AppState).filter(models.AppState.id == 1).first()
-    state_json = dict(record.state) if record and record.state else {}
-    mapping_type_config = state_json.get("mappingTypeConfig")
-    item_classifications = state_json.get("itemClassifications") or {}
+    # Config from app_config table
+    mapping_type_config = _get_mapping_type_config(db)
+
+    # Item classifications from bom_items table
+    classified = db.query(models.BomItem.item_id, models.BomItem.classification).filter(
+        models.BomItem.classification.isnot(None),
+        models.BomItem.classification != "",
+    ).all()
+    item_classifications = {row.item_id: row.classification for row in classified}
 
     return {
         "locks": locks_dict,
@@ -1245,6 +2072,8 @@ def _build_bom_payload(db_items: List[models.BomItem]) -> List[Dict[str, Any]]:
                 **({"category": getattr(itm, "category", None)} if getattr(itm, "category", None) else {}),
                 **({"productType": getattr(itm, "product_type", None)} if getattr(itm, "product_type", None) else {}),
                 **({"priority": getattr(itm, "priority", None)} if getattr(itm, "priority", None) is not None else {}),
+                **({"classification": getattr(itm, "classification", None)} if getattr(itm, "classification", None) else {}),
+                **({"mlPredictions": getattr(itm, "ml_predictions", None)} if getattr(itm, "ml_predictions", None) else {}),
                 "features": features_payload,
             }
         )
@@ -1302,6 +2131,8 @@ async def sync_state(payload: StateIn, db: Session = Depends(get_db), current_us
     # when classifications are persisted separately we ignore that property on sync requests
     incoming = dict(payload.state)
     incoming.pop("classifications", None)
+    incoming.pop("itemClassifications", None)
+    incoming.pop("classAttributeValues", None)
     mapping_sync_mode = str(incoming.pop("mappingSyncMode", "merge") or "merge").strip().lower()
     apply_global_deletes = bool(incoming.pop("applyGlobalDeletes", False))
 
@@ -1518,7 +2349,9 @@ async def sync_state(payload: StateIn, db: Session = Depends(get_db), current_us
                 payload_id = row.get("id")
                 if payload_id is not None:
                     existing_row = existing_by_id.get(int(payload_id))
-                if existing_row is None and mapping_sync_mode != "patch":
+                if existing_row is None:
+                    # Always fall back to natural-key lookup regardless of sync
+                    # mode to prevent duplicate global mapping rows.
                     matching_group = existing_groups.get(natural_key) or []
                     if matching_group:
                         existing_row = max(matching_group, key=_global_mapping_model_rank)
@@ -1596,8 +2429,21 @@ async def sync_state(payload: StateIn, db: Session = Depends(get_db), current_us
 
                 for legacy_attr in legacy_ids:
                     if not values_map:
-                        # No specific value mappings — update the target attribute
-                        # on ALL existing workspace_mapping rows for this item+feature.
+                        # No value mappings from frontend — auto-populate from
+                        # global mapping for this specific feature.
+                        gm_row = (
+                            db.query(models.GlobalMapping)
+                            .filter(models.GlobalMapping.legacy_feature_ids.contains([legacy_attr]))
+                            .first()
+                        )
+                        if not gm_row:
+                            # Fallback: scan all global mappings for this feature
+                            for _gm in db.query(models.GlobalMapping).all():
+                                if legacy_attr in (getattr(_gm, "legacy_feature_ids", []) or []):
+                                    gm_row = _gm
+                                    break
+                        global_vals = (getattr(gm_row, "value_mappings", {}) or {}) if gm_row else {}
+
                         existing_rows = (
                             db.query(models.WorkspaceMapping)
                             .filter(
@@ -1611,6 +2457,10 @@ async def sync_state(payload: StateIn, db: Session = Depends(get_db), current_us
                                 existing.new_attribute_id = new_attr
                                 existing.attribute_type = attr_type
                                 existing.mapped_from = mapped_from
+                                # Auto-populate new_value from global mapping
+                                if global_vals and existing.legacy_value:
+                                    gval = global_vals.get(existing.legacy_value, "")
+                                    existing.new_value = str(gval)
                                 existing.signed_on_by_user_id = current_user_id
                                 existing.signed_on_by_username = getattr(current_user, "username", None)
                                 existing.signed_on_at = signed_ts
@@ -1687,13 +2537,14 @@ async def sync_state(payload: StateIn, db: Session = Depends(get_db), current_us
 
         logger.info("sync_state: upserted %d workspace mapping rows", workspace_rows_upserted)
 
-    # Persist the remainder of the JSON state as a lightweight shell
-    record = db.query(models.AppState).filter(models.AppState.id == 1).first()
-    if not record:
-        record = models.AppState(id=1, state=incoming)
-        db.add(record)
-    else:
-        record.state = incoming
+    # Persist mappingTypeConfig to app_config (the only remaining config key)
+    if "mappingTypeConfig" in incoming:
+        cfg = db.query(models.AppConfig).filter(models.AppConfig.id == 1).first()
+        if not cfg:
+            cfg = models.AppConfig(id=1, mapping_type_config=incoming["mappingTypeConfig"])
+            db.add(cfg)
+        else:
+            cfg.mapping_type_config = incoming["mappingTypeConfig"]
 
     db.commit()
 
@@ -1821,9 +2672,6 @@ async def handle_lock(
     else:
         raise HTTPException(status_code=400, detail="unknown action")
 
-    # Also update the AppState JSON locks for backward compatibility with
-    # /state endpoint consumers that read locks from the JSON blob.
-    _sync_locks_to_app_state(db)
     db.commit()
 
     # Broadcast lock change to all connected WebSocket clients
@@ -1838,27 +2686,6 @@ async def handle_lock(
     await broadcast_lock_change(itemId, lock_info, actor_id=current_user_id)
 
     return response_payload
-
-
-def _sync_locks_to_app_state(db: Session):
-    """Rebuild the locks dict in AppState JSON from the item_locks table."""
-    all_locks = db.query(models.ItemLock).all()
-    locks_dict = {}
-    for lock in all_locks:
-        locks_dict[lock.item_id] = {
-            "itemId": lock.item_id,
-            "userId": lock.user_id,
-            "userName": lock.user_name or "",
-            "timestamp": lock.acquired_at * 1000,
-        }
-    record = db.query(models.AppState).filter(models.AppState.id == 1).first()
-    if not record:
-        record = models.AppState(id=1, state={"locks": locks_dict})
-        db.add(record)
-    else:
-        state = dict(record.state) if record.state else {}
-        state["locks"] = locks_dict
-        record.state = state
 
 
 @router.get("/dashboard/metrics")
@@ -1881,12 +2708,7 @@ def get_dashboard_metrics(
         return _metrics_cache[cache_key]
 
     # --- Get included attribute types from mappingTypeConfig ---
-    state_record = db.query(models.AppState).filter(models.AppState.id == 1).first()
-    state_payload = dict(state_record.state) if state_record and state_record.state else {}
-    mapping_type_config = state_payload.get("mappingTypeConfig") or {}
-    available_types = [str(v).strip().lower() for v in (mapping_type_config.get("availableTypes") or []) if str(v).strip()]
-    included_types = [str(v).strip().lower() for v in (mapping_type_config.get("includedTypes") or []) if str(v).strip()]
-    included_type_set = set(included_types if included_types else available_types) if available_types else None
+    included_type_set = _get_included_type_set(db)
 
     # --- Get BOM items matching filters (lightweight: no features loaded) ---
     items_query = db.query(
@@ -2080,12 +2902,7 @@ def get_item_statuses(db: Session = Depends(get_db)):
         # value row has a non-blank new_value.
         #
         # Build included-type filter so we can skip ignored attribute types.
-        state_record = db.query(models.AppState).filter(models.AppState.id == 1).first()
-        state_payload = dict(state_record.state) if state_record and state_record.state else {}
-        mapping_type_config = state_payload.get("mappingTypeConfig") or {}
-        available_types = [str(v).strip().lower() for v in (mapping_type_config.get("availableTypes") or []) if str(v).strip()]
-        included_types = [str(v).strip().lower() for v in (mapping_type_config.get("includedTypes") or []) if str(v).strip()]
-        included_type_set = set(included_types if included_types else available_types) if available_types else None
+        included_type_set = _get_included_type_set(db)
 
         # Initialise every BOM item so items without any workspace rows still
         # appear in the output.
@@ -2387,6 +3204,159 @@ def wipe_bom(db: Session = Depends(get_db), current_user: models.User = Depends(
     db.commit()
     invalidate_metrics_cache()
     return {"ok": True}
+
+
+@router.post("/attribute-options")
+def attribute_options(
+    payload: Dict[str, Any],
+    db: Session = Depends(get_db),
+):
+    """Return ordered dropdown options for a feature's target attribute selector.
+
+    Request body:
+        featureId  – legacy feature ID (required)
+        classId    – optional PLM class; when absent returns top 20 across all classes
+        search     – optional substring filter applied to attribute IDs
+
+    Response:
+        globalCandidates  – target attributes from global mappings for this feature
+        classAttributes   – top 20 attributes from the class (or all classes if no classId)
+        warningIds        – global candidates that are NOT in the class attribute list
+    """
+    feature_id = str(payload.get("featureId") or "").strip()
+    class_id = str(payload.get("classId") or "").strip() or None
+    search = str(payload.get("search") or "").strip().lower()[:MAX_SEARCH_LENGTH]
+
+    # ── 1. Global candidates for this feature ────────────────────────
+    global_candidates: List[str] = []
+    rows = db.query(models.GlobalMapping).all()
+    for m in rows:
+        m_fids = getattr(m, "legacy_feature_ids", []) or []
+        if feature_id in m_fids:
+            parts = [
+                p.strip()
+                for p in (getattr(m, "new_attribute_id", "") or "").replace(" ", "").split(";")
+                if p.strip() and p.strip().upper() != "UNMAPPED"
+            ]
+            global_candidates.extend(parts)
+    # Deduplicate preserving order
+    seen: set = set()
+    deduped: List[str] = []
+    for c in global_candidates:
+        key = c.upper().replace(" ", "")
+        if key not in seen:
+            seen.add(key)
+            deduped.append(c)
+    global_candidates = deduped
+
+    # ── 2. Classification attributes ─────────────────────────────────
+    class_attr_ids: List[str] = []
+    class_attr_key_set: set = set()
+
+    if class_id:
+        cls_row = (
+            db.query(models.Classification)
+            .filter(models.Classification.class_id == class_id)
+            .first()
+        )
+        if cls_row and cls_row.attributes:
+            for attr in cls_row.attributes:
+                aid = attr.get("attributeId") or attr.get("attribute_id") or ""
+                if aid:
+                    class_attr_ids.append(aid)
+                    class_attr_key_set.add(aid.upper().replace(" ", ""))
+    else:
+        # No class → collect top 20 distinct attributes across ALL classes
+        all_cls = db.query(models.Classification).all()
+        attr_freq: Dict[str, int] = {}
+        attr_canonical: Dict[str, str] = {}
+        for cls_row in all_cls:
+            for attr in (cls_row.attributes or []):
+                aid = attr.get("attributeId") or attr.get("attribute_id") or ""
+                if not aid:
+                    continue
+                key = aid.upper().replace(" ", "")
+                attr_freq[key] = attr_freq.get(key, 0) + 1
+                if key not in attr_canonical:
+                    attr_canonical[key] = aid
+        sorted_keys = sorted(attr_freq.keys(), key=lambda k: -attr_freq[k])
+        for key in sorted_keys[:20]:
+            class_attr_ids.append(attr_canonical[key])
+            class_attr_key_set.add(key)
+
+    # ── 3. Apply search filter ────────────────────────────────────────
+    if search:
+        global_candidates = [c for c in global_candidates if search in c.lower()]
+        class_attr_ids = [a for a in class_attr_ids if search in a.lower()]
+
+        # When searching, also scan ALL classifications for matching attributes
+        # so the user can find any attribute even if it's not in the current class.
+        all_cls_rows = db.query(models.Classification).all()
+        extra_seen: set = set(a.upper().replace(" ", "") for a in class_attr_ids)
+        extra_matches: List[str] = []
+        for cls_row in all_cls_rows:
+            for attr in (cls_row.attributes or []):
+                aid = attr.get("attributeId") or attr.get("attribute_id") or ""
+                if not aid:
+                    continue
+                key = aid.upper().replace(" ", "")
+                if key not in extra_seen and search in aid.lower():
+                    extra_seen.add(key)
+                    extra_matches.append(aid)
+        class_attr_ids.extend(extra_matches)
+
+    class_attr_ids = class_attr_ids[:20]
+
+    # ── 4. Warning IDs: global candidates not in the class ────────────
+    # Only warn when a specific class is provided; for unclassified items
+    # there is no class to be "not in".
+    warning_ids = []
+    if class_id:
+        warning_ids = [
+            c for c in global_candidates
+            if c.upper().replace(" ", "") not in class_attr_key_set
+        ]
+
+    return {
+        "globalCandidates": global_candidates,
+        "classAttributes": class_attr_ids,
+        "warningIds": warning_ids,
+    }
+
+
+@router.post("/global-mappings/by-features")
+def global_mappings_by_features(
+    payload: Dict[str, Any],
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """Return global mappings grouped by feature ID for a list of features."""
+    feature_ids = payload.get("featureIds") or []
+    if not isinstance(feature_ids, list) or len(feature_ids) > 500:
+        raise HTTPException(status_code=400, detail="featureIds must be a list of up to 500 strings")
+
+    feature_ids = [str(fid).strip() for fid in feature_ids if fid]
+    if not feature_ids:
+        return {}
+
+    rows = db.query(models.GlobalMapping).all()
+    result: Dict[str, list] = {fid: [] for fid in feature_ids}
+    fid_set = set(feature_ids)
+
+    for m in rows:
+        m_fids = getattr(m, "legacy_feature_ids", []) or []
+        for fid in m_fids:
+            if fid in fid_set:
+                result[fid].append({
+                    "id": getattr(m, "id", None),
+                    "legacyFeatureIds": m_fids,
+                    "newAttributeId": getattr(m, "new_attribute_id", ""),
+                    "attributeType": getattr(m, "attribute_type", "") or "",
+                    "valueMappings": getattr(m, "value_mappings", {}) or {},
+                    "version": getattr(m, "version", 1),
+                })
+
+    return result
 
 
 @router.get("/global-mappings")
@@ -2782,6 +3752,26 @@ def upsert_global_mapping(
     }
 
 
+@router.post("/global-mappings/deduplicate")
+def deduplicate_global_mappings(
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """Consolidate duplicate global mappings sharing the same feature-level key.
+
+    Keeps the best row per feature (prefers non-empty attribute_type, then most
+    recently modified), merges value_mappings from duplicates, and deletes the
+    inferior rows.
+    """
+    if getattr(current_user, "role", "user") != "admin":
+        raise HTTPException(status_code=403, detail="Only admins may deduplicate global mappings")
+
+    removed = _deduplicate_global_mappings_in_db(db)
+    invalidate_metrics_cache()
+    remaining = int(db.query(func.count(models.GlobalMapping.id)).scalar() or 0)
+    return {"ok": True, "duplicatesRemoved": removed, "globalMappingsTotal": remaining}
+
+
 @router.delete("/global-mappings/{mapping_id}")
 def delete_global_mapping(
     mapping_id: int,
@@ -2892,17 +3882,162 @@ def get_classification_filters(
     return {"classes": class_options, "attributes": attribute_options}
 
 
+@router.get("/classifications/search")
+def search_classification_names(
+    search: Optional[str] = None,
+    limit: int = Query(20, ge=1, le=200),
+    db: Session = Depends(get_db),
+):
+    """Lightweight search returning only classId + className (no attributes)."""
+    search = _validate_search(search)
+    query = db.query(
+        models.Classification.class_id,
+        models.Classification.class_name,
+    )
+    if search:
+        like = f"%{search}%"
+        query = query.filter(
+            or_(
+                models.Classification.class_id.ilike(like),
+                models.Classification.class_name.ilike(like),
+            )
+        )
+    query = query.order_by(models.Classification.class_id).limit(limit)
+    rows = query.all()
+    return {"items": [{"classId": r[0], "className": r[1] or r[0]} for r in rows]}
+
+
+@router.get("/classifications/{class_id}")
+def get_classification_by_id(
+    class_id: str,
+    db: Session = Depends(get_db),
+):
+    """Return a single classification with its attributes."""
+    record = db.query(models.Classification).filter(models.Classification.class_id == class_id).first()
+    if not record:
+        raise HTTPException(status_code=404, detail=f"Classification '{class_id}' not found")
+    return {
+        "classId": record.class_id,
+        "className": record.class_name,
+        "attributes": record.attributes or [],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Item class-attribute values (replaces blob classAttributeValues)
+# ---------------------------------------------------------------------------
+
+@router.get("/items/{item_id}/class-attribute-values")
+def get_class_attribute_values(
+    item_id: str,
+    db: Session = Depends(get_db),
+    _current_user: models.User = Depends(get_current_user),
+):
+    rows = (
+        db.query(models.ItemClassAttributeValue)
+        .filter(models.ItemClassAttributeValue.item_id == item_id)
+        .all()
+    )
+    result: Dict[str, str] = {}
+    class_id: Optional[str] = None
+    for r in rows:
+        result[r.attribute_id] = r.value or ""
+        class_id = r.class_id
+    return {"classId": class_id, "values": result}
+
+
+@router.put("/items/{item_id}/class-attribute-values")
+def put_class_attribute_values(
+    item_id: str,
+    body: ClassAttributeValuesIn,
+    db: Session = Depends(get_db),
+    _current_user: models.User = Depends(get_current_user),
+):
+    new_class_id = body.classId
+    prev_class_id = body.previousClassId
+    incoming_values = body.values  # Dict[str, str]
+
+    # If class changed, handle shared-attribute retention
+    if prev_class_id and prev_class_id != new_class_id:
+        existing = (
+            db.query(models.ItemClassAttributeValue)
+            .filter(
+                models.ItemClassAttributeValue.item_id == item_id,
+                models.ItemClassAttributeValue.class_id == prev_class_id,
+            )
+            .all()
+        )
+        incoming_attr_ids = set(incoming_values.keys())
+        for row in existing:
+            if row.attribute_id in incoming_attr_ids:
+                # shared attribute – update class_id + value
+                row.class_id = new_class_id
+                row.value = incoming_values.pop(row.attribute_id, row.value)
+            else:
+                # old-only attribute – remove
+                db.delete(row)
+        # remaining incoming keys are new-only attributes – insert
+        for attr_id, val in incoming_values.items():
+            db.add(models.ItemClassAttributeValue(
+                item_id=item_id,
+                class_id=new_class_id,
+                attribute_id=attr_id,
+                value=val,
+            ))
+    else:
+        # Same class or no previous – simple upsert
+        for attr_id, val in incoming_values.items():
+            existing_row = (
+                db.query(models.ItemClassAttributeValue)
+                .filter(
+                    models.ItemClassAttributeValue.item_id == item_id,
+                    models.ItemClassAttributeValue.class_id == new_class_id,
+                    models.ItemClassAttributeValue.attribute_id == attr_id,
+                )
+                .first()
+            )
+            if existing_row:
+                existing_row.value = val
+            else:
+                db.add(models.ItemClassAttributeValue(
+                    item_id=item_id,
+                    class_id=new_class_id,
+                    attribute_id=attr_id,
+                    value=val,
+                ))
+
+    db.commit()
+    return {"ok": True}
+
+
+@router.delete("/items/{item_id}/class-attribute-values")
+def delete_class_attribute_values(
+    item_id: str,
+    db: Session = Depends(get_db),
+    _current_user: models.User = Depends(get_current_user),
+):
+    """Delete all class-attribute values for an item (e.g. when reverting to legacy view)."""
+    count = (
+        db.query(models.ItemClassAttributeValue)
+        .filter(models.ItemClassAttributeValue.item_id == item_id)
+        .delete(synchronize_session="fetch")
+    )
+    db.commit()
+    return {"ok": True, "deleted": count}
+
+
 @router.post("/reset")
 def reset(db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
     # only admins may reset the application state
     if getattr(current_user, "role", "user") != "admin":
         raise HTTPException(status_code=403, detail="admin role required to reset state")
-    record = db.query(models.AppState).filter(models.AppState.id == 1).first()
-    if record:
-        db.delete(record)
+    cfg = db.query(models.AppConfig).filter(models.AppConfig.id == 1).first()
+    if cfg:
+        cfg.mapping_type_config = None
 
     # also nuke any classifications, BOM, mappings and local overrides so
     # reset truly returns to defaults
+    db.query(models.ItemClassAttributeValue).delete()
     db.query(models.Classification).delete()
     db.query(models.BomFeature).delete()
     db.query(models.BomItem).delete()

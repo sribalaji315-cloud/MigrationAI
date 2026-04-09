@@ -1,0 +1,1784 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Creo Gateway Bridge</title>
+  <script src="/legacy-js/pfcUtils.js"></script>
+  <style>
+    body {
+      margin: 0;
+      font-family: Segoe UI, Arial, sans-serif;
+      background: #0f172a;
+      color: #e2e8f0;
+    }
+
+    main {
+      padding: 14px 16px;
+    }
+
+    .status {
+      display: inline-block;
+      padding: 6px 10px;
+      border-radius: 999px;
+      background: rgba(148, 163, 184, 0.18);
+      margin-bottom: 10px;
+      font-weight: 700;
+    }
+
+    .ok {
+      color: #5eead4;
+    }
+
+    .warn {
+      color: #fbbf24;
+    }
+
+    pre {
+      white-space: pre-wrap;
+      background: rgba(15, 23, 42, 0.75);
+      border: 1px solid rgba(148, 163, 184, 0.25);
+      border-radius: 12px;
+      padding: 12px;
+      min-height: 200px;
+      max-height: 60vh;
+      overflow: auto;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <div id="bridgeStatus" class="status warn">Initializing Creo bridge...</div>
+    <div id="bridgeSummary">Keep this page open inside Creo. It forwards Creo API requests to the external browser UI.</div>
+    <pre id="bridgeLog"></pre>
+  </main>
+
+  <script>
+    var bridgeSocket = null;
+    var reconnectTimer = null;
+    var pwl = null;
+    var pwlc = null;
+    var bomDescriptionCache = {};
+    var bomClassificationCache = {};
+    var bridgeSocketUrl = "";
+    var connectionAttemptIndex = 0;
+    var PROGRAM_IMPORT_POST_MACRO = "Yes ;Yes ; ~ Command `ProCmdRegenAuto` ;#CURRENT VALS;#CURRENT VALS;#CURRENT VALS;#CURRENT VALS;~ Command `ProCmdRegenAuto` ;#CURRENT VALS;#CURRENT VALS;#CURRENT VALS;#CURRENT VALS; ~ Command `ProCmdModelSave` ;#CURRENT VALS;#CURRENT VALS;#CURRENT VALS;#CURRENT VALS;#CURRENT VALS;#CURRENT VALS;#CURRENT VALS;";
+    var PROGRAM_IMPORT_SETTLE_MS = 5000;
+    var SUPPRESS_POPUP_MENU_MACRO = "~ Command `ProCmdSuppress@PopupMenuTree` ;~ Activate `del_sup_msg` `ok`;";
+    var RESUME_POPUP_MENU_MACRO = "~ Command `ProCmdResume@PopupMenuTree`;";
+
+    function byId(id)
+    {
+      return document.getElementById(id);
+    }
+
+    function log(message)
+    {
+      var logEl = byId("bridgeLog");
+      var now = new Date().toLocaleTimeString();
+      logEl.textContent = "[" + now + "] " + message + "\n" + logEl.textContent;
+    }
+
+    function summarizeResult(result)
+    {
+      if (result == null)
+        return "ok";
+
+      if (typeof result === "string" || typeof result === "number" || typeof result === "boolean")
+        return String(result);
+
+      if (result.message != null && String(result.message) !== "")
+        return String(result.message);
+
+      if (result.modelNameExt != null)
+      {
+        var parts = [String(result.modelNameExt)];
+        if (result.filePath != null)
+          parts.push("file=" + String(result.filePath));
+        if (result.closed != null)
+          parts.push("closed=" + String(result.closed));
+        if (result.opened != null)
+          parts.push("opened=" + String(result.opened));
+        if (result.imported != null)
+          parts.push("imported=" + String(result.imported));
+        if (result.regenerated != null)
+          parts.push("regenerated=" + String(result.regenerated));
+        if (result.saved != null)
+          parts.push("saved=" + String(result.saved));
+        if (result.postImportMacroRan != null)
+          parts.push("postImportMacroRan=" + String(result.postImportMacroRan));
+        return parts.join(" | ");
+      }
+
+      if (result.modelNameExt != null && result.featureId != null)
+        return String(result.modelNameExt) + " feature " + String(result.featureId);
+
+      if (result.directoryPath != null)
+        return String(result.directoryPath);
+
+      if (result.paramName != null)
+        return String(result.paramName);
+
+      var keys = [];
+      for (var key in result)
+      {
+        if (!Object.prototype.hasOwnProperty.call(result, key))
+          continue;
+        keys.push(key);
+        if (keys.length >= 4)
+          break;
+      }
+
+      if (keys.length == 0)
+        return "ok";
+
+      return "keys: " + keys.join(", ");
+    }
+
+    function setStatus(text, ok)
+    {
+      var el = byId("bridgeStatus");
+      el.textContent = text;
+      el.className = "status " + (ok ? "ok" : "warn");
+    }
+
+    function delay(ms)
+    {
+      return new Promise(function (resolve) {
+        window.setTimeout(resolve, ms);
+      });
+    }
+
+    function installCreoHelperFallbacks()
+    {
+      if (typeof window.isProEEmbeddedBrowser !== "function")
+      {
+        window.isProEEmbeddedBrowser = function ()
+        {
+          try
+          {
+            return !!(top && top.external && top.external.ptc);
+          }
+          catch (err)
+          {
+            return false;
+          }
+        };
+      }
+
+      if (typeof window.pfcIsWindows !== "function")
+      {
+        window.pfcIsWindows = function ()
+        {
+          return navigator.userAgent.toString().toLowerCase().indexOf("trident") !== -1;
+        };
+      }
+
+      if (typeof window.pfcIsChrome !== "function")
+      {
+        window.pfcIsChrome = function ()
+        {
+          return navigator.userAgent.toString().toLowerCase().indexOf("chrome/") !== -1;
+        };
+      }
+
+      if (typeof window.pfcIsMozilla !== "function")
+      {
+        window.pfcIsMozilla = function ()
+        {
+          if (window.pfcIsWindows())
+            return false;
+          if (window.pfcIsChrome())
+            return false;
+          return true;
+        };
+      }
+
+      if (typeof window.pfcCreate !== "function")
+      {
+        window.pfcCreate = function (className)
+        {
+          if (window.pfcIsWindows())
+            return new ActiveXObject("pfc." + className);
+          if (window.pfcIsChrome())
+          {
+            if (typeof window.pfcCefCreate !== "function")
+              throw new Error("pfcCefCreate is unavailable in this embedded browser session.");
+            return window.pfcCefCreate(className);
+          }
+          if (window.pfcIsMozilla())
+          {
+            if (typeof netscape === "undefined" ||
+              !netscape.security ||
+              !netscape.security.PrivilegeManager ||
+              typeof netscape.security.PrivilegeManager.enablePrivilege !== "function")
+            {
+              throw new Error("Mozilla Creo privilege manager is unavailable.");
+            }
+
+            netscape.security.PrivilegeManager.enablePrivilege("UniversalXPConnect");
+            return Components.classes["@ptc.com/pfc/" + className + ";1"].createInstance();
+          }
+
+          throw new Error("Unsupported embedded browser runtime for Creo helper creation.");
+        };
+      }
+
+      if (typeof window.pfcGetProESession !== "function")
+      {
+        window.pfcGetProESession = function ()
+        {
+          if (!window.isProEEmbeddedBrowser())
+            throw new Error("Not in embedded browser. Aborting...");
+          if (window.pfcIsMozilla())
+            netscape.security.PrivilegeManager.enablePrivilege("UniversalXPConnect");
+          return window.pfcCreate("MpfcCOMGlobal").GetProESession();
+        };
+      }
+
+      if (typeof window.pfcGetScript !== "function")
+      {
+        window.pfcGetScript = function ()
+        {
+          if (!window.isProEEmbeddedBrowser())
+            throw new Error("Not in embedded browser. Aborting...");
+          if (window.pfcIsMozilla())
+            netscape.security.PrivilegeManager.enablePrivilege("UniversalXPConnect");
+          return window.pfcCreate("MpfcCOMGlobal").GetScript();
+        };
+      }
+    }
+
+    installCreoHelperFallbacks();
+
+    function hasCreoHelpers()
+    {
+      return typeof pfcGetScript === "function";
+    }
+
+    function shouldEnableMozillaPrivilege()
+    {
+      return typeof pfcIsMozilla === "function" && pfcIsMozilla() &&
+        typeof netscape !== "undefined" &&
+        netscape.security &&
+        netscape.security.PrivilegeManager &&
+        typeof netscape.security.PrivilegeManager.enablePrivilege === "function";
+    }
+
+    function normalizeGatewayCandidate(raw)
+    {
+      var value = trimText(raw);
+      if (value === "")
+        return "";
+
+      value = value.replace(/\/+$/, "");
+      if (/^wss?:\/\//i.test(value))
+        return value.replace(/\/ws\/creo$/i, "") + "/ws/creo";
+      if (/^https?:\/\//i.test(value))
+      {
+        var wsScheme = value.indexOf("https://") === 0 ? "wss://" : "ws://";
+        return wsScheme + value.replace(/^https?:\/\//i, "") + "/ws/creo";
+      }
+
+      return "";
+    }
+
+    function getGatewaySocketCandidates()
+    {
+      var query = null;
+      var candidates = [];
+      var dedupe = {};
+      var currentHostCandidate = "";
+
+      try
+      {
+        query = new URLSearchParams(window.location.search || "");
+      }
+      catch (err)
+      {
+        query = null;
+      }
+
+      function addCandidate(raw)
+      {
+        var candidate = normalizeGatewayCandidate(raw);
+        if (candidate === "" || dedupe[candidate])
+          return;
+        dedupe[candidate] = true;
+        candidates.push(candidate);
+      }
+
+      if ((window.location.protocol === "http:" || window.location.protocol === "https:") && window.location.host)
+      {
+        currentHostCandidate = normalizeGatewayCandidate(window.location.protocol + "//" + window.location.host);
+        addCandidate(currentHostCandidate);
+      }
+
+      if (query)
+      {
+        addCandidate(query.get("gateway"));
+        addCandidate(query.get("gatewayUrl"));
+        addCandidate(query.get("ws"));
+      }
+
+      try
+      {
+        addCandidate(window.localStorage.getItem("creoGatewayWsUrl"));
+      }
+      catch (err)
+      {
+      }
+
+      return candidates;
+    }
+
+    function getNextGatewaySocketUrl()
+    {
+      var candidates = getGatewaySocketCandidates();
+      if (!candidates.length)
+        throw new Error("No gateway URL candidates are available for the Creo bridge.");
+
+      var candidate = candidates[connectionAttemptIndex % candidates.length];
+      connectionAttemptIndex += 1;
+      return candidate;
+    }
+
+    function initCreoContext()
+    {
+      if (pwl != null && pwlc != null)
+        return;
+
+      if (!hasCreoHelpers())
+        throw new Error("Creo helper script is unavailable. Confirm /legacy-js/pfcUtils.js loads in the embedded browser.");
+
+      if (shouldEnableMozillaPrivilege())
+        netscape.security.PrivilegeManager.enablePrivilege("UniversalXPConnect");
+
+      pwl = pfcGetScript();
+      document.pwl = pwl;
+      pwlc = pwl.GetPWLConstants();
+      document.pwlc = pwlc;
+      log("Creo scripting context initialized.");
+    }
+
+    function ensureCreoContext()
+    {
+      if (pwl == null || pwlc == null)
+        initCreoContext();
+
+      if (document.pwl == null)
+        throw new Error("Creo scripting context is unavailable. Open this page in the embedded browser.");
+    }
+
+    function trimText(value)
+    {
+      return String(value == null ? "" : value).replace(/^\s+|\s+$/g, "");
+    }
+
+    function normalizeAbsolutePath(raw)
+    {
+      return trimText(raw).replace(/\//g, "\\");
+    }
+
+    function normalizeModelNameExt(raw)
+    {
+      return trimText(raw);
+    }
+
+    function isSupportedModelExt(modelNameExt)
+    {
+      return /\.(prt|asm)$/i.test(String(modelNameExt || ""));
+    }
+
+    function isWindowsAbsolutePath(path)
+    {
+      return /^[A-Za-z]:\\/.test(String(path || "")) || /^\\\\/.test(String(path || ""));
+    }
+
+    function splitPathForExport(path)
+    {
+      var normalized = normalizeAbsolutePath(path);
+      var idx = Math.max(normalized.lastIndexOf("\\"), normalized.lastIndexOf("/"));
+      if (idx < 0)
+        return { directory: "", fileName: normalized };
+
+      return {
+        directory: normalized.substring(0, idx),
+        fileName: normalized.substring(idx + 1)
+      };
+    }
+
+    function stripModelExtension(modelNameExt)
+    {
+      return String(modelNameExt || "").replace(/\.[^\.]+$/, "");
+    }
+
+    function programFileExtension(modelNameExt)
+    {
+      return (/\.asm$/i.test(modelNameExt)) ? ".als" : ".txt";
+    }
+
+    function getValueFromResult(ret)
+    {
+      if (ret.ParamType == parseInt(document.pwlc.PWL_VALUE_STRING))
+        return ret.ParamStringVal;
+      if (ret.ParamType == parseInt(document.pwlc.PWL_VALUE_DOUBLE))
+        return String(ret.ParamDoubleVal);
+      if (ret.ParamType == parseInt(document.pwlc.PWL_VALUE_INTEGER))
+        return String(ret.ParamIntVal);
+      if (ret.ParamType == parseInt(document.pwlc.PWL_VALUE_BOOLEAN))
+        return ret.ParamBooleanVal ? "true" : "false";
+      return "";
+    }
+
+    function getTypeNameFromCode(code)
+    {
+      var value = parseInt(code, 10);
+      if (value == parseInt(document.pwlc.PWL_VALUE_STRING))
+        return "String";
+      if (value == parseInt(document.pwlc.PWL_VALUE_DOUBLE))
+        return "Double";
+      if (value == parseInt(document.pwlc.PWL_VALUE_INTEGER))
+        return "Integer";
+      if (value == parseInt(document.pwlc.PWL_VALUE_BOOLEAN))
+        return "Boolean";
+      return "Unknown";
+    }
+
+    function resolveParamType(paramType)
+    {
+      if (typeof paramType == "number")
+        return paramType;
+
+      if (typeof paramType == "string")
+      {
+        if (/^\d+$/.test(paramType))
+          return parseInt(paramType, 10);
+
+        if (document.pwlc[paramType] != null)
+          return parseInt(document.pwlc[paramType], 10);
+      }
+
+      return parseInt(document.pwlc.PWL_VALUE_STRING, 10);
+    }
+
+    function buildParamValue(paramType, rawValue)
+    {
+      var valueText = String(rawValue == null ? "" : rawValue);
+      var floatValue = parseFloat(valueText);
+      var intValue = parseInt(valueText, 10);
+      var boolValue = valueText.toLowerCase() == "true";
+
+      if (paramType == parseInt(document.pwlc.PWL_VALUE_DOUBLE) && isNaN(floatValue))
+        floatValue = 1.1;
+      if (paramType == parseInt(document.pwlc.PWL_VALUE_INTEGER) && isNaN(intValue))
+        intValue = -5;
+
+      return {
+        stringValue: valueText,
+        floatValue: floatValue,
+        intValue: intValue,
+        boolValue: boolValue
+      };
+    }
+
+    function ensureModelLoadedInSession(modelNameExt)
+    {
+      try
+      {
+        if (!modelNameExt)
+          return false;
+
+        var ret = document.pwl.pwlMdlOpen(modelNameExt, "", false);
+        return !!(ret.Status || ret.ErrorCode == -4);
+      }
+      catch (e)
+      {
+        return false;
+      }
+    }
+
+    function readModelParameter(modelNameExt, parameterName)
+    {
+      try
+      {
+        var ret = document.pwl.pwlParameterValueGet(modelNameExt, parseInt(document.pwlc.PWL_MODEL), -1, parameterName);
+        if (!ret.Status)
+          return "";
+        return getValueFromResult(ret);
+      }
+      catch (e)
+      {
+        return "";
+      }
+    }
+
+    function readFeatureDescriptionParameter(parentAssemblyModelExt, featureId)
+    {
+      try
+      {
+        if (!parentAssemblyModelExt || featureId == null || featureId === "")
+          return "";
+
+        var featId = parseInt(featureId, 10);
+        if (isNaN(featId))
+          return "";
+
+        var ret = document.pwl.pwlParameterValueGet(parentAssemblyModelExt, parseInt(document.pwlc.PWL_FEATURE), featId, "DESCP");
+        if (!ret.Status)
+          return "";
+        return getValueFromResult(ret);
+      }
+      catch (e)
+      {
+        return "";
+      }
+    }
+
+    function getModelDescription(modelNameExt, allowOpenFallback, featureId, parentAssemblyModelExt)
+    {
+      if (!modelNameExt)
+        return "";
+
+      var key = String(modelNameExt).toUpperCase() + "|" + String(parentAssemblyModelExt || "") + "|" + String(featureId || "");
+      if (bomDescriptionCache[key] != null)
+        return bomDescriptionCache[key];
+
+      var desc = readModelParameter(modelNameExt, "DESCP");
+      if (desc === "")
+        desc = readFeatureDescriptionParameter(parentAssemblyModelExt, featureId);
+
+      if (desc === "" && allowOpenFallback && ensureModelLoadedInSession(modelNameExt))
+      {
+        desc = readModelParameter(modelNameExt, "DESCP");
+        if (desc === "")
+          desc = readFeatureDescriptionParameter(parentAssemblyModelExt, featureId);
+      }
+
+      bomDescriptionCache[key] = desc;
+      return desc;
+    }
+
+    function getModelClassification(modelNameExt, allowOpenFallback)
+    {
+      if (!modelNameExt)
+        return "";
+
+      var key = String(modelNameExt).toUpperCase();
+      if (bomClassificationCache[key] != null)
+        return bomClassificationCache[key];
+
+      var classification = readModelParameter(modelNameExt, "BS_Class");
+      if (classification === "" && allowOpenFallback && ensureModelLoadedInSession(modelNameExt))
+        classification = readModelParameter(modelNameExt, "BS_Class");
+
+      bomClassificationCache[key] = classification;
+      return classification;
+    }
+
+    function resolveModelName(desc, session)
+    {
+      var name = "";
+      try
+      {
+        if (desc.GetFileName)
+          name = desc.GetFileName();
+      }
+      catch (e1) {}
+
+      if ((!name || name === "") && desc.ModelName && desc.Type)
+        name = desc.ModelName + "." + desc.Type;
+
+      if (!name || name === "")
+      {
+        try
+        {
+          var model = session.GetModelFromDescr(desc);
+          if (model != null)
+          {
+            if (model.FileName)
+              name = model.FileName;
+            else if (model.Name && model.Extension)
+              name = model.Name + "." + model.Extension;
+          }
+        }
+        catch (e2) {}
+      }
+
+      if (!name || name === "")
+        name = desc.ModelName || "unknown";
+
+      return name;
+    }
+
+
+    function buildBomChildren(assembly, session, modelTypeClass, level, parentAssemblyModelExt)
+    {
+      var children = [];
+      var components = assembly.ListFeaturesByType(true, pfcCreate("pfcFeatureType").FEATTYPE_COMPONENT);
+      if (components == null || components.Count == 0)
+        return children;
+
+      for (var i = 0; i < components.Count; i++)
+      {
+        var compFeat = components.Item(i);
+        var desc = compFeat.ModelDescr;
+        if (desc == null)
+          continue;
+
+        var featureId = "";
+        try
+        {
+          if (compFeat.Id != null)
+            featureId = String(compFeat.Id);
+          else if (compFeat.GetId)
+            featureId = String(compFeat.GetId());
+        }
+        catch (ignoreId) {}
+
+        var name = resolveModelName(desc, session);
+        var compModel = null;
+        var hasChildren = false;
+        try
+        {
+          compModel = session.GetModelFromDescr(desc);
+          hasChildren = (compModel != null && compModel.Type == modelTypeClass.MDL_ASSEMBLY);
+        }
+        catch (ignoreModel) {}
+
+        var node = {
+          number: String(level),
+          modelNameExt: name,
+          featureId: featureId,
+          parentAssemblyModelExt: parentAssemblyModelExt || "",
+          description: getModelDescription(name, true, featureId, parentAssemblyModelExt || ""),
+          classification: getModelClassification(name, true),
+          children: []
+        };
+
+        if (hasChildren)
+          node.children = buildBomChildren(compModel, session, modelTypeClass, level + 1, name);
+
+        children.push(node);
+      }
+
+      return children;
+    }
+
+    function getCurrentModelName()
+    {
+      var ret = document.pwl.pwlMdlCurrentGet();
+      if (!ret.Status)
+        throw new Error("pwlMdlCurrentGet failed (" + ret.ErrorCode + ")");
+
+      var currentName = trimText(ret.MdlNameExt);
+      if (currentName !== "" && currentName.toLowerCase() !== "undefined" && currentName.toLowerCase() !== "null")
+        return currentName;
+
+      try
+      {
+        var session = pfcGetProESession();
+        var currentModel = session.CurrentModel;
+        if (currentModel != null)
+        {
+          currentName = trimText(currentModel.FileName || "");
+          if (currentName !== "")
+            return currentName;
+
+          currentName = trimText(resolveModelName(currentModel.Descr, session));
+          if (currentName !== "")
+            return currentName;
+
+          var baseName = trimText(currentModel.Name || "");
+          var extName = trimText(currentModel.Extension || "");
+          if (baseName !== "" && extName !== "")
+            return baseName + "." + extName;
+        }
+      }
+      catch (ignoreFallback) {}
+
+      return "";
+    }
+
+    function listParameters(modelNameExt)
+    {
+      ensureModelLoadedInSession(modelNameExt);
+      var ret = document.pwl.pwlMdlParametersGet(modelNameExt);
+      if (!ret.Status)
+        throw new Error("Parameters not available for " + modelNameExt + ".");
+
+      var rows = [];
+      for (var i = 0; i < ret.NumParams; i++)
+      {
+        var paramName = ret.ParamNames.Item(i);
+        var valRet = document.pwl.pwlParameterValueGet(modelNameExt, parseInt(document.pwlc.PWL_MODEL), -1, paramName);
+        if (!valRet.Status)
+          continue;
+
+        rows.push({
+          name: paramName,
+          typeCode: parseInt(valRet.ParamType, 10),
+          typeName: getTypeNameFromCode(valRet.ParamType),
+          value: getValueFromResult(valRet)
+        });
+      }
+
+      return { modelNameExt: modelNameExt, parameters: rows };
+    }
+
+    function setParameter(args)
+    {
+      var modelNameExt = String(args.modelNameExt || "");
+      var paramName = String(args.paramName || "");
+      var paramType = resolveParamType(args.paramType);
+      var parsed = buildParamValue(paramType, args.rawValue);
+
+      var ret = document.pwl.pwlParameterValueSet(modelNameExt, document.pwlc.PWL_MODEL, -1, paramName, paramType, parsed.intValue, parsed.floatValue, parsed.stringValue, parsed.boolValue);
+      if (!ret.Status)
+        throw new Error("pwlParameterValueSet failed (" + ret.ErrorCode + ")");
+
+      if (paramName.toUpperCase() == "BS_CLASS")
+        bomClassificationCache[String(modelNameExt).toUpperCase()] = String(args.rawValue || "");
+
+      return { modelNameExt: modelNameExt, paramName: paramName, saved: true };
+    }
+
+    function createParameter(args)
+    {
+      var modelNameExt = String(args.modelNameExt || "");
+      var paramName = String(args.paramName || "");
+      var paramType = resolveParamType(args.paramType);
+      var parsed = buildParamValue(paramType, args.rawValue);
+
+      var ret = document.pwl.pwlParameterCreate(modelNameExt, document.pwlc.PWL_MODEL, -1, paramName, paramType, parsed.intValue, parsed.floatValue, parsed.stringValue, parsed.boolValue);
+      if (!ret.Status)
+        throw new Error("pwlParameterCreate failed (" + ret.ErrorCode + ")");
+
+      if (paramName.toUpperCase() == "BS_CLASS")
+        bomClassificationCache[String(modelNameExt).toUpperCase()] = String(args.rawValue || "");
+
+      return { modelNameExt: modelNameExt, paramName: paramName, created: true };
+    }
+
+    function saveClassification(args)
+    {
+      var modelNameExt = String(args.modelNameExt || "");
+      var value = String(args.value || "");
+      var stringType = parseInt(document.pwlc.PWL_VALUE_STRING, 10);
+      var setRet = document.pwl.pwlParameterValueSet(modelNameExt, document.pwlc.PWL_MODEL, -1, "BS_Class", stringType, -1, 0.0, value, false);
+      if (!setRet.Status)
+      {
+        var createRet = document.pwl.pwlParameterCreate(modelNameExt, document.pwlc.PWL_MODEL, -1, "BS_Class", stringType, -1, 0.0, value, false);
+        if (!createRet.Status)
+          throw new Error("Could not save Classification (BS_Class). Error " + createRet.ErrorCode);
+      }
+
+      bomClassificationCache[String(modelNameExt).toUpperCase()] = value;
+      return { modelNameExt: modelNameExt, value: value, saved: true };
+    }
+
+    function setProProgramWorkingDirectory(folderPath)
+    {
+      if (!folderPath)
+        return false;
+
+      var base = String(folderPath).replace(/\//g, "\\");
+      if (base === "")
+        return false;
+
+      var candidates = [base];
+      if (base.charAt(base.length - 1) != "\\")
+        candidates.push(base + "\\");
+
+      for (var i = 0; i < candidates.length; i++)
+      {
+        var ret = document.pwl.pwlDirectoryCurrentSet(candidates[i]);
+        if (ret && ret.Status)
+          return true;
+      }
+
+      return false;
+    }
+
+    function getCurrentDirectory()
+    {
+      var ret = document.pwl.pwlDirectoryCurrentGet();
+      if (!ret.Status)
+        throw new Error("pwlDirectoryCurrentGet failed (" + ret.ErrorCode + ")");
+      return { directoryPath: ret.DirectoryPath };
+    }
+
+    function setCurrentDirectory(args)
+    {
+      var targetDir = normalizeAbsolutePath(args.directoryPath || "");
+      if (targetDir === "")
+        throw new Error("directoryPath is required.");
+
+      var ret = document.pwl.pwlDirectoryCurrentSet(targetDir);
+      if (!ret.Status)
+        throw new Error("pwlDirectoryCurrentSet failed (" + ret.ErrorCode + ")");
+      return { directoryPath: targetDir, set: true };
+    }
+
+    function runMacro(args)
+    {
+      var macroText = String(args.macro || "");
+      var workingDirectory = String(args.workingDirectory || "");
+      if (macroText.replace(/^\s+|\s+$/g, "") === "")
+        throw new Error("Enter a macro string first.");
+
+      var proProgramDir = (workingDirectory !== "") ? workingDirectory : "C:\\myloadpoint\\creo automation\\proprogram";
+      if (!setProProgramWorkingDirectory(proProgramDir))
+        throw new Error("pwlDirectoryCurrentSet failed for " + proProgramDir);
+
+      pfcGetProESession().RunMacro(macroText);
+      return { ok: true, macro: macroText, workingDirectory: proProgramDir };
+    }
+
+    function activateOwnerModelForFeatureOps(ownerModelNameExt)
+    {
+      var owner = normalizeModelNameExt(ownerModelNameExt || "");
+      if (owner === "")
+        throw new Error("Owning model is empty.");
+
+      var ret = document.pwl.pwlMdlOpen(owner, "", true);
+      if (!ret.Status && ret.ErrorCode != -4)
+        throw new Error("Could not activate owning model window (pwlMdlOpen " + ret.ErrorCode + ").");
+
+      try
+      {
+        if (document.pwl.pwlWindowActiveGet && document.pwl.pwlWindowActivate)
+        {
+          var activeWin = document.pwl.pwlWindowActiveGet();
+          if (activeWin && activeWin.Status && activeWin.WindowID != null)
+            document.pwl.pwlWindowActivate(parseInt(activeWin.WindowID, 10));
+        }
+      }
+      catch (ignoreActivate) {}
+
+      var session = pfcGetProESession();
+      var model = null;
+      try
+      {
+        var desc = pfcCreate("pfcModelDescriptor").CreateFromFileName(owner);
+        model = session.GetModelFromDescr(desc);
+      }
+      catch (ignoreGet) {}
+
+      if (model == null)
+        throw new Error("Could not load owner model " + owner + " in session.");
+
+      try
+      {
+        if (session.GetModelWindow)
+        {
+          var mdlWindow = session.GetModelWindow(model);
+          if (mdlWindow != null && mdlWindow.Activate)
+            mdlWindow.Activate();
+        }
+      }
+      catch (ignoreWindow) {}
+
+      return model;
+    }
+
+    function createFeatureSelectionForCurrentModel(modelObj, featureInt)
+    {
+      if (modelObj == null)
+        throw new Error("Could not resolve active owner model object.");
+      if (!modelObj.GetFeatureById)
+        throw new Error("Model does not support GetFeatureById.");
+
+      var feature = null;
+      try { feature = modelObj.GetFeatureById(featureInt); } catch (e1) {}
+      if (feature == null)
+        throw new Error("Feature " + String(featureInt) + " not found in " + String(modelObj.FileName || modelObj.Name || "current model") + ".");
+
+      var mpfcSelect = pfcCreate("MpfcSelect");
+      if (mpfcSelect == null || !mpfcSelect.CreateModelItemSelection)
+        throw new Error("MpfcSelect.CreateModelItemSelection is unavailable.");
+
+      var selection = null;
+      var componentPath = null;
+      try
+      {
+        if (modelObj.Type == pfcCreate("pfcModelType").MDL_ASSEMBLY)
+        {
+          var emptyIds = pfcCreate("intseq");
+          componentPath = pfcCreate("MpfcAssembly").CreateComponentPath(modelObj, emptyIds);
+        }
+      }
+      catch (ignorePath) {}
+
+      try
+      {
+        selection = mpfcSelect.CreateModelItemSelection(feature, componentPath || void null);
+      }
+      catch (e2)
+      {
+        selection = mpfcSelect.CreateModelItemSelection(feature, void null);
+      }
+
+      if (selection == null)
+        throw new Error("CreateModelItemSelection returned null.");
+
+      return selection;
+    }
+
+    function primeSelectionBufferWithFeature(ownerModelNameExt, featureInt)
+    {
+      var session = pfcGetProESession();
+      var model = activateOwnerModelForFeatureOps(ownerModelNameExt);
+      var selection = createFeatureSelectionForCurrentModel(model, featureInt);
+
+      try
+      {
+        if (selection.Highlight)
+          selection.Highlight(model);
+      }
+      catch (ignoreHighlight) {}
+
+      var selectionBuffer = session.CurrentSelectionBuffer;
+      if (selectionBuffer == null)
+        throw new Error("Session.CurrentSelectionBuffer is unavailable for the active model.");
+
+      try { selectionBuffer.Clear(); } catch (ignoreClear) {}
+      selectionBuffer.AddSelection(selection);
+
+      return { model: model, selection: selection };
+    }
+
+    function featureResumeById(args)
+    {
+      var modelNameExt = normalizeModelNameExt(args.modelNameExt || "");
+      var featureId = parseInt(args.featureId, 10);
+      if (modelNameExt === "")
+        throw new Error("modelNameExt is required.");
+      if (isNaN(featureId) || featureId <= 0)
+        throw new Error("featureId must be a positive integer.");
+
+      primeSelectionBufferWithFeature(modelNameExt, featureId);
+      pfcGetProESession().RunMacro(RESUME_POPUP_MENU_MACRO);
+      return { ok: true, modelNameExt: modelNameExt, featureId: featureId };
+    }
+
+    function featureSuppressById(args)
+    {
+      var modelNameExt = normalizeModelNameExt(args.modelNameExt || "");
+      var featureId = parseInt(args.featureId, 10);
+      if (modelNameExt === "")
+        throw new Error("modelNameExt is required.");
+      if (isNaN(featureId) || featureId <= 0)
+        throw new Error("featureId must be a positive integer.");
+
+      primeSelectionBufferWithFeature(modelNameExt, featureId);
+      pfcGetProESession().RunMacro(SUPPRESS_POPUP_MENU_MACRO);
+      return { ok: true, modelNameExt: modelNameExt, featureId: featureId };
+    }
+
+    async function runMacroForModels(args)
+    {
+      var macroText = trimText(args.macro || "");
+      var models = args.models || [];
+      var parentModel = String(args.parentModelNameExt || "");
+      var delayMs = parseInt(args.delayMs || 1500, 10);
+      if (isNaN(delayMs) || delayMs < 0)
+        delayMs = 1500;
+
+      if (macroText === "")
+        throw new Error("Enter BOM macro string first.");
+      if (!models.length)
+        throw new Error("No models were provided for BOM macro execution.");
+
+      var baseWorkingDir = "C:\\myloadpoint";
+      var macroWorkingDir = String(args.workingDirectory || "") || "C:\\myloadpoint\\creo automation\\proprogram";
+      var success = 0;
+      var failed = 0;
+      var failedItems = [];
+
+      for (var i = 0; i < models.length; i++)
+      {
+        var currentModel = String(models[i] || "");
+        try
+        {
+          if (!setProProgramWorkingDirectory(baseWorkingDir))
+            throw new Error("base directory set failed");
+
+          var openResult = openModelForProProgram(currentModel);
+          if (!openResult.ok)
+            throw new Error("open failed");
+
+          if (!setProProgramWorkingDirectory(macroWorkingDir))
+            throw new Error("macro directory set failed");
+
+          pfcGetProESession().RunMacro(macroText);
+          if (delayMs > 0)
+            await delay(delayMs);
+          closeModelAfterProProgram(currentModel);
+          setProProgramWorkingDirectory(baseWorkingDir);
+          success += 1;
+        }
+        catch (e)
+        {
+          failed += 1;
+          failedItems.push(currentModel);
+          setProProgramWorkingDirectory(baseWorkingDir);
+        }
+      }
+
+      if (parentModel !== "")
+        openModelForProProgram(parentModel);
+
+      return {
+        success: success,
+        failed: failed,
+        failedItems: failedItems,
+        parentModelNameExt: parentModel,
+        message: "Macro run complete. Success: " + String(success) + ", Failed: " + String(failed) + "."
+      };
+    }
+
+    function getBomTree()
+    {
+      bomDescriptionCache = {};
+      bomClassificationCache = {};
+
+      var session = pfcGetProESession();
+      var currentModel = session.CurrentModel;
+      var modelTypeClass = pfcCreate("pfcModelType");
+      if (currentModel == null)
+        throw new Error("No current model in session.");
+
+      var currentModelName = getCurrentModelName();
+      var root = {
+        number: "1",
+        modelNameExt: currentModelName,
+        featureId: "",
+        parentAssemblyModelExt: "",
+        description: getModelDescription(currentModelName, true, "", ""),
+        classification: getModelClassification(currentModelName, true),
+        children: []
+      };
+
+      if (currentModel.Type == modelTypeClass.MDL_ASSEMBLY)
+        root.children = buildBomChildren(currentModel, session, modelTypeClass, 2, currentModelName);
+
+      return { root: root };
+    }
+
+    function openModel(args)
+    {
+      var modelNameExt = normalizeModelNameExt(args.modelNameExt || "");
+      if (modelNameExt === "")
+        throw new Error("modelNameExt is required.");
+
+      log("[model_open] requesting open for " + modelNameExt);
+
+      var ret = document.pwl.pwlMdlOpen(modelNameExt, "", true);
+      if (!ret.Status && ret.ErrorCode != -4)
+        throw new Error("pwlMdlOpen failed (" + ret.ErrorCode + ")");
+
+      try
+      {
+        if (document.pwl.pwlWindowActiveGet && document.pwl.pwlWindowActivate)
+        {
+          var newWin = document.pwl.pwlWindowActiveGet();
+          if (newWin.Status && newWin.WindowID != null)
+            document.pwl.pwlWindowActivate(parseInt(newWin.WindowID, 10));
+        }
+      }
+      catch (ignoreActivate) {}
+
+      log("[model_open] done for " + modelNameExt + " | ret.Status=" + String(ret.Status) + " | ret.ErrorCode=" + String(ret.ErrorCode));
+
+      return { modelNameExt: modelNameExt, opened: true };
+    }
+
+    function closeModel(args)
+    {
+      var modelNameExt = normalizeModelNameExt(args.modelNameExt || "");
+      if (modelNameExt === "")
+        throw new Error("modelNameExt is required.");
+
+      log("[model_close] requesting close for " + modelNameExt);
+
+      var closed = closeModelWindowAfterProProgram(modelNameExt, "");
+      if (!closed)
+        closed = closeModelAfterProProgram(modelNameExt);
+
+      log("[model_close] result for " + modelNameExt + " | closed=" + String(!!closed));
+
+      return { modelNameExt: modelNameExt, closed: !!closed };
+    }
+
+    function regenerateModel(args)
+    {
+      var modelNameExt = normalizeModelNameExt(args.modelNameExt || "");
+      if (modelNameExt === "")
+        throw new Error("modelNameExt is required.");
+
+      ensureModelLoadedInSession(modelNameExt);
+      var ret = document.pwl.pwlMdlRegenerate(modelNameExt);
+      if (!ret.Status)
+        throw new Error("pwlMdlRegenerate failed (" + ret.ErrorCode + ")");
+      return { modelNameExt: modelNameExt, regenerated: true };
+    }
+
+    function saveModel(args)
+    {
+      var modelNameExt = normalizeModelNameExt(args.modelNameExt || "");
+      if (modelNameExt === "")
+        throw new Error("modelNameExt is required.");
+
+      ensureModelLoadedInSession(modelNameExt);
+      var session = pfcGetProESession();
+      var desc = pfcCreate("pfcModelDescriptor").CreateFromFileName(modelNameExt);
+      var model = session.GetModelFromDescr(desc);
+      if (model == null)
+        throw new Error("Could not get model " + modelNameExt + " from session.");
+
+      model.Save();
+      return { modelNameExt: modelNameExt, saved: true };
+    }
+
+    function openModelForProProgram(modelNameExt)
+    {
+      var ret = document.pwl.pwlMdlOpen(modelNameExt, "", true);
+      if (!ret.Status && ret.ErrorCode != -4)
+        return { ok: false, openedNow: false };
+
+      try
+      {
+        if (document.pwl.pwlWindowActiveGet && document.pwl.pwlWindowActivate)
+        {
+          var win = document.pwl.pwlWindowActiveGet();
+          if (win.Status && win.WindowID != null)
+            document.pwl.pwlWindowActivate(parseInt(win.WindowID, 10));
+        }
+      }
+      catch (ignoreActivate) {}
+
+      return { ok: true, openedNow: !!ret.Status };
+    }
+
+    function closeModelAfterProProgram(modelNameExt)
+    {
+      try
+      {
+        if (!modelNameExt)
+          return false;
+        log("[closeModelAfterProProgram] erase request for " + modelNameExt);
+        var ret = document.pwl.pwlMdlErase(modelNameExt);
+        log("[closeModelAfterProProgram] erase result for " + modelNameExt + " | status=" + String(!!(ret && ret.Status)) + " | error=" + String(ret && ret.ErrorCode));
+        return !!(ret && ret.Status);
+      }
+      catch (e)
+      {
+        log("[closeModelAfterProProgram] exception for " + modelNameExt + " | " + String(e.message || e));
+        return false;
+      }
+    }
+
+    function closeModelWindowAfterProProgram(modelNameExt, parentModelNameExt)
+    {
+      try
+      {
+        var currentName = normalizeModelNameExt(modelNameExt);
+        var parentName = normalizeModelNameExt(parentModelNameExt);
+        if (currentName === "")
+          return false;
+
+        log("[closeModelWindowAfterProProgram] request current=" + currentName + " parent=" + parentName);
+
+        if (parentName !== "" && currentName.toUpperCase() === parentName.toUpperCase())
+        {
+          log("[closeModelWindowAfterProProgram] skipping close for parent model " + currentName);
+          return false;
+        }
+
+        var session = pfcGetProESession();
+        var desc = pfcCreate("pfcModelDescriptor").CreateFromFileName(currentName);
+        var model = session.GetModelFromDescr(desc);
+        if (model == null)
+        {
+          log("[closeModelWindowAfterProProgram] no session model found for " + currentName + ", falling back to erase");
+          return closeModelAfterProProgram(currentName);
+        }
+
+        try
+        {
+          if (session.GetModelWindow)
+          {
+            var mdlWindow = session.GetModelWindow(model);
+            if (mdlWindow != null)
+            {
+              log("[closeModelWindowAfterProProgram] closing window for " + currentName);
+              mdlWindow.Close();
+              var erased = closeModelAfterProProgram(currentName);
+              log("[closeModelWindowAfterProProgram] post-window erase for " + currentName + " | erased=" + String(erased));
+              return erased || true;
+            }
+          }
+        }
+        catch (ignoreClose) {
+          log("[closeModelWindowAfterProProgram] window-close exception for " + currentName + " | " + String(ignoreClose.message || ignoreClose));
+        }
+
+        return closeModelAfterProProgram(currentName);
+      }
+      catch (e)
+      {
+        log("[closeModelWindowAfterProProgram] outer exception for " + modelNameExt + " | " + String(e.message || e));
+        return closeModelAfterProProgram(modelNameExt);
+      }
+    }
+
+    function getModelByNameForProgramIo(modelNameExt)
+    {
+      var normalized = normalizeModelNameExt(modelNameExt);
+      var openResult = openModelForProProgram(normalized);
+      if (!openResult.ok)
+        return { ok: false, model: null, openedNow: false, reason: "Could not open model " + normalized + "." };
+
+      var session = pfcGetProESession();
+      var desc = pfcCreate("pfcModelDescriptor").CreateFromFileName(normalized);
+      var model = session.GetModelFromDescr(desc);
+      if (model == null)
+        return { ok: false, model: null, openedNow: openResult.openedNow, reason: "Unable to get model object for " + normalized + "." };
+
+      return { ok: true, model: model, openedNow: openResult.openedNow, reason: "" };
+    }
+
+    function programExport(args)
+    {
+      var baseWorkingDir = "C:\\myloadpoint";
+      var shouldRestoreWorkingDir = false;
+      var shouldCloseModel = false;
+      var modelToClose = "";
+
+      var modelNameExt = normalizeModelNameExt(args.modelNameExt || "");
+      if (modelNameExt === "" || !isSupportedModelExt(modelNameExt))
+        throw new Error("Enter a valid model name with extension (.prt or .asm).");
+
+      var exportPath = normalizeAbsolutePath(args.filePath || "");
+      if (exportPath === "" || !isWindowsAbsolutePath(exportPath))
+        throw new Error("Enter an absolute export file path.");
+
+      var exportPathParts = splitPathForExport(exportPath);
+      if (exportPathParts.directory === "" || exportPathParts.fileName === "")
+        throw new Error("Export path must include directory and file name.");
+
+      try
+      {
+        var modelInfo = getModelByNameForProgramIo(modelNameExt);
+        if (!modelInfo.ok)
+          throw new Error(modelInfo.reason || "Model open failed.");
+        shouldCloseModel = !!modelInfo.openedNow;
+        modelToClose = modelNameExt;
+
+        if (!setProProgramWorkingDirectory(exportPathParts.directory))
+          throw new Error("Failed to set export working directory: " + exportPathParts.directory);
+        shouldRestoreWorkingDir = true;
+
+        var exportInstructions = pfcCreate("pfcProgramExportInstructions").Create();
+        modelInfo.model.Export(exportPathParts.fileName, exportInstructions);
+      }
+      finally
+      {
+        if (shouldCloseModel)
+          closeModelWindowAfterProProgram(modelToClose, "");
+        if (shouldRestoreWorkingDir)
+          setProProgramWorkingDirectory(baseWorkingDir);
+      }
+
+      return { modelNameExt: modelNameExt, filePath: exportPath, exported: true };
+    }
+
+    async function programImport(args)
+    {
+      var baseWorkingDir = "C:\\myloadpoint";
+      var shouldRestoreWorkingDir = false;
+      var shouldCloseModel = false;
+      var postImportMacroRan = true;
+      var modelToClose = "";
+
+      var modelNameExt = normalizeModelNameExt(args.modelNameExt || "");
+      if (modelNameExt === "" || !isSupportedModelExt(modelNameExt))
+        throw new Error("Enter a valid model name with extension (.prt or .asm).");
+
+      var importPath = normalizeAbsolutePath(args.filePath || "");
+      if (importPath === "" || !isWindowsAbsolutePath(importPath))
+        throw new Error("Enter an absolute import file path.");
+
+      var importPathParts = splitPathForExport(importPath);
+      if (importPathParts.directory === "" || importPathParts.fileName === "")
+        throw new Error("Import path must include directory and file name.");
+
+      log("[import] model=" + modelNameExt + " dir=" + importPathParts.directory + " file=" + importPathParts.fileName);
+
+      try
+      {
+        // Set base working dir so pwlMdlOpen can find the model (bridge starts from cold context)
+        log("[import] Step 1: setting base working dir to " + baseWorkingDir);
+        setProProgramWorkingDirectory(baseWorkingDir);
+
+        log("[import] Step 2: opening model " + modelNameExt);
+        var modelInfo = getModelByNameForProgramIo(modelNameExt);
+        if (!modelInfo.ok)
+          throw new Error(modelInfo.reason || "Model open failed.");
+        shouldCloseModel = !!modelInfo.openedNow;
+        modelToClose = modelNameExt;
+        log("[import] Step 2 done: openedNow=" + modelInfo.openedNow + " model=" + (modelInfo.model != null));
+
+        log("[import] Step 3: setting working dir to " + importPathParts.directory);
+        if (!setProProgramWorkingDirectory(importPathParts.directory))
+          throw new Error("Failed to set import working directory: " + importPathParts.directory);
+        shouldRestoreWorkingDir = true;
+
+        log("[import] Step 4: calling model.Import(" + importPathParts.fileName + ")");
+        var importInstructions = pfcCreate("pfcProgramImportInstructions").Create();
+        modelInfo.model.Import(importPathParts.fileName, importInstructions);
+        log("[import] Step 4 done: Import succeeded");
+
+        log("[import] Step 5: running post-import macro");
+        try
+        {
+          runMacro({ macro: PROGRAM_IMPORT_POST_MACRO, workingDirectory: importPathParts.directory });
+          log("[import] Step 5 done: macro queued");
+        }
+        catch (macroErr)
+        {
+          postImportMacroRan = false;
+          log("[import] Step 5 warning: " + String(macroErr.message || macroErr));
+        }
+
+        if (postImportMacroRan)
+        {
+          log("[import] Step 6: waiting " + String(PROGRAM_IMPORT_SETTLE_MS) + "ms for post-import macro to settle before closing " + modelNameExt);
+          await delay(PROGRAM_IMPORT_SETTLE_MS);
+          log("[import] Step 6 done: settle wait finished for " + modelNameExt);
+        }
+      }
+      catch (e)
+      {
+        var errDetail = String(e.message || e);
+        try
+        {
+          if (typeof window.pfcCefGetLastException === "function")
+          {
+            var pfcErr = window.pfcCefGetLastException();
+            if (pfcErr && pfcErr.message)
+              errDetail = String(pfcErr.message).replace("Exceptions::", "").split(";")[0];
+          }
+        }
+        catch (ignorePfc) {}
+
+        log("[import] FAILED at: " + modelNameExt + " - " + errDetail);
+        throw new Error(errDetail);
+      }
+      finally
+      {
+        if (shouldCloseModel)
+        {
+          log("[import] finally: closing model window for " + modelToClose);
+          var closeResult = closeModelWindowAfterProProgram(modelToClose, "");
+          log("[import] finally: close result for " + modelToClose + " = " + String(closeResult));
+        }
+        if (shouldRestoreWorkingDir)
+        {
+          log("[import] finally: restoring working dir to " + baseWorkingDir);
+          setProProgramWorkingDirectory(baseWorkingDir);
+        }
+      }
+
+      return {
+        modelNameExt: modelNameExt,
+        filePath: importPath,
+        imported: true,
+        postImportMacroRan: postImportMacroRan
+      };
+    }
+
+    async function programBatchExport(args)
+    {
+      var batchDir = normalizeAbsolutePath(args.directoryPath || "");
+      var models = args.models || [];
+      var parentModel = String(args.parentModelNameExt || "");
+      var baseWorkingDir = "C:\\myloadpoint";
+      var success = 0;
+      var failed = 0;
+      var failedItems = [];
+
+      if (batchDir === "" || !isWindowsAbsolutePath(batchDir))
+        throw new Error("Enter an absolute batch directory path.");
+      if (!models.length)
+        throw new Error("No valid models found in tree to export.");
+
+      for (var i = 0; i < models.length; i++)
+      {
+        var currentModel = String(models[i] || "");
+        try
+        {
+          setProProgramWorkingDirectory(baseWorkingDir);
+          var openResult = openModelForProProgram(currentModel);
+          if (!openResult.ok)
+            throw new Error("open failed");
+
+          var session = pfcGetProESession();
+          var desc = pfcCreate("pfcModelDescriptor").CreateFromFileName(currentModel);
+          var model = session.GetModelFromDescr(desc);
+          if (model == null)
+            throw new Error("model get failed");
+
+          if (!setProProgramWorkingDirectory(batchDir))
+            throw new Error("dir set failed");
+
+          var targetFileName = stripModelExtension(currentModel) + programFileExtension(currentModel);
+          var exportInstructions = pfcCreate("pfcProgramExportInstructions").Create();
+          model.Export(targetFileName, exportInstructions);
+          log("  exported: " + targetFileName);
+          success += 1;
+        }
+        catch (e)
+        {
+          failed += 1;
+          failedItems.push(currentModel);
+          log("  FAILED export: " + currentModel + " - " + String(e.message || e));
+        }
+        finally
+        {
+          closeModelWindowAfterProProgram(currentModel, parentModel);
+          setProProgramWorkingDirectory(baseWorkingDir);
+        }
+        await delay(100);
+      }
+
+      if (parentModel !== "")
+        openModelForProProgram(parentModel);
+
+      return {
+        directoryPath: batchDir,
+        success: success,
+        failed: failed,
+        failedItems: failedItems,
+        message: "Batch Export complete. Success: " + String(success) + ", Failed: " + String(failed)
+      };
+    }
+
+    async function programBatchImport(args)
+    {
+      var batchDir = normalizeAbsolutePath(args.directoryPath || "");
+      var models = args.models || [];
+      var parentModel = String(args.parentModelNameExt || "");
+      var featureMap = args.featureMap || {};
+      var levelMap = args.levelMap || {};
+      var baseWorkingDir = "C:\\myloadpoint";
+      var success = 0;
+      var failed = 0;
+      var failedItems = [];
+      var skipped = 0;
+      var skippedItems = [];
+
+      if (batchDir === "" || !isWindowsAbsolutePath(batchDir))
+        throw new Error("Enter an absolute batch directory path.");
+      if (!models.length)
+        throw new Error("No valid models found in tree to import.");
+
+      // --- Preflight: resume suppressed components ---
+      var resumeTargets = [];
+      for (var ri = 0; ri < models.length; ri++)
+      {
+        var rKey = String(models[ri] || "").toUpperCase();
+        var mapping = featureMap[rKey];
+        if (mapping && mapping.featureId && mapping.parentModel)
+          resumeTargets.push({ model: models[ri], featureId: parseInt(mapping.featureId, 10), parentModel: String(mapping.parentModel) });
+      }
+
+      if (resumeTargets.length > 0)
+      {
+        log("Preflight: resuming " + String(resumeTargets.length) + " component(s)...");
+        for (var rt = 0; rt < resumeTargets.length; rt++)
+        {
+          try
+          {
+            primeSelectionBufferWithFeature(resumeTargets[rt].parentModel, resumeTargets[rt].featureId);
+            pfcGetProESession().RunMacro(RESUME_POPUP_MENU_MACRO);
+            await delay(800);
+            log("Resumed " + resumeTargets[rt].model + " (feat " + String(resumeTargets[rt].featureId) + ")");
+          }
+          catch (resumeErr)
+          {
+            log("Resume warning: " + resumeTargets[rt].model + ": " + String(resumeErr.message || resumeErr));
+          }
+        }
+        await delay(500);
+      }
+
+      // --- Sort by hierarchy level: deepest children first, parent last ---
+      var sortedModels = models.slice();
+      sortedModels.sort(function (a, b)
+      {
+        var la = levelMap[a.toUpperCase()] || 0;
+        var lb = levelMap[b.toUpperCase()] || 0;
+        return lb - la;  // descending: highest level number (deepest) first
+      });
+      log("Import order (deepest first): " + sortedModels.join(", "));
+
+      // --- Close parent before loop ---
+      if (parentModel !== "")
+      {
+        closeModelWindowAfterProProgram(parentModel, "");
+      }
+
+      // --- Import loop: mirrors single programImport flow exactly ---
+      for (var i = 0; i < sortedModels.length; i++)
+      {
+        var currentModel = String(sortedModels[i] || "");
+        var currentLevel = levelMap[currentModel.toUpperCase()] || 0;
+        
+        var shouldCloseThisModel = false;
+        log("[" + String(i + 1) + "/" + String(sortedModels.length) + "] " + currentModel + " (level " + String(currentLevel) + ")");
+
+        try
+        {
+          // 1. Set base working dir so pwlMdlOpen can find the model
+          setProProgramWorkingDirectory(baseWorkingDir);
+
+          // 2. Open model (same as single import)
+          var modelInfo = getModelByNameForProgramIo(currentModel);
+          if (!modelInfo.ok)
+            throw new Error(modelInfo.reason || "open failed");
+          shouldCloseThisModel = !!modelInfo.openedNow;
+          log("  opened: " + currentModel + " (openedNow=" + modelInfo.openedNow + ")");
+
+          // 3. Set working dir to batch directory
+          if (!setProProgramWorkingDirectory(batchDir))
+            throw new Error("dir set failed");
+
+          // 4. Import (use .als for assemblies, .txt for parts)
+          var targetFileName = stripModelExtension(currentModel) + programFileExtension(currentModel);
+          log("  importing: " + targetFileName);
+          var importInstructions = pfcCreate("pfcProgramImportInstructions").Create();
+          modelInfo.model.Import(targetFileName, importInstructions);
+          log("  imported: " + targetFileName);
+
+          // 5. Run post-import macro via runMacro (same path as single import)
+          try
+          {
+            runMacro({ macro: PROGRAM_IMPORT_POST_MACRO, workingDirectory: batchDir });
+            log("  post-import macro queued: " + currentModel);
+          }
+          catch (macroErr)
+          {
+            log("  macro warning: " + currentModel + " - " + String(macroErr.message || macroErr));
+          }
+
+          success += 1;
+          log("  OK: " + currentModel);
+        }
+        catch (e)
+        {
+          var errDetail = String(e.message || e);
+          try
+          {
+            if (typeof window.pfcCefGetLastException === "function")
+            {
+              var pfcErr = window.pfcCefGetLastException();
+              if (pfcErr && pfcErr.message)
+                errDetail = String(pfcErr.message).replace("Exceptions::", "").split(";")[0];
+            }
+          }
+          catch (ignore) {}
+          failed += 1;
+          failedItems.push(currentModel);
+          log("  FAILED: " + currentModel + " - " + errDetail);
+        }
+        finally
+        {
+          if (shouldCloseThisModel)
+            closeModelWindowAfterProProgram(currentModel, parentModel);
+          setProProgramWorkingDirectory(baseWorkingDir);
+        }
+        await delay(200);
+      }
+
+      if (parentModel !== "")
+        openModelForProProgram(parentModel);
+
+      var summaryMsg = "Batch Import complete. Success: " + String(success) + ", Failed: " + String(failed);
+      if (skippedItems.length > 0)
+        summaryMsg += ", Skipped: " + String(skipped);
+      if (failedItems.length > 0)
+        summaryMsg += ". Failed items: " + failedItems.join(", ");
+      if (skippedItems.length > 0)
+        summaryMsg += ". Skipped items: " + skippedItems.join(", ");
+
+      return {
+        directoryPath: batchDir,
+        success: success,
+        failed: failed,
+        failedItems: failedItems,
+        skipped: skipped,
+        skippedItems: skippedItems,
+        message: summaryMsg
+      };
+    }
+
+    function executeAction(action, args)
+    {
+      ensureCreoContext();
+
+      if (action === "current_model")
+        return { modelNameExt: getCurrentModelName() };
+      if (action === "bom_tree")
+        return getBomTree();
+      if (action === "parameters_list")
+        return listParameters(String(args.modelNameExt || ""));
+      if (action === "parameter_set")
+        return setParameter(args || {});
+      if (action === "parameter_create")
+        return createParameter(args || {});
+      if (action === "classification_save")
+        return saveClassification(args || {});
+      if (action === "directory_get")
+        return getCurrentDirectory();
+      if (action === "directory_set")
+        return setCurrentDirectory(args || {});
+      if (action === "macro_run")
+        return runMacro(args || {});
+      if (action === "macro_run_for_models")
+        return runMacroForModels(args || {});
+      if (action === "model_open")
+        return openModel(args || {});
+      if (action === "model_close")
+        return closeModel(args || {});
+      if (action === "model_regenerate")
+        return regenerateModel(args || {});
+      if (action === "feature_resume_by_id")
+        return featureResumeById(args || {});
+      if (action === "feature_suppress_by_id")
+        return featureSuppressById(args || {});
+      if (action === "model_save")
+        return saveModel(args || {});
+      if (action === "program_export")
+        return programExport(args || {});
+      if (action === "program_import")
+        return programImport(args || {});
+      if (action === "program_batch_export")
+        return programBatchExport(args || {});
+      if (action === "program_batch_import")
+        return programBatchImport(args || {});
+
+      throw new Error("Unsupported bridge action: " + action);
+    }
+
+    function sendBridgeIdentity()
+    {
+      bridgeSocket.send(JSON.stringify({
+        type: "bridge-ready",
+        client: "Creo Embedded Browser",
+        capabilities: [
+          "current_model",
+          "bom_tree",
+          "parameters_list",
+          "parameter_set",
+          "parameter_create",
+          "classification_save",
+          "directory_get",
+          "directory_set",
+          "macro_run",
+          "macro_run_for_models",
+          "model_open",
+          "model_regenerate",
+          "feature_resume_by_id",
+          "feature_suppress_by_id",
+          "program_export",
+          "program_import",
+          "program_batch_export",
+          "model_close",
+          "model_save",
+          "program_batch_import"
+        ]
+      }));
+    }
+
+    function connect()
+    {
+      bridgeSocketUrl = getNextGatewaySocketUrl();
+      setStatus("Connecting bridge to gateway...", false);
+      log("Connecting to gateway: " + bridgeSocketUrl);
+      bridgeSocket = new WebSocket(bridgeSocketUrl);
+
+      bridgeSocket.onopen = function () {
+        setStatus("Bridge connected to gateway.", true);
+        log("WebSocket connected.");
+        try
+        {
+          window.localStorage.setItem("creoGatewayWsUrl", bridgeSocketUrl);
+        }
+        catch (err)
+        {
+        }
+        sendBridgeIdentity();
+      };
+
+      bridgeSocket.onmessage = function (event) {
+        var payload = JSON.parse(event.data || "{}");
+        if (payload.type === "server-ready")
+        {
+          log("Gateway ready. Service version: " + payload.version);
+          return;
+        }
+
+        if (payload.type !== "command")
+          return;
+
+        log("Received action: " + payload.action + " | args: " + JSON.stringify(payload.args || {}));
+
+        Promise.resolve().then(function () {
+          return executeAction(payload.action, payload.args || {});
+        }).then(function (result) {
+          bridgeSocket.send(JSON.stringify({
+            type: "result",
+            id: payload.id,
+            success: true,
+            result: result
+          }));
+          log("Action succeeded: " + payload.action + " | " + summarizeResult(result));
+        }).catch(function (err) {
+          bridgeSocket.send(JSON.stringify({
+            type: "result",
+            id: payload.id,
+            success: false,
+            error: (err && err.message) ? err.message : String(err)
+          }));
+          log("Action failed: " + payload.action + " | " + ((err && err.message) ? err.message : String(err)));
+        });
+      };
+
+      bridgeSocket.onclose = function () {
+        setStatus("Bridge disconnected. Reconnecting...", false);
+        log("WebSocket closed for " + bridgeSocketUrl + ". Retrying in 2 seconds.");
+        window.clearTimeout(reconnectTimer);
+        reconnectTimer = window.setTimeout(connect, 2000);
+      };
+
+      bridgeSocket.onerror = function () {
+        setStatus("Bridge connection error.", false);
+        log("WebSocket error for " + bridgeSocketUrl + ".");
+      };
+    }
+
+    try
+    {
+      initCreoContext();
+      connect();
+    }
+    catch (err)
+    {
+      setStatus("Bridge failed to initialize.", false);
+      log((err && err.message) ? err.message : String(err));
+    }
+  </script>
+</body>
+</html>

@@ -15,9 +15,14 @@ class UserOut(BaseModel):
     id: int
     username: str
     role: str
+    approval_status: str
 
     class Config:
         orm_mode = True
+
+class UserUpdate(BaseModel):
+    role: Optional[str] = None
+    approval_status: Optional[str] = None
 
 class StateIn(BaseModel):
     state: Dict[str, Any]
@@ -88,3 +93,11 @@ class ValueListGroupOut(BaseModel):
     valuelistIdDescription: Optional[str] = None
     unit: Optional[str] = None
     valueCount: int
+
+
+# --- Item Class Attribute Value schemas -------------------------------------------
+
+class ClassAttributeValuesIn(BaseModel):
+    classId: str
+    previousClassId: Optional[str] = None
+    values: Dict[str, str]

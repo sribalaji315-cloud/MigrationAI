@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Creo Local Gateway Control Panel</title>
+  <script src="/js/requestProgress.js"></script>
+  <link rel="stylesheet" href="/static/local_control_panel.css">
+</head>
+<body>
+  <main class="shell">
+    <section class="hero">
+      <div>
+        <p class="eyebrow">Local Gateway</p>
+        <h1>Control the local Creo service</h1>
+        <p class="lede">This page runs on the user's machine. Configure the cloud origin, review the generated API key, and verify that the Creo bridge and local ML runtime are online.</p>
+      </div>
+      <div class="hero-actions">
+        <button id="refreshStatusBtn" type="button">Refresh Status</button>
+        <a id="openWorkbenchLink" href="/index.html">Open Local Workbench</a>
+        <a id="openBridgeLink" href="/creo_bridge.html" target="_blank" rel="noreferrer">Open Bridge Page</a>
+      </div>
+    </section>
+
+    <section class="grid two-up">
+      <article class="panel">
+        <div class="panel-header">
+          <h2>Connection</h2>
+          <span id="gatewayUrlBadge" class="badge pending">Loading</span>
+        </div>
+        <div class="field">
+          <label for="gatewayUrlInput">Gateway URL</label>
+          <div class="inline-row">
+            <input id="gatewayUrlInput" type="text" readonly>
+            <button id="copyGatewayUrlBtn" type="button" class="ghost">Copy</button>
+          </div>
+        </div>
+        <div class="field">
+          <label for="apiKeyInput">API key</label>
+          <div class="inline-row">
+            <input id="apiKeyInput" type="text" readonly>
+            <button id="copyApiKeyBtn" type="button" class="ghost">Copy</button>
+          </div>
+        </div>
+        <p class="meta">Paste this URL and API key into the cloud-hosted web app so it can call the local gateway securely.</p>
+      </article>
+
+      <article class="panel">
+        <div class="panel-header">
+          <h2>Runtime Status</h2>
+          <span id="restartBadge" class="badge hidden">Restart required</span>
+        </div>
+        <div class="status-list">
+          <div class="status-row">
+            <span>Creo bridge</span>
+            <strong id="bridgeStatusValue" class="status pending">Checking</strong>
+          </div>
+          <div class="status-row">
+            <span>Model runtime</span>
+            <strong id="modelStatusValue" class="status pending">Checking</strong>
+          </div>
+          <div class="status-row">
+            <span>Bridge client</span>
+            <strong id="bridgeClientValue">Unknown</strong>
+          </div>
+        </div>
+        <p id="statusMessage" class="meta">Waiting for service status.</p>
+      </article>
+    </section>
+
+    <section class="grid two-up">
+      <article class="panel">
+        <div class="panel-header">
+          <h2>Cloud Access</h2>
+        </div>
+        <div class="field">
+          <label for="allowedOriginInput">Allowed cloud origin</label>
+          <input id="allowedOriginInput" type="text" placeholder="https://your-web-app.example.com">
+        </div>
+        <p class="meta">Only this origin will be allowed by CORS. Leave blank during local setup, then set it before exposing the cloud UI.</p>
+      </article>
+
+      <article class="panel">
+        <div class="panel-header">
+          <h2>Service Port</h2>
+        </div>
+        <div class="field">
+          <label for="localPortInput">Configured port</label>
+          <input id="localPortInput" type="number" min="1" max="65535" step="1">
+        </div>
+        <p class="meta">The next startup will bind to this port. The current running address is shown above.</p>
+      </article>
+    </section>
+
+    <section class="panel footer-panel">
+      <div class="panel-header">
+        <h2>Apply Changes</h2>
+      </div>
+      <div class="actions-row">
+        <button id="saveConfigBtn" type="button">Save Local Settings</button>
+      </div>
+      <p id="saveMessage" class="meta">No local changes saved yet.</p>
+    </section>
+  </main>
+
+  <script src="/static/local_control_panel.js"></script>
+</body>
+</html>

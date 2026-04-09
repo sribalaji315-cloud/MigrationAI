@@ -17,6 +17,11 @@ class Settings(BaseSettings):
     ALLOWED_ORIGIN_REGEX: str = r"^https?://(localhost|127\.0\.0\.1|10(?:\.\d{1,3}){3}|192\.168(?:\.\d{1,3}){2}|172\.(?:1[6-9]|2\d|3[0-1])(?:\.\d{1,3}){2})(:\d+)?$"
     ADMIN_EMAIL: str = ""
     ADMIN_PASSWORD: str = ""
+    ML_SERVICE_URL: str = "http://localhost:8014"
+    ML_SERVICE_API_KEY: str = ""
+    ML_USE_SYNONYM_ASSIST: bool = True
+    ML_SYNONYM_THRESHOLD: float = 0.5
+    ML_SYNONYM_WEIGHT: float = 0.35
 
     class Config:
         env_file = ".env"

@@ -46,12 +46,13 @@ const LoginSignUp: React.FC<LoginSignUpProps> = ({ onLogin }) => {
       if (modeResult === 'REMOTE_SQL') {
         try {
           await dbService.register(userName, password, 'user');
-          await dbService.login(userName, password);
-          const remoteUser = await dbService.me();
-          onLogin({ userId: `USR-${remoteUser.id}`, userName: remoteUser.username, password: '', role: remoteUser.role });
+          setError('');
+          alert('Registration submitted successfully. Awaiting admin approval.');
+          setIsLogin(true);
+          setPassword('');
           return;
         } catch (err: any) {
-          setError(err?.detail || 'Username already registered.');
+          setError(err?.message || err?.detail || 'Username already registered.');
           return;
         }
       }
@@ -67,12 +68,15 @@ const LoginSignUp: React.FC<LoginSignUpProps> = ({ onLogin }) => {
         userId: `USR-${Math.floor(Math.random() * 9000) + 1000}`,
         userName,
         password,
-        role: 'user'
+        role: 'user',
+        approvalStatus: 'pending'
       };
 
       state.users.push(newUser);
       await dbService.saveAll(state, 'user', { includeBom: false });
-      onLogin(newUser);
+      alert('Registration submitted successfully. Awaiting admin approval (local mock mode).');
+      setIsLogin(true);
+      setPassword('');
     } catch (err: any) {
       setError(err?.message || 'Unable to reach backend. Check the API server and CORS settings.');
     }

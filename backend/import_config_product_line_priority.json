@@ -1,0 +1,16 @@
+{
+    "import_profile": "product_line_priority",
+    "source_db_path": "C:\\Users\\ISA2\\OneDrive - HAWORTH INC\\Downloads\\sqlite.db",
+
+    "parent_table": "Products",
+    "target_table": "bom_items",
+    "update_existing_bom_items_only": true,
+
+    "parent_to_bom_item": {
+        "item_id": "SwingId",
+        "product_type": "BluestarClass"
+    },
+
+    "priority_from_mapped_field": "product_type",
+    "priority_value": 1
+}
