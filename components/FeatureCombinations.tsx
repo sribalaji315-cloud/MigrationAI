@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react';
-import { User, FeatureCombinationJobProgress, FeatureCombinationRow, FeatureCombinationItem } from '../types';
+import { User, FeatureCombinationJobProgress, FeatureCombinationRow, FeatureCombinationItem, ConsolidationAnalysis, SubsetMergeDetail, VariantComparisonResponse, CrossFeatureResponse } from '../types';
 import { dbService } from '../services/dbService';
 
 interface FeatureCombinationsProps {
@@ -129,6 +129,25 @@ const FeatureCombinations: React.FC<FeatureCombinationsProps> = ({ currentUser, 
   const [comboItems, setComboItems] = useState<FeatureCombinationItem[]>([]);
   const [isLoadingItems, setIsLoadingItems] = useState(false);
 
+  // Right panel tab + consolidation state
+  const [rightTab, setRightTab] = useState<'items' | 'consolidate'>('items');
+  const [consolidation, setConsolidation] = useState<ConsolidationAnalysis | null>(null);
+  const [isLoadingConsolidation, setIsLoadingConsolidation] = useState(false);
+
+  // Analysis mode
+  const [analysisMode, setAnalysisMode] = useState(false);
+  const [subsetMergeDetail, setSubsetMergeDetail] = useState<SubsetMergeDetail | null>(null);
+  const [isLoadingSubsetDetail, setIsLoadingSubsetDetail] = useState(false);
+  const [computingStrategy, setComputingStrategy] = useState<string | null>(null);
+  const [savedPlanFeatureIds, setSavedPlanFeatureIds] = useState<Set<string>>(new Set());
+  const consolidationPollRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // On-demand variant comparison & cross-feature state
+  const [variantData, setVariantData] = useState<VariantComparisonResponse | null>(null);
+  const [isLoadingVariants, setIsLoadingVariants] = useState(false);
+  const [crossFeatureData, setCrossFeatureData] = useState<CrossFeatureResponse | null>(null);
+  const [isLoadingCrossFeatures, setIsLoadingCrossFeatures] = useState(false);
+
   // Resizable panel state
   const containerRef = useRef<HTMLDivElement>(null);
   const [rightPanelWidth, setRightPanelWidth] = useState(380);
@@ -193,7 +212,7 @@ const FeatureCombinations: React.FC<FeatureCombinationsProps> = ({ currentUser, 
   const prevStatusRef = useRef<string | undefined>();
   useEffect(() => {
     if (prevStatusRef.current === 'running' && jobProgress?.status === 'completed') {
-      fetchList(0, search, filterFeatureIds, filterAttributeTypes, filterPriorities, filterStatuses, sortBy, sortDir);
+      fetchList(0, search, filterFeatureIds, filterAttributeTypes, filterPriorities, filterStatuses, sortBy, sortDir, analysisMode);
       loadFilters();
     }
     prevStatusRef.current = jobProgress?.status;
@@ -214,7 +233,7 @@ const FeatureCombinations: React.FC<FeatureCombinationsProps> = ({ currentUser, 
   }, []);
 
   // --- Fetch summary list ---
-  const fetchList = useCallback(async (pageNum: number, searchTerm: string, featIds: string[], attrTypes: string[], prios: string[], statuses: string[], sBy?: string, sDir?: string) => {
+  const fetchList = useCallback(async (pageNum: number, searchTerm: string, featIds: string[], attrTypes: string[], prios: string[], statuses: string[], sBy?: string, sDir?: string, analysis?: boolean) => {
     setIsLoading(true);
     try {
       const result = await dbService.fetchFeatureCombinations({
@@ -225,6 +244,7 @@ const FeatureCombinations: React.FC<FeatureCombinationsProps> = ({ currentUser, 
         status: statuses.length ? statuses.join(',') : undefined,
         sortBy: sBy || undefined,
         sortDir: sDir || undefined,
+        analysisMode: analysis || undefined,
         limit: PAGE_SIZE,
         offset: pageNum * PAGE_SIZE,
       });
@@ -237,7 +257,7 @@ const FeatureCombinations: React.FC<FeatureCombinationsProps> = ({ currentUser, 
     }
   }, []);
 
-  useEffect(() => { fetchList(page, search, filterFeatureIds, filterAttributeTypes, filterPriorities, filterStatuses, sortBy, sortDir); }, [page, search, filterFeatureIds, filterAttributeTypes, filterPriorities, filterStatuses, sortBy, sortDir, fetchList]);
+  useEffect(() => { fetchList(page, search, filterFeatureIds, filterAttributeTypes, filterPriorities, filterStatuses, sortBy, sortDir, analysisMode); }, [page, search, filterFeatureIds, filterAttributeTypes, filterPriorities, filterStatuses, sortBy, sortDir, analysisMode, fetchList]);
 
   const handleSearch = () => {
     setSearch(searchInput);
@@ -261,6 +281,21 @@ const FeatureCombinations: React.FC<FeatureCombinationsProps> = ({ currentUser, 
       return;
     }
     setSelectedCombo(combo);
+    setConsolidation(null);
+    setSubsetMergeDetail(null);
+    setComputingStrategy(null);
+    setVariantData(null);
+    setCrossFeatureData(null);
+    if (consolidationPollRef.current) clearTimeout(consolidationPollRef.current);
+    if (analysisMode) {
+      // In analysis mode, auto-open consolidate tab but do NOT fetch analysis yet
+      setRightTab('consolidate');
+      if (combo.comboCountForFeature > 1) {
+        loadExistingPlan(combo.featureId);
+      }
+    } else {
+      setRightTab('items');
+    }
     setIsLoadingItems(true);
     try {
       const result = await dbService.fetchFeatureCombinationItems(combo.id);
@@ -271,7 +306,119 @@ const FeatureCombinations: React.FC<FeatureCombinationsProps> = ({ currentUser, 
     } finally {
       setIsLoadingItems(false);
     }
+  }, [selectedCombo, analysisMode]);
+
+  // --- Fetch consolidation analysis on demand ---
+  const handleConsolidateClick = useCallback(() => {
+    if (!selectedCombo || selectedCombo.comboCountForFeature <= 1) return;
+    setRightTab('consolidate');
+    // Skip re-fetch if we already have data for this feature
+    if (consolidation && consolidation.featureId === selectedCombo.featureId) return;
+    setIsLoadingConsolidation(true);
+    setConsolidation(null);
+    dbService.fetchConsolidationAnalysis(selectedCombo.featureId)
+      .then(data => setConsolidation(data))
+      .catch(err => { console.error('consolidation fetch failed', err); setConsolidation(null); })
+      .finally(() => setIsLoadingConsolidation(false));
+  }, [selectedCombo, consolidation]);
+
+  // --- Toggle analysis mode ---
+  const handleToggleAnalysisMode = useCallback(() => {
+    setAnalysisMode(prev => {
+      const next = !prev;
+      setPage(0);
+      setSelectedCombo(null);
+      setComboItems([]);
+      setConsolidation(null);
+      setSubsetMergeDetail(null);
+      setRightTab(next ? 'consolidate' : 'items');
+      return next;
+    });
+  }, []);
+
+  // --- Suggest Subset Merge (on demand) ---
+  const handleTriggerStrategy = useCallback((strategy: string) => {
+    if (!selectedCombo) return;
+    const featureId = selectedCombo.featureId;
+    setComputingStrategy(strategy);
+    setSubsetMergeDetail(null);
+    setIsLoadingSubsetDetail(true);
+
+    // Clear any existing poll
+    if (consolidationPollRef.current) clearTimeout(consolidationPollRef.current);
+
+    dbService.triggerConsolidationCompute(featureId, strategy)
+      .then(() => {
+        // Start polling for completion
+        const poll = () => {
+          dbService.fetchConsolidationPlan(featureId)
+            .then(plan => {
+              if (!plan) {
+                consolidationPollRef.current = setTimeout(poll, 1500);
+                return;
+              }
+              if (plan.status === 'computing') {
+                consolidationPollRef.current = setTimeout(poll, 1500);
+                return;
+              }
+              // completed or failed
+              setSubsetMergeDetail(plan);
+              setIsLoadingSubsetDetail(false);
+              setComputingStrategy(null);
+              if (plan.status === 'completed') {
+                setSavedPlanFeatureIds(prev => new Set([...prev, featureId]));
+              }
+            })
+            .catch(() => {
+              consolidationPollRef.current = setTimeout(poll, 2000);
+            });
+        };
+        consolidationPollRef.current = setTimeout(poll, 1000);
+      })
+      .catch(err => {
+        console.error('trigger consolidation failed', err);
+        setIsLoadingSubsetDetail(false);
+        setComputingStrategy(null);
+      });
   }, [selectedCombo]);
+
+  // Cleanup poll on unmount or feature change
+  useEffect(() => {
+    return () => { if (consolidationPollRef.current) clearTimeout(consolidationPollRef.current); };
+  }, [selectedCombo?.featureId]);
+
+  // --- Load existing plan when selecting a feature ---
+  const loadExistingPlan = useCallback((featureId: string) => {
+    dbService.fetchConsolidationPlan(featureId)
+      .then(plan => {
+        if (plan && plan.status === 'completed') {
+          setSubsetMergeDetail(plan);
+          setSavedPlanFeatureIds(prev => new Set([...prev, featureId]));
+        } else if (plan && plan.status === 'computing') {
+          setIsLoadingSubsetDetail(true);
+          setComputingStrategy(plan.strategy);
+          // Start polling
+          const poll = () => {
+            dbService.fetchConsolidationPlan(featureId)
+              .then(p => {
+                if (!p || p.status === 'computing') {
+                  consolidationPollRef.current = setTimeout(poll, 1500);
+                  return;
+                }
+                setSubsetMergeDetail(p);
+                setIsLoadingSubsetDetail(false);
+                setComputingStrategy(null);
+                if (p.status === 'completed') {
+                  setSavedPlanFeatureIds(prev => new Set([...prev, featureId]));
+                }
+              })
+              .catch(() => { consolidationPollRef.current = setTimeout(poll, 2000); });
+          };
+          consolidationPollRef.current = setTimeout(poll, 1000);
+        }
+      })
+      .catch(() => { /* no existing plan — that's fine */ });
+  }, []);
 
   // --- Derived ---
   const isActive = jobProgress?.status === 'queued' || jobProgress?.status === 'running';
@@ -316,6 +463,21 @@ const FeatureCombinations: React.FC<FeatureCombinationsProps> = ({ currentUser, 
           )}
         </div>
         <div className="flex items-center gap-2">
+          {/* Analysis Mode toggle */}
+          <button
+            onClick={handleToggleAnalysisMode}
+            className={`flex items-center gap-1.5 px-3 py-1.5 rounded-md text-[9px] font-black uppercase tracking-wider transition-all ${
+              analysisMode
+                ? 'bg-violet-600 text-white hover:bg-violet-700'
+                : 'bg-slate-100 text-slate-500 hover:bg-slate-200'
+            }`}
+          >
+            <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" />
+            </svg>
+            {analysisMode ? 'Analysis ON' : 'Analysis'}
+          </button>
+          <div className="h-4 w-px bg-slate-200" />
           <button
             onClick={handleTrigger}
             disabled={isActive || isTriggering}
@@ -398,7 +560,10 @@ const FeatureCombinations: React.FC<FeatureCombinationsProps> = ({ currentUser, 
           selected={filterStatuses}
           onChange={handleMultiFilterChange(setFilterStatuses)}
         />
-        <span className="text-[9px] text-slate-400 font-medium ml-auto">{total.toLocaleString()} combinations</span>
+        <span className="text-[9px] text-slate-400 font-medium ml-auto">
+          {total.toLocaleString()} {analysisMode ? 'unique features' : 'combinations'}
+          {analysisMode && <span className="ml-1 text-violet-500">(analysis mode)</span>}
+        </span>
       </div>
 
       {/* Content: resizable split */}
@@ -449,7 +614,12 @@ const FeatureCombinations: React.FC<FeatureCombinationsProps> = ({ currentUser, 
                     }`}
                   >
                     <td className="px-3 py-2">
-                      <div className="font-semibold text-slate-800">{r.featureId}</div>
+                      <div className="font-semibold text-slate-800">
+                        {r.featureId}
+                        {analysisMode && (r.savedPlanStrategy || savedPlanFeatureIds.has(r.featureId)) && (
+                          <span className="ml-1.5 inline-block px-1 py-0 bg-emerald-100 text-emerald-700 rounded text-[8px] font-bold uppercase">saved</span>
+                        )}
+                      </div>
                       {r.description && <div className="text-[10px] text-slate-400 truncate max-w-[200px]">{r.description}</div>}
                       {r.unit && <div className="text-[10px] text-slate-400">Unit: {r.unit}</div>}
                     </td>
@@ -566,15 +736,47 @@ const FeatureCombinations: React.FC<FeatureCombinationsProps> = ({ currentUser, 
           className="w-1.5 cursor-col-resize bg-slate-200 hover:bg-blue-400 active:bg-blue-500 transition-colors shrink-0"
         />
 
-        {/* Right: Items panel */}
+        {/* Right: Items / Consolidation panel */}
         <div style={{ width: rightPanelWidth, minWidth: MIN_RIGHT_W }} className="flex flex-col overflow-hidden bg-white shrink-0">
-          <div className="px-4 py-2.5 border-b border-slate-200 bg-slate-50 shrink-0">
-            <h2 className="text-[9px] font-black uppercase tracking-wider text-slate-500">
-              {selectedCombo
-                ? `Items using ${selectedCombo.featureId} — ${selectedCombo.normalizedValues.length} value${selectedCombo.normalizedValues.length !== 1 ? 's' : ''}`
-                : 'Select a combination to view items'}
-            </h2>
+          {/* Panel header with tabs */}
+          <div className="border-b border-slate-200 bg-slate-50 shrink-0">
+            <div className="px-4 pt-2.5 pb-0">
+              <h2 className="text-[9px] font-black uppercase tracking-wider text-slate-500 mb-2">
+                {selectedCombo
+                  ? selectedCombo.featureId + (selectedCombo.description ? ` — ${selectedCombo.description}` : '')
+                  : 'Select a combination'}
+              </h2>
+              {selectedCombo && (
+                <div className="flex gap-0 border-b-0">
+                  <button
+                    onClick={() => setRightTab('items')}
+                    className={`px-3 py-1.5 text-[9px] font-black uppercase tracking-wider border-b-2 transition-colors ${
+                      rightTab === 'items'
+                        ? 'border-blue-500 text-blue-600'
+                        : 'border-transparent text-slate-400 hover:text-slate-600'
+                    }`}
+                  >
+                    Items ({comboItems.length})
+                  </button>
+                  {analysisMode && (
+                    <button
+                      onClick={handleConsolidateClick}
+                      disabled={selectedCombo.comboCountForFeature <= 1}
+                      className={`px-3 py-1.5 text-[9px] font-black uppercase tracking-wider border-b-2 transition-colors disabled:opacity-30 disabled:cursor-not-allowed ${
+                        rightTab === 'consolidate'
+                          ? 'border-violet-500 text-violet-600'
+                          : 'border-transparent text-slate-400 hover:text-slate-600'
+                      }`}
+                      title={selectedCombo.comboCountForFeature <= 1 ? 'Only 1 variant — nothing to consolidate' : `Analyze ${selectedCombo.comboCountForFeature} variants`}
+                    >
+                      Consolidate ({selectedCombo.comboCountForFeature})
+                    </button>
+                  )}
+                </div>
+              )}
+            </div>
           </div>
+
           <div className="flex-1 overflow-auto">
             {!selectedCombo ? (
               <div className="flex items-center justify-center h-full text-slate-300 text-xs">
@@ -585,44 +787,411 @@ const FeatureCombinations: React.FC<FeatureCombinationsProps> = ({ currentUser, 
                   Click a row to see matching items
                 </div>
               </div>
-            ) : isLoadingItems ? (
-              <div className="flex items-center justify-center h-32">
-                <div className="w-4 h-4 border-2 border-blue-500 border-t-transparent rounded-full animate-spin" />
-              </div>
-            ) : comboItems.length === 0 ? (
-              <div className="text-center py-8 text-slate-400 text-xs">No items found</div>
-            ) : (
-              <table className="w-full text-xs">
-                <thead className="bg-slate-50 sticky top-0">
-                  <tr>
-                    <th className="text-left px-3 py-2 text-[9px] font-black uppercase tracking-wider text-slate-500 border-b border-slate-200">Item ID</th>
-                    <th className="text-left px-3 py-2 text-[9px] font-black uppercase tracking-wider text-slate-500 border-b border-slate-200">Description</th>
-                    <th className="text-left px-3 py-2 text-[9px] font-black uppercase tracking-wider text-slate-500 border-b border-slate-200">Category</th>
-                    <th className="text-center px-3 py-2 text-[9px] font-black uppercase tracking-wider text-slate-500 border-b border-slate-200">Priority</th>
-                    <th className="text-left px-3 py-2 text-[9px] font-black uppercase tracking-wider text-slate-500 border-b border-slate-200">Product Line</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {comboItems.map(item => (
-                    <tr key={item.itemId} className="border-b border-slate-50 hover:bg-slate-50">
-                      <td className="px-3 py-1.5 font-semibold text-slate-700">{item.itemId}</td>
-                      <td className="px-3 py-1.5 text-slate-500 truncate max-w-[160px]">{item.description}</td>
-                      <td className="px-3 py-1.5 text-slate-400">{item.category}</td>
-                      <td className="px-3 py-1.5 text-center">
-                        {item.priority != null ? (
-                          <span className="inline-block px-1.5 py-0.5 bg-amber-50 text-amber-600 rounded text-[10px] font-bold">P{item.priority}</span>
-                        ) : (
-                          <span className="text-[10px] text-slate-300">—</span>
-                        )}
-                      </td>
-                      <td className="px-3 py-1.5 text-slate-400">{item.productType || '—'}</td>
+            ) : rightTab === 'items' ? (
+              /* ---- ITEMS TAB ---- */
+              isLoadingItems ? (
+                <div className="flex items-center justify-center h-32">
+                  <div className="w-4 h-4 border-2 border-blue-500 border-t-transparent rounded-full animate-spin" />
+                </div>
+              ) : comboItems.length === 0 ? (
+                <div className="text-center py-8 text-slate-400 text-xs">No items found</div>
+              ) : (
+                <table className="w-full text-xs">
+                  <thead className="bg-slate-50 sticky top-0">
+                    <tr>
+                      <th className="text-left px-3 py-2 text-[9px] font-black uppercase tracking-wider text-slate-500 border-b border-slate-200">Item ID</th>
+                      <th className="text-left px-3 py-2 text-[9px] font-black uppercase tracking-wider text-slate-500 border-b border-slate-200">Description</th>
+                      <th className="text-left px-3 py-2 text-[9px] font-black uppercase tracking-wider text-slate-500 border-b border-slate-200">Category</th>
+                      <th className="text-center px-3 py-2 text-[9px] font-black uppercase tracking-wider text-slate-500 border-b border-slate-200">Priority</th>
+                      <th className="text-left px-3 py-2 text-[9px] font-black uppercase tracking-wider text-slate-500 border-b border-slate-200">Product Line</th>
                     </tr>
-                  ))}
-                </tbody>
-              </table>
+                  </thead>
+                  <tbody>
+                    {comboItems.map(item => (
+                      <tr key={item.itemId} className="border-b border-slate-50 hover:bg-slate-50">
+                        <td className="px-3 py-1.5 font-semibold text-slate-700">{item.itemId}</td>
+                        <td className="px-3 py-1.5 text-slate-500 truncate max-w-[160px]">{item.description}</td>
+                        <td className="px-3 py-1.5 text-slate-400">{item.category}</td>
+                        <td className="px-3 py-1.5 text-center">
+                          {item.priority != null ? (
+                            <span className="inline-block px-1.5 py-0.5 bg-amber-50 text-amber-600 rounded text-[10px] font-bold">P{item.priority}</span>
+                          ) : (
+                            <span className="text-[10px] text-slate-300">—</span>
+                          )}
+                        </td>
+                        <td className="px-3 py-1.5 text-slate-400">{item.productType || '—'}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              )
+            ) : (
+              /* ---- CONSOLIDATE TAB ---- */
+              isLoadingConsolidation ? (
+                <div className="flex items-center justify-center h-32">
+                  <div className="w-4 h-4 border-2 border-violet-500 border-t-transparent rounded-full animate-spin" />
+                </div>
+              ) : !consolidation ? (
+                <div className="text-center py-8 text-slate-400 text-xs">No analysis data</div>
+              ) : (
+                <div className="p-4 space-y-4">
+                  {/* A. Summary */}
+                  <div className="bg-violet-50 rounded-lg p-3">
+                    <div className="flex items-baseline justify-between mb-2">
+                      <span className="text-[10px] font-black text-violet-700 uppercase tracking-wider">
+                        {consolidation.featureId}
+                      </span>
+                      <span className="text-[9px] font-bold text-violet-500">
+                        {consolidation.totalVariants} variants · {consolidation.totalItems.toLocaleString()} items
+                      </span>
+                    </div>
+                    <div className="text-[9px] text-violet-600 font-semibold mb-1.5">Union of all values ({consolidation.unionValues.length})</div>
+                    <div className="flex flex-wrap gap-1">
+                      {consolidation.unionValues.map(v => (
+                        <span key={v} className="inline-block px-1.5 py-0.5 bg-violet-100 text-violet-700 rounded text-[9px] font-medium">{v}</span>
+                      ))}
+                    </div>
+                  </div>
+
+                  {/* B. Merge Options — clickable to trigger strategy */}
+                  <div>
+                    <div className="text-[9px] font-black text-slate-500 uppercase tracking-wider mb-2">Merge Options — click to compute</div>
+                    <div className="space-y-2">
+                      {consolidation.mergeOptions.map((opt, i) => {
+                        const strategyKey = opt.label === 'Full Union' ? 'full_union' : opt.label === 'Subset Merge' ? 'subset_merge' : 'no_merge';
+                        const isRecommended = i === 0 ? false : i === consolidation.mergeOptions.length - 1 ? false : true;
+                        const isComputing = computingStrategy === strategyKey;
+                        const isApplied = subsetMergeDetail?.status === 'completed' && subsetMergeDetail?.strategy === strategyKey;
+                        const cardColor = isApplied
+                          ? 'border-emerald-300 bg-emerald-50 ring-2 ring-emerald-400'
+                          : isComputing
+                            ? 'border-violet-300 bg-violet-50 ring-2 ring-violet-400'
+                            : opt.totalNoise === 0
+                              ? 'border-emerald-200 bg-emerald-50'
+                              : opt.listsNeeded === 1
+                                ? 'border-rose-200 bg-rose-50'
+                                : 'border-amber-200 bg-amber-50';
+                        const textColor = isApplied
+                          ? 'text-emerald-700'
+                          : opt.totalNoise === 0
+                            ? 'text-emerald-700'
+                            : opt.listsNeeded === 1
+                              ? 'text-rose-700'
+                              : 'text-amber-700';
+                        return (
+                          <div
+                            key={opt.label}
+                            onClick={() => !isComputing && !isLoadingSubsetDetail && handleTriggerStrategy(strategyKey)}
+                            className={`rounded-lg border p-2.5 cursor-pointer hover:shadow-md transition-all ${cardColor} ${isRecommended && !isApplied && !isComputing ? 'ring-2 ring-amber-400' : ''}`}
+                          >
+                            <div className="flex items-center justify-between mb-1">
+                              <span className={`text-[10px] font-black uppercase tracking-wider ${textColor}`}>
+                                {opt.label}
+                                {isApplied && <span className="ml-1.5 text-[8px] bg-emerald-500 text-white rounded px-1 py-0 font-bold normal-case">applied</span>}
+                                {isRecommended && !isApplied && <span className="ml-1.5 text-[8px] bg-amber-400 text-white rounded px-1 py-0 font-bold normal-case">recommended</span>}
+                              </span>
+                              <div className="flex items-center gap-1.5">
+                                {isComputing && (
+                                  <div className="w-3 h-3 border-2 border-violet-500 border-t-transparent rounded-full animate-spin" />
+                                )}
+                                <span className={`text-[10px] font-bold ${textColor}`}>
+                                  {opt.listsNeeded} list{opt.listsNeeded !== 1 ? 's' : ''}
+                                </span>
+                              </div>
+                            </div>
+                            <div className="flex items-center gap-3 text-[9px]">
+                              <span className={textColor}>
+                                Noise: <strong>{opt.totalNoise.toLocaleString()}</strong> extra exposures
+                              </span>
+                              <span className={textColor}>
+                                Max per item: <strong>{opt.maxNoisePerItem}</strong>
+                              </span>
+                            </div>
+                            {opt.canonicalValues.length <= 3 && (
+                              <div className="mt-1.5 space-y-1">
+                                {opt.canonicalValues.map((listVals, li) => (
+                                  <div key={li} className="flex flex-wrap gap-0.5">
+                                    <span className="text-[8px] text-slate-400 font-bold mr-1">L{li + 1}:</span>
+                                    {listVals.map(v => (
+                                      <span key={v} className="inline-block px-1 py-0 bg-white/60 rounded text-[8px] font-medium text-slate-600">{v}</span>
+                                    ))}
+                                  </div>
+                                ))}
+                              </div>
+                            )}
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+
+                  {/* B2. Consolidation Plan Detail */}
+                  <div>
+                    {isLoadingSubsetDetail && !subsetMergeDetail && (
+                      <div className="flex items-center justify-center py-4">
+                        <div className="w-4 h-4 border-2 border-violet-500 border-t-transparent rounded-full animate-spin" />
+                        <span className="ml-2 text-[9px] text-violet-500 font-bold uppercase tracking-wider">Computing {computingStrategy?.replace('_', ' ')}…</span>
+                      </div>
+                    )}
+                    {subsetMergeDetail && subsetMergeDetail.status === 'failed' && (
+                      <div className="bg-rose-50 border border-rose-200 rounded-lg p-3 text-center">
+                        <span className="text-[9px] font-bold text-rose-600 uppercase">Computation failed</span>
+                        {subsetMergeDetail.errorMessage && (
+                          <div className="text-[9px] text-rose-500 mt-1">{subsetMergeDetail.errorMessage}</div>
+                        )}
+                      </div>
+                    )}
+                    {subsetMergeDetail && subsetMergeDetail.status === 'completed' && (
+                      <div className="space-y-3">
+                        <div className="flex items-center justify-between">
+                          <div className="text-[9px] font-black text-violet-600 uppercase tracking-wider">
+                            {subsetMergeDetail.strategy.replace('_', ' ')}: {subsetMergeDetail.listsNeeded} value list{subsetMergeDetail.listsNeeded !== 1 ? 's' : ''}
+                          </div>
+                          <div className="flex items-center gap-2">
+                            <span className="flex items-center gap-1 px-2 py-1 bg-emerald-100 text-emerald-700 rounded text-[9px] font-bold uppercase">
+                              <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" /></svg>
+                              Saved
+                              {subsetMergeDetail.appliedBy && (
+                                <span className="font-normal normal-case text-emerald-500 ml-1">by {subsetMergeDetail.appliedBy}</span>
+                              )}
+                            </span>
+                          </div>
+                        </div>
+                        {subsetMergeDetail.lists.map(list => (
+                          <div key={list.index} className="rounded-lg border border-violet-200 bg-violet-50/50 p-2.5">
+                            <div className="flex items-center justify-between mb-1.5">
+                              <span className="text-[10px] font-black text-violet-700 uppercase tracking-wider">
+                                Value List {list.index + 1}
+                              </span>
+                              <span className="text-[9px] font-bold text-violet-500">
+                                {list.itemCount.toLocaleString()} item{list.itemCount !== 1 ? 's' : ''}
+                                {list.variants && list.variants.length > 0 && (
+                                  <span className="ml-1 text-slate-400">· {list.variants.length} variant{list.variants.length !== 1 ? 's' : ''}</span>
+                                )}
+                              </span>
+                            </div>
+                            {/* Merged values */}
+                            <div className="flex flex-wrap gap-1 mb-2">
+                              {list.values.map(v => (
+                                <span key={v} className="inline-block px-1.5 py-0.5 bg-violet-100 text-violet-700 rounded text-[9px] font-medium">{v}</span>
+                              ))}
+                            </div>
+                            {/* Variant breakdown */}
+                            {list.variants && list.variants.length > 0 && (
+                              <div className="mb-2 space-y-1">
+                                <div className="text-[8px] font-black text-slate-400 uppercase tracking-wider">Source Variants</div>
+                                {list.variants.map((vr, vi) => (
+                                  <div key={vi} className="flex items-center gap-1.5 text-[9px]">
+                                    <span className="inline-block px-1 py-0 bg-slate-200 text-slate-500 rounded text-[8px] font-bold">V{vi + 1}</span>
+                                    <span className="text-slate-500">{vr.values.length} val{vr.values.length !== 1 ? 's' : ''}</span>
+                                    <span className="text-slate-400">·</span>
+                                    <span className="text-slate-500">{vr.itemCount} item{vr.itemCount !== 1 ? 's' : ''}</span>
+                                    <div className="flex flex-wrap gap-0.5 ml-1">
+                                      {vr.values.slice(0, 8).map(val => (
+                                        <span key={val} className="inline-block px-1 py-0 bg-white border border-slate-200 rounded text-[8px] text-slate-500">{val}</span>
+                                      ))}
+                                      {vr.values.length > 8 && <span className="text-[8px] text-slate-400">+{vr.values.length - 8}</span>}
+                                    </div>
+                                  </div>
+                                ))}
+                              </div>
+                            )}
+                            {/* Items table */}
+                            {list.items.length > 0 && (
+                              <div className="bg-white rounded border border-violet-100 overflow-hidden">
+                                <table className="w-full text-[10px]">
+                                  <thead>
+                                    <tr className="bg-violet-50/80">
+                                      <th className="text-left px-2 py-1 text-[8px] font-black uppercase text-violet-500">Item</th>
+                                      <th className="text-left px-2 py-1 text-[8px] font-black uppercase text-violet-500">Description</th>
+                                      <th className="text-center px-2 py-1 text-[8px] font-black uppercase text-violet-500">Pri</th>
+                                      <th className="text-left px-2 py-1 text-[8px] font-black uppercase text-violet-500">Product</th>
+                                    </tr>
+                                  </thead>
+                                  <tbody>
+                                    {list.items.slice(0, 20).map(it => (
+                                      <tr key={it.itemId} className="border-t border-violet-50">
+                                        <td className="px-2 py-0.5 font-semibold text-slate-700">{it.itemId}</td>
+                                        <td className="px-2 py-0.5 text-slate-500 truncate max-w-[120px]">{it.description}</td>
+                                        <td className="px-2 py-0.5 text-center">
+                                          {it.priority != null ? (
+                                            <span className="inline-block px-1 py-0 bg-amber-50 text-amber-600 rounded text-[9px] font-bold">P{it.priority}</span>
+                                          ) : <span className="text-slate-300">—</span>}
+                                        </td>
+                                        <td className="px-2 py-0.5 text-slate-400">{it.productType || '—'}</td>
+                                      </tr>
+                                    ))}
+                                    {list.items.length > 20 && (
+                                      <tr>
+                                        <td colSpan={4} className="px-2 py-1 text-center text-[8px] text-violet-400 font-bold">
+                                          +{list.items.length - 20} more items (showing first 20)
+                                        </td>
+                                      </tr>
+                                    )}
+                                  </tbody>
+                                </table>
+                              </div>
+                            )}
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+
+                  {/* C. Variant Comparison (on-demand) */}
+                  <div>
+                    <div className="flex items-center justify-between mb-2">
+                      <div className="text-[9px] font-black text-slate-500 uppercase tracking-wider">Variant Comparison</div>
+                      {!variantData && !isLoadingVariants && (
+                        <button
+                          onClick={() => {
+                            setIsLoadingVariants(true);
+                            dbService.fetchVariantComparison(consolidation.featureId)
+                              .then(data => setVariantData(data))
+                              .catch(err => { console.error('variant fetch failed', err); setVariantData(null); })
+                              .finally(() => setIsLoadingVariants(false));
+                          }}
+                          className="px-2 py-0.5 rounded bg-indigo-50 text-indigo-600 text-[9px] font-bold hover:bg-indigo-100 transition-colors"
+                        >
+                          Load Variants
+                        </button>
+                      )}
+                    </div>
+                    {isLoadingVariants && (
+                      <div className="flex items-center justify-center py-6">
+                        <div className="animate-spin rounded-full h-5 w-5 border-b-2 border-indigo-500" />
+                        <span className="ml-2 text-[10px] text-slate-400">Loading variant comparison…</span>
+                      </div>
+                    )}
+                    {variantData && variantData.variants.length > 0 && (
+                      <div className="space-y-2">
+                        {variantData.variants.map(v => {
+                          const variantSet = new Set(v.values);
+                          const valueCounts: Record<string, number> = {};
+                          variantData.unionValues.forEach(uv => {
+                            valueCounts[uv] = variantData.variants.filter(ov => ov.values.includes(uv)).length;
+                          });
+
+                          return (
+                            <div key={v.comboId} className={`rounded-lg border p-2.5 ${
+                              selectedCombo?.id === v.comboId
+                                ? 'border-blue-300 bg-blue-50'
+                                : 'border-slate-200 bg-white'
+                            }`}>
+                              <div className="flex items-center justify-between mb-1.5">
+                                <div className="flex items-center gap-2">
+                                  <span className="text-[10px] font-bold text-slate-700">{v.values.length} val{v.values.length !== 1 ? 's' : ''}</span>
+                                  <span className="text-[9px] text-slate-400">{v.itemCount.toLocaleString()} items</span>
+                                </div>
+                                <div className="flex gap-0.5">
+                                  {v.priorities.slice(0, 3).map((p, pi) => (
+                                    <span key={pi} className="inline-block px-1 py-0 bg-amber-50 text-amber-600 rounded text-[8px] font-bold">P{p}</span>
+                                  ))}
+                                </div>
+                              </div>
+                              {v.productTypes.length > 0 && (
+                                <div className="flex flex-wrap gap-1 mb-1.5">
+                                  {v.productTypes.slice(0, 4).map(pt => (
+                                    <span key={pt} className="inline-block px-1 py-0 bg-slate-100 text-slate-500 rounded text-[8px] font-medium">{pt}</span>
+                                  ))}
+                                  {v.productTypes.length > 4 && <span className="text-[8px] text-slate-400">+{v.productTypes.length - 4}</span>}
+                                </div>
+                              )}
+                              <div className="flex flex-wrap gap-0.5">
+                                {variantData.unionValues.map(uv => {
+                                  const inVariant = variantSet.has(uv);
+                                  const inAllVariants = valueCounts[uv] === variantData.variants.length;
+                                  const inSomeVariants = valueCounts[uv] > 1;
+                                  if (!inVariant) {
+                                    return (
+                                      <span key={uv} className="inline-block px-1 py-0 rounded text-[8px] font-medium bg-slate-100 text-slate-300 line-through">{uv}</span>
+                                    );
+                                  }
+                                  const color = inAllVariants
+                                    ? 'bg-emerald-100 text-emerald-700'
+                                    : inSomeVariants
+                                      ? 'bg-amber-100 text-amber-700'
+                                      : 'bg-rose-100 text-rose-700';
+                                  return (
+                                    <span key={uv} className={`inline-block px-1 py-0 rounded text-[8px] font-medium ${color}`}>{uv}</span>
+                                  );
+                                })}
+                              </div>
+                              {v.isSubsetOf.length > 0 && (
+                                <div className="mt-1 text-[8px] text-slate-400">
+                                  ⊂ subset of {v.isSubsetOf.length} larger variant{v.isSubsetOf.length !== 1 ? 's' : ''}
+                                </div>
+                              )}
+                              {v.noiseIfUnion > 0 && (
+                                <div className="mt-0.5 text-[8px] text-rose-400">
+                                  +{v.noiseIfUnion} extra value{v.noiseIfUnion !== 1 ? 's' : ''} if fully merged ({v.noiseItems.toLocaleString()} noise)
+                                </div>
+                              )}
+                            </div>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </div>
+
+                  {/* D. Cross-feature matches (on-demand) */}
+                  <div>
+                    <div className="flex items-center justify-between mb-2">
+                      <div className="text-[9px] font-black text-slate-500 uppercase tracking-wider">Cross-Feature Matches</div>
+                      {!crossFeatureData && !isLoadingCrossFeatures && (
+                        <button
+                          onClick={() => {
+                            setIsLoadingCrossFeatures(true);
+                            dbService.fetchCrossFeatureMatches(consolidation.featureId)
+                              .then(data => setCrossFeatureData(data))
+                              .catch(err => { console.error('cross-feature fetch failed', err); setCrossFeatureData(null); })
+                              .finally(() => setIsLoadingCrossFeatures(false));
+                          }}
+                          className="px-2 py-0.5 rounded bg-indigo-50 text-indigo-600 text-[9px] font-bold hover:bg-indigo-100 transition-colors"
+                        >
+                          Load Matches
+                        </button>
+                      )}
+                    </div>
+                    {isLoadingCrossFeatures && (
+                      <div className="flex items-center justify-center py-4">
+                        <div className="animate-spin rounded-full h-5 w-5 border-b-2 border-indigo-500" />
+                        <span className="ml-2 text-[10px] text-slate-400">Loading cross-feature matches…</span>
+                      </div>
+                    )}
+                    {crossFeatureData && crossFeatureData.crossFeatureMatches.length > 0 && (
+                      <div className="space-y-1">
+                        {crossFeatureData.crossFeatureMatches.map(cf => {
+                          const relColor = cf.relationship === 'identical'
+                            ? 'bg-emerald-100 text-emerald-700'
+                            : cf.relationship === 'subset' || cf.relationship === 'superset'
+                              ? 'bg-amber-100 text-amber-700'
+                              : 'bg-slate-100 text-slate-600';
+                          return (
+                            <div key={cf.featureId} className="flex items-center justify-between border border-slate-100 rounded-lg px-2.5 py-1.5 hover:bg-slate-50">
+                              <div className="flex items-center gap-2">
+                                <span className="text-[10px] font-bold text-slate-700">{cf.featureId}</span>
+                                <span className={`inline-block px-1.5 py-0 rounded text-[8px] font-bold uppercase ${relColor}`}>
+                                  {cf.relationship}
+                                </span>
+                              </div>
+                              <span className="text-[9px] font-bold text-slate-500">{cf.overlapPercent}% overlap</span>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    )}
+                    {crossFeatureData && crossFeatureData.crossFeatureMatches.length === 0 && (
+                      <div className="text-[9px] text-slate-400 italic">No cross-feature matches found (≥50% overlap).</div>
+                    )}
+                  </div>
+                </div>
+              )
             )}
           </div>
-          {selectedCombo && comboItems.length > 0 && (
+
+          {/* Footer (items tab only) */}
+          {selectedCombo && rightTab === 'items' && comboItems.length > 0 && (
             <div className="px-4 py-2 border-t border-slate-200 bg-slate-50 shrink-0">
               <span className="text-[9px] font-bold text-slate-400 uppercase tracking-wider">
                 {comboItems.length} item{comboItems.length !== 1 ? 's' : ''}

@@ -1610,6 +1610,10 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
                 candidateValuesForAttribute = attrDef.allowedValues;
               }
             }
+            // Ensure NOT REQUIRED is always available as a value option
+            if (!candidateValuesForAttribute.includes('NOT REQUIRED')) {
+              candidateValuesForAttribute = [...candidateValuesForAttribute, 'NOT REQUIRED'];
+            }
             const attributeTone: Tone = selectedAttribute === 'UNMAPPED'
               ? 'unmapped'
               : selectedAttribute === 'NOT REQUIRED'

@@ -1,5 +1,5 @@
 
-import { GlobalMapping, DatabaseState, User, ConnectionMode, NewAttribute, WorkspaceMappingRow, MappingGenerationProgress, ValueListGroup, ValueListRow, NewClassification, BomHierarchyItem, MLPrediction, MLSettings, FeatureCombinationJobProgress, FeatureCombinationRow, FeatureCombinationItem } from '../types';
+import { GlobalMapping, DatabaseState, User, ConnectionMode, NewAttribute, WorkspaceMappingRow, MappingGenerationProgress, ValueListGroup, ValueListRow, NewClassification, BomHierarchyItem, MLPrediction, MLSettings, FeatureCombinationJobProgress, FeatureCombinationRow, FeatureCombinationItem, ConsolidationAnalysis, SubsetMergeDetail } from '../types';
 
 export interface SaveAllResult {
   mode: ConnectionMode;
@@ -1175,7 +1175,7 @@ export const dbService = {
     });
   },
 
-  async fetchFeatureCombinations(options?: { search?: string; featureId?: string; attributeType?: string; priority?: number; status?: string; sortBy?: string; sortDir?: string; limit?: number; offset?: number }): Promise<{ items: FeatureCombinationRow[]; total: number }> {
+  async fetchFeatureCombinations(options?: { search?: string; featureId?: string; attributeType?: string; priority?: number; status?: string; sortBy?: string; sortDir?: string; analysisMode?: boolean; limit?: number; offset?: number }): Promise<{ items: FeatureCombinationRow[]; total: number }> {
     if (!SQL_ENDPOINT) throw new Error('Database connection not available.');
     const params = new URLSearchParams();
     if (options?.search) params.set('search', options.search);
@@ -1185,6 +1185,7 @@ export const dbService = {
     if (options?.status) params.set('status', options.status);
     if (options?.sortBy) params.set('sortBy', options.sortBy);
     if (options?.sortDir) params.set('sortDir', options.sortDir);
+    if (options?.analysisMode) params.set('analysisMode', 'true');
     if (options?.limit != null) params.set('limit', String(options.limit));
     if (options?.offset != null) params.set('offset', String(options.offset));
     const query = params.toString();
@@ -1208,5 +1209,65 @@ export const dbService = {
       headers: this._authHeaders(),
       _ttlMs: 10000,
     });
+  },
+
+  async fetchConsolidationAnalysis(featureId: string): Promise<ConsolidationAnalysis> {
+    if (!SQL_ENDPOINT) throw new Error('Database connection not available.');
+    return this._cachedFetch(`${SQL_ENDPOINT}/feature-combinations/analysis/${encodeURIComponent(featureId)}`, {
+      headers: this._authHeaders(),
+      _ttlMs: 15000,
+    });
+  },
+
+  async fetchVariantComparison(featureId: string): Promise<import('../types').VariantComparisonResponse> {
+    if (!SQL_ENDPOINT) throw new Error('Database connection not available.');
+    const resp = await fetch(`${SQL_ENDPOINT}/feature-combinations/analysis-variants?featureId=${encodeURIComponent(featureId)}`, {
+      headers: this._authHeaders(),
+    });
+    if (!resp.ok) {
+      const errText = await resp.text();
+      throw new Error(`Failed to fetch variant comparison: ${resp.status} ${errText}`);
+    }
+    return resp.json();
+  },
+
+  async fetchCrossFeatureMatches(featureId: string): Promise<import('../types').CrossFeatureResponse> {
+    if (!SQL_ENDPOINT) throw new Error('Database connection not available.');
+    const resp = await fetch(`${SQL_ENDPOINT}/feature-combinations/analysis-cross-features?featureId=${encodeURIComponent(featureId)}`, {
+      headers: this._authHeaders(),
+    });
+    if (!resp.ok) {
+      const errText = await resp.text();
+      throw new Error(`Failed to fetch cross-feature matches: ${resp.status} ${errText}`);
+    }
+    return resp.json();
+  },
+
+  async triggerConsolidationCompute(featureId: string, strategy: string): Promise<{ featureId: string; strategy: string; status: string }> {
+    if (!SQL_ENDPOINT) throw new Error('Database connection not available.');
+    const resp = await fetch(`${SQL_ENDPOINT}/feature-combinations/consolidation-plans/compute`, {
+      method: 'POST',
+      headers: { ...this._authHeaders(), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ featureId, strategy }),
+    });
+    if (!resp.ok) {
+      const errText = await resp.text();
+      throw new Error(`Failed to trigger consolidation: ${resp.status} ${errText}`);
+    }
+    this._invalidateCache();
+    return resp.json();
+  },
+
+  async fetchConsolidationPlan(featureId: string): Promise<SubsetMergeDetail> {
+    if (!SQL_ENDPOINT) throw new Error('Database connection not available.');
+    const resp = await fetch(`${SQL_ENDPOINT}/feature-combinations/consolidation-plans/by-feature?featureId=${encodeURIComponent(featureId)}`, {
+      headers: this._authHeaders(),
+    });
+    if (!resp.ok) {
+      if (resp.status === 404) return null as any;
+      const errText = await resp.text();
+      throw new Error(`Failed to fetch consolidation plan: ${resp.status} ${errText}`);
+    }
+    return resp.json();
   },
 };

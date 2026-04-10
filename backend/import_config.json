@@ -21,5 +21,6 @@
     },
 
     "child_values_columns": ["Option"],
-    "child_value_description_column": "OptionDescription"
+    "child_value_description_column": "OptionDescription",
+    "child_value_till_date_column": null
 }

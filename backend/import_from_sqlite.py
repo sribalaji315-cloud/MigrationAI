@@ -121,6 +121,7 @@ def _group_children_by_feature(
     child_mapping: dict,
     values_cols: list,
     value_desc_col: str | None,
+    till_date_col: str | None = None,
 ) -> list[dict]:
     """Group child rows by feature_id, aggregating values and descriptions.
 
@@ -142,6 +143,7 @@ def _group_children_by_feature(
                 "unit": mapped.get("unit"),
                 "values": [],
                 "valueDescriptions": {},
+                "valueTillDates": {},
             }
 
         entry = grouped[fid]
@@ -165,6 +167,15 @@ def _group_children_by_feature(
                         desc = None
                     if desc is not None and desc != "":
                         entry["valueDescriptions"][sv] = str(desc)
+
+                # Collect till-date if configured
+                if till_date_col:
+                    try:
+                        td = cr[till_date_col]
+                    except (IndexError, KeyError):
+                        td = None
+                    if td is not None and td != "":
+                        entry["valueTillDates"][sv] = str(td)
 
     return list(grouped.values())
 
@@ -208,6 +219,7 @@ def run_import(cfg: dict, *, dry_run: bool = False, force: bool = False, wipe: b
     child_mapping = cfg["child_to_bom_feature"]
     values_cols = cfg.get("child_values_columns", [])
     value_desc_col = cfg.get("child_value_description_column")
+    till_date_col = cfg.get("child_value_till_date_column")
 
     # Read parent rows
     parent_rows = src.execute(
@@ -241,7 +253,7 @@ def run_import(cfg: dict, *, dry_run: bool = False, force: bool = False, wipe: b
 
             child_rows = child_by_parent.get(str(pr[parent_pk]), [])
             grouped_features = _group_children_by_feature(
-                child_rows, child_mapping, values_cols, value_desc_col,
+                child_rows, child_mapping, values_cols, value_desc_col, till_date_col,
             )
 
             if dry_run:
@@ -253,10 +265,16 @@ def run_import(cfg: dict, *, dry_run: bool = False, force: bool = False, wipe: b
                 for gf in grouped_features:
                     vals = gf["values"]
                     descs = gf["valueDescriptions"]
-                    payload = {"values": vals, "valueDescriptions": descs} if descs else vals
+                    till_dates = gf["valueTillDates"]
+                    payload = {"values": vals, "valueDescriptions": descs}
+                    if till_dates:
+                        payload["valueTillDates"] = till_dates
+                    if not descs and not till_dates:
+                        payload = vals
                     print(
                         f"    Feature(feature_id={gf['feature_id']!r}, "
                         f"values={payload!r})"
+                    )
                     )
                 features_created += len(grouped_features)
                 items_created += 1
@@ -276,7 +294,12 @@ def run_import(cfg: dict, *, dry_run: bool = False, force: bool = False, wipe: b
             for gf in grouped_features:
                 vals = gf["values"]
                 descs = gf["valueDescriptions"]
-                composite = {"values": vals, "valueDescriptions": descs} if descs else vals
+                till_dates = gf["valueTillDates"]
+                composite = {"values": vals, "valueDescriptions": descs}
+                if till_dates:
+                    composite["valueTillDates"] = till_dates
+                if not descs and not till_dates:
+                    composite = vals
 
                 feature = BomFeature(
                     item_id=bom_item.id,

@@ -86,6 +86,8 @@ class GlobalMapping(Base):
     new_attribute_id = Column(String, nullable=False)
     attribute_type = Column(String, nullable=False, default="")
     value_mappings = Column(JSON, nullable=True)
+    status = Column(String, nullable=False, default="active")  # active|deprecated|ignored
+    ignored_values = Column(JSON, nullable=True)  # list of legacy values to exclude
     # Phase 4.2: Optimistic locking version column
     version = Column(Integer, nullable=False, default=1)
     # Phase 4.3: Audit trail columns
@@ -122,6 +124,7 @@ class WorkspaceMapping(Base):
     condition = Column(String, nullable=True)
     formula = Column(String, nullable=True)
     mapped_from = Column(String, nullable=False, default="global")
+    value_status = Column(String, nullable=True, index=True)  # null|discontinued|ignored|deprecated
     signed_on_by_user_id = Column(String, index=True, nullable=True)
     signed_on_by_username = Column(String, nullable=True)
     signed_on_at = Column(Float, nullable=True)
@@ -299,3 +302,29 @@ class FeatureCombination(Base):
     priorities_json = Column(JSON, nullable=True)
     item_ids_json = Column(JSON, nullable=True)  # list of item_id strings in this combo
     built_at = Column(Float, nullable=True)
+
+
+class ConsolidationPlan(Base):
+    """Saved consolidation decision for a feature_id.
+
+    Stores the chosen merge strategy, the canonical value lists produced,
+    and the mapping of items to each list.
+    """
+
+    __tablename__ = "consolidation_plans"
+
+    id = Column(Integer, primary_key=True, index=True)
+    feature_id = Column(String, unique=True, index=True, nullable=False)
+    strategy = Column(String, nullable=False)  # subset_merge | full_union | no_merge
+    status = Column(String, nullable=False, default="completed")  # computing | completed | failed
+    lists_needed = Column(Integer, nullable=False, default=1)
+    canonical_lists_json = Column(JSON, nullable=False)  # [[val1, val2], [val3]]
+    item_assignments_json = Column(JSON, nullable=False)  # [[item1, item2], [item3]]
+    details_json = Column(JSON, nullable=True)  # per-list items + variant breakdowns for display
+    total_noise = Column(Integer, nullable=False, default=0)
+    max_noise_per_item = Column(Integer, nullable=False, default=0)
+    error_message = Column(String, nullable=True)
+    created_by = Column(String, nullable=True)
+    created_at = Column(Float, nullable=True)
+    updated_by = Column(String, nullable=True)
+    updated_at = Column(Float, nullable=True)

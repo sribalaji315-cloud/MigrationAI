@@ -19,6 +19,8 @@ export interface LegacyFeature {
   formula?: string;
   // Optional per-value descriptions, keyed by raw value
   valueDescriptions?: Record<string, string>;
+  // Optional per-value till-dates (YYYY-MM-DD), keyed by raw value
+  valueTillDates?: Record<string, string>;
 }
 
 export interface MLPrediction {
@@ -93,6 +95,8 @@ export interface GlobalMapping {
   valueMappings: Record<string, string>;
   attributeType: MappingAttributeType;
   mappedFrom?: 'global' | 'local';
+  status?: 'active' | 'deprecated' | 'ignored';
+  ignoredValues?: string[];
 }
 
 export interface ItemLock {
@@ -141,6 +145,7 @@ export interface WorkspaceMappingRow {
   condition?: string;
   formula?: string;
   mappedFrom?: string;
+  valueStatus?: 'discontinued' | 'ignored' | 'deprecated' | null;
   signedOnByUserId?: string | null;
   signedOnByUsername?: string | null;
   signedOnAt?: number | null;
@@ -211,6 +216,7 @@ export interface FeatureCombinationRow {
   mappingStatus: 'complete' | 'partial' | 'unmapped';
   priorities: number[];
   builtAt?: number | null;
+  savedPlanStrategy?: string | null;
 }
 
 export interface FeatureCombinationItem {
@@ -220,4 +226,90 @@ export interface FeatureCombinationItem {
   productType: string;
   priority?: number | null;
   classification: string;
+}
+
+export interface ConsolidationVariant {
+  comboId: number;
+  values: string[];
+  itemCount: number;
+  priorities: number[];
+  productTypes: string[];
+  isSubsetOf: number[];
+  isSupersetOf: number[];
+  noiseIfUnion: number;
+  noiseItems: number;
+}
+
+export interface MergeOption {
+  label: string;
+  canonicalValues: string[][];
+  listsNeeded: number;
+  totalNoise: number;
+  maxNoisePerItem: number;
+}
+
+export interface CrossFeatureMatch {
+  featureId: string;
+  unionValues: string[];
+  relationship: 'identical' | 'subset' | 'superset' | 'overlap';
+  overlapPercent: number;
+}
+
+export interface VariantComparisonResponse {
+  featureId: string;
+  unionValues: string[];
+  variants: ConsolidationVariant[];
+}
+
+export interface CrossFeatureResponse {
+  featureId: string;
+  crossFeatureMatches: CrossFeatureMatch[];
+}
+
+export interface ConsolidationAnalysis {
+  featureId: string;
+  description: string;
+  totalVariants: number;
+  totalItems: number;
+  unionValues: string[];
+  variants: ConsolidationVariant[];
+  mergeOptions: MergeOption[];
+  crossFeatureMatches: CrossFeatureMatch[];
+}
+
+export interface SubsetMergeListItem {
+  itemId: string;
+  description: string;
+  category: string;
+  priority?: number | null;
+  productType: string;
+}
+
+export interface SubsetMergeVariant {
+  comboId: number;
+  values: string[];
+  itemCount: number;
+}
+
+export interface SubsetMergeList {
+  index: number;
+  values: string[];
+  itemCount: number;
+  items: SubsetMergeListItem[];
+  totalItemIds: string[];
+  variants: SubsetMergeVariant[];
+}
+
+export interface SubsetMergeDetail {
+  featureId: string;
+  strategy: string;
+  status: 'computing' | 'completed' | 'failed';
+  listsNeeded: number;
+  totalNoise: number;
+  maxNoisePerItem: number;
+  applied: boolean;
+  appliedAt: number | null;
+  appliedBy: string | null;
+  errorMessage?: string | null;
+  lists: SubsetMergeList[];
 }

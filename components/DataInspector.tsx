@@ -2,7 +2,9 @@
 import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
 import { DataCategory, GlobalMapping, NewClassification, NewAttribute, LegacyItem, LegacyFeature, User, ItemLock, MappingTypeConfig, MappingGenerationProgress, ValueListGroup, ValueListRow } from '../types';
 import { dbService } from '../services/dbService';
-import { buildCsv, splitCsvLine, parseCsv } from '../utils/csvHelpers';
+import { buildCsv, splitCsvLine, parseCsv, detectDelimiter, splitDelimitedLine } from '../utils/csvHelpers';
+import { useCsvWorker } from '../hooks/useCsvWorker';
+import type { MergeGroupFeaturesInput } from '../workers/csvWorker';
 
 interface DataInspectorProps {
   category: DataCategory;
@@ -228,6 +230,21 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
   const autoSaveTimerRef = useRef<number | null>(null);
   const hydrationCategoryRef = useRef<DataCategory | null>(null);
   const mappingProgressPct = Math.round((mappingGenerationProgress?.progress || 0) * 100);
+
+  // ---- Feature CSV import (dual file) state ----
+  const { parseAutoAsync, mergeGroupFeaturesAsync } = useCsvWorker();
+  const [showFeatureImportModal, setShowFeatureImportModal] = useState(false);
+  const [featureImportStep, setFeatureImportStep] = useState<'select' | 'mapping' | 'importing' | 'done'>('select');
+  const [featureFile1, setFeatureFile1] = useState<File | null>(null);
+  const [featureFile2, setFeatureFile2] = useState<File | null>(null);
+  const [featureFile1Headers, setFeatureFile1Headers] = useState<string[]>([]);
+  const [featureFile2Headers, setFeatureFile2Headers] = useState<string[]>([]);
+  const [featureImportProgress, setFeatureImportProgress] = useState(0);
+  const [featureImportStats, setFeatureImportStats] = useState<{ totalItems: number; totalFeatures: number; groupFeaturesExpanded: number } | null>(null);
+  const [featureColMap1, setFeatureColMap1] = useState<Record<string, string>>({});
+  const [featureColMap2, setFeatureColMap2] = useState<Record<string, string>>({});
+  const featureFile1Ref = useRef<HTMLInputElement | null>(null);
+  const featureFile2Ref = useRef<HTMLInputElement | null>(null);
 
   // ---- Classification filter state (all distinct classes + attributes) ----
   const [allClassOptions, setAllClassOptions] = useState<{ classId: string; className: string }[]>([]);
@@ -1251,22 +1268,24 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
     if (category !== 'mapping') return;
 
     const allMappings = await fetchAllGlobalMappings();
-    const rows: string[][] = [['legacyFeatureIds', 'newAttributeId', 'attributeType', 'legacy value', 'new value']];
+    const rows: string[][] = [['legacyFeatureIds', 'newAttributeId', 'attributeType', 'status', 'ignoredValues', 'legacy value', 'new value']];
 
     allMappings.forEach(m => {
       if (!isTypeIncludedInExport(m.attributeType)) return;
       const featureCell = (m.legacyFeatureIds || []).join('|');
       const targetCell = m.newAttributeId || '';
       const attrTypeCell = normalizeAttributeType((m as any).attributeType);
+      const statusCell = m.status || 'active';
+      const ignoredCell = (m.ignoredValues || []).join('|');
       const pairs = Object.entries(m.valueMappings || {});
 
       if (!pairs.length) {
-        rows.push([featureCell, targetCell, attrTypeCell, '', '']);
+        rows.push([featureCell, targetCell, attrTypeCell, statusCell, ignoredCell, '', '']);
         return;
       }
 
       pairs.forEach(([legacyValue, newValue]) => {
-        rows.push([featureCell, targetCell, attrTypeCell, legacyValue || '', newValue || '']);
+        rows.push([featureCell, targetCell, attrTypeCell, statusCell, ignoredCell, legacyValue || '', newValue || '']);
       });
     });
 
@@ -1286,24 +1305,26 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
     if (category !== 'mapping') return;
 
     const allMappings = await fetchAllGlobalMappings();
-    const rows: string[][] = [['legacyFeatureId', 'newAttributeId', 'attributeType', 'legacy value', 'new value']];
+    const rows: string[][] = [['legacyFeatureId', 'newAttributeId', 'attributeType', 'status', 'ignoredValues', 'legacy value', 'new value']];
 
     allMappings.forEach(m => {
       if (!isTypeIncludedInExport(m.attributeType)) return;
       const featureIds = (m.legacyFeatureIds || []).filter(Boolean);
       const targetCell = m.newAttributeId || '';
       const attrTypeCell = normalizeAttributeType((m as any).attributeType);
+      const statusCell = m.status || 'active';
+      const ignoredCell = (m.ignoredValues || []).join('|');
       const pairs = Object.entries(m.valueMappings || {});
       const sourceFeatures = featureIds.length ? featureIds : [''];
 
       sourceFeatures.forEach(featureId => {
         if (!pairs.length) {
-          rows.push([featureId, targetCell, attrTypeCell, '', '']);
+          rows.push([featureId, targetCell, attrTypeCell, statusCell, ignoredCell, '', '']);
           return;
         }
 
         pairs.forEach(([legacyValue, newValue]) => {
-          rows.push([featureId, targetCell, attrTypeCell, legacyValue || '', newValue || '']);
+          rows.push([featureId, targetCell, attrTypeCell, statusCell, ignoredCell, legacyValue || '', newValue || '']);
         });
       });
     });
@@ -1376,6 +1397,8 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
           const legacyValue = (r['legacy value'] || r['legacyValue'] || r['legacy_value'] || '').trim();
           const newValue = (r['new value'] || r['newValue'] || r['new_value'] || '').trim();
           const valuePairs = parseList(r['valuePairs'] || r['valuepairs'] || '', /\|/);
+          const csvStatus = (r['status'] || '').trim().toLowerCase() || undefined;
+          const csvIgnoredValues = parseList(r['ignoredValues'] || r['ignored values'] || r['ignored_values'] || '', /[|,;]/);
 
           const rowValueMappings: Record<string, string> = {};
           valuePairs.forEach(p => {
@@ -1394,6 +1417,8 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
               newAttributeId,
               attributeType,
               valueMappings: { ...rowValueMappings },
+              ...(csvStatus && { status: csvStatus as any }),
+              ...(csvIgnoredValues.length && { ignoredValues: csvIgnoredValues }),
             });
           });
         });
@@ -1445,6 +1470,8 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
               newAttributeId: m.newAttributeId,
               attributeType: normalizeAttributeType(m.attributeType),
               valueMappings: { ...(m.valueMappings || {}) },
+              ...(m.status && { status: m.status }),
+              ...(m.ignoredValues?.length && { ignoredValues: [...m.ignoredValues] }),
             };
             existing.push(clone);
             existingByKey.set(key, clone);
@@ -1458,6 +1485,14 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
             existingMapping.attributeType = incomingType;
             existingByKey.delete(oldExactKey);
             existingByKey.set(keyFor(existingMapping), existingMapping);
+          }
+
+          if (m.status) {
+            existingMapping.status = m.status;
+          }
+          if (m.ignoredValues?.length) {
+            const mergedIgnored = new Set([...(existingMapping.ignoredValues || []), ...m.ignoredValues]);
+            existingMapping.ignoredValues = Array.from(mergedIgnored);
           }
 
           Object.entries(m.valueMappings || {}).forEach(([legacy, nextVal]) => {
@@ -1724,6 +1759,197 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
         setCsvImportProgress(0);
       }, 300);
     }
+  };
+
+  // ---- Feature CSV import (dual file) handlers ----
+  const handleFeatureFileSelect = async (fileNum: 1 | 2, file: File | null) => {
+    if (!file) return;
+    if (fileNum === 1) {
+      setFeatureFile1(file);
+      // Read just the header line
+      const text = await file.slice(0, 8192).text();
+      const firstLine = text.split(/\r?\n/)[0] || '';
+      const delim = detectDelimiter(firstLine);
+      const headers = splitDelimitedLine(firstLine, delim).map(h => h.trim()).filter(Boolean);
+      setFeatureFile1Headers(headers);
+      // Auto-map columns heuristically
+      const autoMap: Record<string, string> = {};
+      const lower = (s: string) => s.toLowerCase().replace(/[^a-z0-9]/g, '');
+      for (const h of headers) {
+        const l = lower(h);
+        if (l === 'item' || l === 'itemid' || l === 'itemnumber') autoMap.itemId = h;
+        else if (l === 'category') autoMap.category = h;
+        else if (l === 'producttype' || l === 'productline') autoMap.productType = h;
+        else if (l === 'priority') autoMap.priority = h;
+        else if (l === 'feature' || l === 'featureid') autoMap.featureId = h;
+        else if (l === 'featuredescription' || l === 'featuredesc' || l === 'featurename') autoMap.featureDescription = h;
+        else if (l === 'option' || l === 'optionid') autoMap.option = h;
+        else if (l === 'optiondescription' || l === 'optiondesc') autoMap.optionDescription = h;
+        else if (l === 'uom' || l === 'unit') autoMap.unit = h;
+        else if (l === 'description' || l === 'itemdescription') autoMap.description = h;
+        else if (l === 'groupfeature' || l === 'featuregroup') autoMap.groupFeature = h;
+      }
+      setFeatureColMap1(autoMap);
+    } else {
+      setFeatureFile2(file);
+      const text = await file.slice(0, 8192).text();
+      const firstLine = text.split(/\r?\n/)[0] || '';
+      const delim = detectDelimiter(firstLine);
+      const headers = splitDelimitedLine(firstLine, delim).map(h => h.trim()).filter(Boolean);
+      setFeatureFile2Headers(headers);
+      const autoMap: Record<string, string> = {};
+      const lower = (s: string) => s.toLowerCase().replace(/[^a-z0-9]/g, '');
+      for (const h of headers) {
+        const l = lower(h);
+        if (l === 'featuregroup' || l === 'group') autoMap.featureGroup = h;
+        else if (l === 'feature' || l === 'featureid') autoMap.feature = h;
+        else if (l === 'featuredesc' || l === 'featuredescription') autoMap.featureDesc = h;
+        else if (l === 'option' || l === 'optionid') autoMap.option = h;
+        else if (l === 'optiondesc' || l === 'optiondescription') autoMap.optionDesc = h;
+        else if (l === 'condition') autoMap.condition = h;
+      }
+      setFeatureColMap2(autoMap);
+    }
+  };
+
+  const handleFeatureImportExecute = async () => {
+    if (!featureFile1 || !featureFile2) return;
+    setFeatureImportStep('importing');
+    setFeatureImportProgress(10);
+    try {
+      // Parse both CSVs in parallel via the web worker
+      const [text1, text2] = await Promise.all([featureFile1.text(), featureFile2.text()]);
+      setFeatureImportProgress(30);
+
+      const [rows1, rows2] = await Promise.all([parseAutoAsync(text1), parseAutoAsync(text2)]);
+      setFeatureImportProgress(50);
+
+      // Build the column mapping input
+      const itemCols = {
+        itemId: featureColMap1.itemId || '',
+        description: featureColMap1.description || '',
+        category: featureColMap1.category || '',
+        productType: featureColMap1.productType || '',
+        priority: featureColMap1.priority || '',
+        featureId: featureColMap1.featureId || '',
+        featureDescription: featureColMap1.featureDescription || '',
+        option: featureColMap1.option || '',
+        optionDescription: featureColMap1.optionDescription || '',
+        unit: featureColMap1.unit || '',
+        groupFeature: featureColMap1.groupFeature || '',
+        tillDate: featureColMap1.tillDate || '',
+      };
+      const groupCols = {
+        featureGroup: featureColMap2.featureGroup || '',
+        feature: featureColMap2.feature || '',
+        featureDesc: featureColMap2.featureDesc || '',
+        option: featureColMap2.option || '',
+        optionDesc: featureColMap2.optionDesc || '',
+        condition: featureColMap2.condition || '',
+        tillDate: featureColMap2.tillDate || '',
+      };
+
+      // Merge in the worker (off main thread)
+      const { items: mergedItems, stats } = await mergeGroupFeaturesAsync({ itemFeatureRows: rows1, groupFeatureRows: rows2, itemCols, groupCols });
+      setFeatureImportProgress(80);
+
+      // Convert to LegacyItem[] and merge with existing BOM
+      const byItem: Record<string, LegacyItem> = {};
+      localBom.forEach(item => { byItem[item.itemId] = JSON.parse(JSON.stringify(item)); });
+
+      for (const mi of mergedItems) {
+        if (!byItem[mi.itemId]) {
+          byItem[mi.itemId] = {
+            itemId: mi.itemId,
+            description: mi.description,
+            category: mi.category,
+            productType: mi.productType,
+            ...(mi.priority != null ? { priority: mi.priority } : {}),
+            features: [],
+          };
+        }
+        const item = byItem[mi.itemId];
+        for (const mf of mi.features) {
+          let feat = item.features.find(f => f.featureId === mf.featureId);
+          if (!feat) {
+            feat = { featureId: mf.featureId, description: mf.description, values: [], unit: mf.unit, condition: mf.condition, valueDescriptions: {} };
+            item.features.push(feat);
+          }
+          for (const v of mf.values) {
+            if (!feat.values.includes(v)) {
+              feat.values.push(v);
+              if (mf.valueDescriptions?.[v]) {
+                if (!feat.valueDescriptions) feat.valueDescriptions = {};
+                feat.valueDescriptions[v] = mf.valueDescriptions[v];
+              }
+              if (mf.valueTillDates?.[v]) {
+                if (!feat.valueTillDates) feat.valueTillDates = {};
+                feat.valueTillDates[v] = mf.valueTillDates[v];
+              }
+            }
+          }
+        }
+      }
+
+      const nextBom = Object.values(byItem);
+      setLocalBom(nextBom);
+      setFeatureImportProgress(90);
+
+      await persistInspectorData({ source: 'auto', closeInspector: false, bomData: nextBom });
+      setFeatureImportProgress(100);
+      setFeatureImportStats(stats);
+      setFeatureImportStep('done');
+    } catch (err: any) {
+      console.error('Feature CSV import failed', err);
+      alert(`Feature import failed: ${err?.message || String(err)}`);
+      setFeatureImportStep('mapping');
+    }
+  };
+
+  const downloadFeatureTemplate = (templateNum: 1 | 2) => {
+    let csv: string;
+    let filename: string;
+    if (templateNum === 1) {
+      csv = buildCsv([
+        ['item', 'description', 'category', 'product type', 'priority', 'Feature', 'feature description', 'option', 'option description', 'UOM', 'group feature', 'Till Date'],
+        ['ITEM-001', 'Example Item', 'Pumps', 'ProductLine-A', '1', 'COLOR', 'Color of housing', 'RED', 'Red finish', 'mm', 'GRP-SEAL', ''],
+        ['ITEM-001', 'Example Item', 'Pumps', 'ProductLine-A', '1', 'COLOR', 'Color of housing', 'BLUE', 'Blue finish', 'mm', 'GRP-SEAL', '2025-06-30'],
+        ['ITEM-002', 'Another Item', 'Valves', 'ProductLine-B', '2', 'SIZE', 'Nominal size', '50', '50mm', 'mm', 'GRP-MATERIAL', ''],
+      ]);
+      filename = 'template_item_features.csv';
+    } else {
+      csv = buildCsv([
+        ['FeatureGroup', 'Seq.', 'Group', 'Feature', 'Feature Desc', 'Option', 'Option Desc', 'From', 'Till', 'Product Group(s)', 'Condition', 'Till Date'],
+        ['GRP-SEAL', '1', 'Seal Group', 'SEAL_TYPE', 'Seal material type', 'NBR', 'Nitrile rubber', '', '', 'All', '', ''],
+        ['GRP-SEAL', '2', 'Seal Group', 'SEAL_TYPE', 'Seal material type', 'EPDM', 'EPDM rubber', '', '', 'All', '', '2025-12-31'],
+        ['GRP-SEAL', '3', 'Seal Group', 'SEAL_RATING', 'Seal pressure rating', 'PN10', '10 bar', '', '', 'All', '', ''],
+        ['GRP-MATERIAL', '1', 'Material Group', 'BODY_MAT', 'Body material', 'CS', 'Carbon steel', '', '', 'All', '', ''],
+        ['GRP-MATERIAL', '2', 'Material Group', 'BODY_MAT', 'Body material', 'SS316', 'Stainless 316', '', '', 'All', 'SIZE>25', ''],
+      ]);
+      filename = 'template_group_features.csv';
+    }
+    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = filename;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
+  };
+
+  const resetFeatureImportModal = () => {
+    setShowFeatureImportModal(false);
+    setFeatureImportStep('select');
+    setFeatureFile1(null);
+    setFeatureFile2(null);
+    setFeatureFile1Headers([]);
+    setFeatureFile2Headers([]);
+    setFeatureColMap1({});
+    setFeatureColMap2({});
+    setFeatureImportProgress(0);
+    setFeatureImportStats(null);
   };
 
   const handleBomSync = async () => {
@@ -2025,6 +2251,15 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
                       className="px-3 py-1.5 border border-rose-200 bg-rose-50 rounded-lg text-[9px] font-black text-rose-700 hover:bg-rose-100 transition-all uppercase tracking-widest"
                     >
                       Wipe BOM
+                    </button>
+                  )}
+                  {category === 'bom' && (
+                    <button
+                      type="button"
+                      onClick={() => { resetFeatureImportModal(); setShowFeatureImportModal(true); }}
+                      className="px-3 py-1.5 border border-violet-200 bg-violet-50 rounded-lg text-[9px] font-black text-violet-700 hover:bg-violet-100 transition-all uppercase tracking-widest"
+                    >
+                      Import Feature CSVs
                     </button>
                   )}
                   <input
@@ -3150,7 +3385,71 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
                     ))}
                   </select>
                 </div>
+                <div>
+                  <label className="text-[8px] font-black text-slate-400 uppercase tracking-widest mb-1 block">
+                    Status
+                  </label>
+                  <select
+                    value={editingRecord.status || 'active'}
+                    onChange={(e) => {
+                      setEditingRecord(prev => markMappingEdited({ ...prev!, status: e.target.value as any }));
+                      setHasCsvUploaded(true);
+                    }}
+                    className={`w-full p-2 text-[10px] border rounded-md font-black outline-none focus:border-indigo-400 ${
+                      (editingRecord.status || 'active') === 'active'
+                        ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
+                        : (editingRecord.status === 'deprecated'
+                          ? 'bg-amber-50 text-amber-700 border-amber-200'
+                          : 'bg-red-50 text-red-700 border-red-200')
+                    }`}
+                  >
+                    <option value="active">Active</option>
+                    <option value="deprecated">Deprecated</option>
+                    <option value="ignored">Ignored</option>
+                  </select>
+                </div>
               </div>
+
+              {/* Ignored Values */}
+              {legacyValueCandidates.length > 0 && (
+                <div className="mb-4">
+                  <div className="flex items-center justify-between mb-2">
+                    <p className="text-[9px] font-black text-slate-400 uppercase tracking-widest">
+                      Ignored Values
+                    </p>
+                    <span className="text-[8px] text-slate-400">
+                      {(editingRecord.ignoredValues || []).length} selected
+                    </span>
+                  </div>
+                  <div className="flex flex-wrap gap-1.5 max-h-24 overflow-y-auto p-2 bg-slate-50 border border-slate-200 rounded-md">
+                    {legacyValueCandidates.map(val => {
+                      const isIgnored = (editingRecord.ignoredValues || []).includes(val);
+                      return (
+                        <button
+                          key={val}
+                          type="button"
+                          onClick={() => {
+                            const current = editingRecord.ignoredValues || [];
+                            const next = isIgnored
+                              ? current.filter(v => v !== val)
+                              : [...current, val];
+                            setEditingRecord(prev => markMappingEdited({ ...prev!, ignoredValues: next }));
+                            setHasCsvUploaded(true);
+                          }}
+                          className={`px-2 py-0.5 rounded-full text-[9px] font-bold transition-all ${
+                            isIgnored
+                              ? 'bg-red-100 text-red-700 border border-red-300 hover:bg-red-200'
+                              : 'bg-white text-slate-500 border border-slate-200 hover:bg-slate-100 hover:text-slate-700'
+                          }`}
+                        >
+                          {isIgnored && <span className="mr-0.5">✕</span>}
+                          {val}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
 
               <div>
                 <div className="flex items-center justify-between mb-2">
@@ -3704,6 +4003,206 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
           )}
         </div>
       </div>
+
+      {/* Feature CSV Import Modal */}
+      {showFeatureImportModal && (
+        <div className="fixed inset-0 z-[200] flex items-center justify-center p-4 bg-slate-900/50 backdrop-blur-sm">
+          <div className="bg-white rounded-2xl shadow-2xl w-full max-w-2xl max-h-[80vh] flex flex-col overflow-hidden border border-slate-200">
+            {/* Modal header */}
+            <div className="px-6 py-4 border-b border-slate-100 flex justify-between items-center shrink-0">
+              <div>
+                <h3 className="text-sm font-black text-slate-900 tracking-tight">Import Feature CSVs</h3>
+                <p className="text-[9px] text-slate-400 font-bold uppercase tracking-widest mt-0.5">Item Features + Group Features</p>
+              </div>
+              <button onClick={resetFeatureImportModal} className="p-1.5 text-slate-400 hover:text-slate-600 hover:bg-slate-50 rounded-md transition-all">
+                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>
+              </button>
+            </div>
+
+            {/* Modal body */}
+            <div className="flex-1 overflow-auto p-6 space-y-5">
+              {featureImportStep === 'select' && (
+                <>
+                  {/* File 1 */}
+                  <div className="rounded-lg border border-slate-200 p-4">
+                    <div className="flex items-center justify-between mb-2">
+                      <span className="text-[10px] font-black text-slate-700 uppercase tracking-wider">File 1: Item Features</span>
+                      {featureFile1 && <span className="text-[9px] text-emerald-600 font-bold">{featureFile1.name}</span>}
+                    </div>
+                    <p className="text-[9px] text-slate-400 mb-2">Columns: item, category, product type, priority, Feature, feature description, option, option description, UOM, group feature</p>
+                    <div className="flex items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={() => featureFile1Ref.current?.click()}
+                        className="px-3 py-1.5 border border-violet-200 bg-violet-50 rounded-lg text-[9px] font-black text-violet-700 hover:bg-violet-100 transition-all uppercase tracking-widest"
+                      >
+                        {featureFile1 ? 'Change File' : 'Select File'}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => downloadFeatureTemplate(1)}
+                        className="px-3 py-1.5 border border-slate-200 bg-slate-50 rounded-lg text-[9px] font-black text-slate-500 hover:bg-slate-100 transition-all uppercase tracking-widest"
+                      >
+                        Download Template
+                      </button>
+                    </div>
+                    <input ref={featureFile1Ref} type="file" accept=".csv,.tsv,text/csv,text/tab-separated-values" className="hidden" onChange={(e) => { handleFeatureFileSelect(1, e.target.files?.[0] || null); e.target.value = ''; }} />
+                    {featureFile1Headers.length > 0 && (
+                      <div className="mt-2 flex flex-wrap gap-1">
+                        {featureFile1Headers.map(h => (
+                          <span key={h} className="inline-block px-1.5 py-0.5 bg-slate-100 text-slate-600 rounded text-[9px]">{h}</span>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+
+                  {/* File 2 */}
+                  <div className="rounded-lg border border-slate-200 p-4">
+                    <div className="flex items-center justify-between mb-2">
+                      <span className="text-[10px] font-black text-slate-700 uppercase tracking-wider">File 2: Group Features</span>
+                      {featureFile2 && <span className="text-[9px] text-emerald-600 font-bold">{featureFile2.name}</span>}
+                    </div>
+                    <p className="text-[9px] text-slate-400 mb-2">Columns: FeatureGroup, Seq., Group, Feature, Feature Desc, Option, Option Desc, From, Till, Product Group(s), Condition</p>
+                    <div className="flex items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={() => featureFile2Ref.current?.click()}
+                        className="px-3 py-1.5 border border-violet-200 bg-violet-50 rounded-lg text-[9px] font-black text-violet-700 hover:bg-violet-100 transition-all uppercase tracking-widest"
+                      >
+                        {featureFile2 ? 'Change File' : 'Select File'}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => downloadFeatureTemplate(2)}
+                        className="px-3 py-1.5 border border-slate-200 bg-slate-50 rounded-lg text-[9px] font-black text-slate-500 hover:bg-slate-100 transition-all uppercase tracking-widest"
+                      >
+                        Download Template
+                      </button>
+                    </div>
+                    <input ref={featureFile2Ref} type="file" accept=".csv,.tsv,text/tab-separated-values" className="hidden" onChange={(e) => { handleFeatureFileSelect(2, e.target.files?.[0] || null); e.target.value = ''; }} />
+                    {featureFile2Headers.length > 0 && (
+                      <div className="mt-2 flex flex-wrap gap-1">
+                        {featureFile2Headers.map(h => (
+                          <span key={h} className="inline-block px-1.5 py-0.5 bg-slate-100 text-slate-600 rounded text-[9px]">{h}</span>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                </>
+              )}
+
+              {featureImportStep === 'mapping' && (
+                <>
+                  {/* Column mapping for File 1 */}
+                  <div className="rounded-lg border border-slate-200 p-4">
+                    <span className="text-[10px] font-black text-violet-700 uppercase tracking-wider block mb-3">Map File 1 Columns (Item Features)</span>
+                    <div className="grid grid-cols-2 gap-2">
+                      {(['itemId', 'description', 'category', 'productType', 'priority', 'featureId', 'featureDescription', 'option', 'optionDescription', 'unit', 'groupFeature', 'tillDate'] as const).map(field => (
+                        <div key={field} className="flex items-center gap-2">
+                          <label className="text-[9px] font-bold text-slate-500 w-28 shrink-0 text-right">{field}</label>
+                          <select
+                            value={featureColMap1[field] || ''}
+                            onChange={e => setFeatureColMap1(prev => ({ ...prev, [field]: e.target.value }))}
+                            className="flex-1 text-[9px] px-1.5 py-1 border border-slate-200 rounded bg-white focus:outline-none focus:ring-1 focus:ring-violet-400"
+                          >
+                            <option value="">— skip —</option>
+                            {featureFile1Headers.map(h => <option key={h} value={h}>{h}</option>)}
+                          </select>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+
+                  {/* Column mapping for File 2 */}
+                  <div className="rounded-lg border border-slate-200 p-4">
+                    <span className="text-[10px] font-black text-violet-700 uppercase tracking-wider block mb-3">Map File 2 Columns (Group Features)</span>
+                    <div className="grid grid-cols-2 gap-2">
+                      {(['featureGroup', 'feature', 'featureDesc', 'option', 'optionDesc', 'condition', 'tillDate'] as const).map(field => (
+                        <div key={field} className="flex items-center gap-2">
+                          <label className="text-[9px] font-bold text-slate-500 w-28 shrink-0 text-right">{field}</label>
+                          <select
+                            value={featureColMap2[field] || ''}
+                            onChange={e => setFeatureColMap2(prev => ({ ...prev, [field]: e.target.value }))}
+                            className="flex-1 text-[9px] px-1.5 py-1 border border-slate-200 rounded bg-white focus:outline-none focus:ring-1 focus:ring-violet-400"
+                          >
+                            <option value="">— skip —</option>
+                            {featureFile2Headers.map(h => <option key={h} value={h}>{h}</option>)}
+                          </select>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                </>
+              )}
+
+              {featureImportStep === 'importing' && (
+                <div className="flex flex-col items-center justify-center py-12 gap-4">
+                  <div className="w-8 h-8 border-3 border-violet-500 border-t-transparent rounded-full animate-spin" />
+                  <span className="text-[10px] font-black text-violet-600 uppercase tracking-wider">Processing Feature CSVs…</span>
+                  <div className="w-48 h-2 bg-slate-200 rounded-full overflow-hidden">
+                    <div className="h-full bg-violet-500 transition-all duration-300" style={{ width: `${featureImportProgress}%` }} />
+                  </div>
+                  <span className="text-[9px] text-slate-400">Parsing and merging in background thread</span>
+                </div>
+              )}
+
+              {featureImportStep === 'done' && featureImportStats && (
+                <div className="flex flex-col items-center justify-center py-8 gap-4">
+                  <div className="w-12 h-12 bg-emerald-100 rounded-full flex items-center justify-center">
+                    <svg className="w-6 h-6 text-emerald-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" /></svg>
+                  </div>
+                  <span className="text-sm font-black text-slate-800">Import Complete</span>
+                  <div className="grid grid-cols-3 gap-4 text-center">
+                    <div className="rounded-lg bg-violet-50 p-3">
+                      <div className="text-lg font-black text-violet-700">{featureImportStats.totalItems.toLocaleString()}</div>
+                      <div className="text-[8px] font-bold text-violet-500 uppercase tracking-wider">Items</div>
+                    </div>
+                    <div className="rounded-lg bg-blue-50 p-3">
+                      <div className="text-lg font-black text-blue-700">{featureImportStats.totalFeatures.toLocaleString()}</div>
+                      <div className="text-[8px] font-bold text-blue-500 uppercase tracking-wider">Total Features</div>
+                    </div>
+                    <div className="rounded-lg bg-emerald-50 p-3">
+                      <div className="text-lg font-black text-emerald-700">{featureImportStats.groupFeaturesExpanded.toLocaleString()}</div>
+                      <div className="text-[8px] font-bold text-emerald-500 uppercase tracking-wider">Group Sub-Features Added</div>
+                    </div>
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {/* Modal footer */}
+            <div className="px-6 py-3 border-t border-slate-100 flex items-center justify-end gap-2 shrink-0 bg-slate-50">
+              {featureImportStep === 'select' && (
+                <>
+                  <button onClick={resetFeatureImportModal} className="px-4 py-1.5 text-[9px] font-black text-slate-500 uppercase tracking-widest hover:bg-slate-100 rounded-lg transition-all">Cancel</button>
+                  <button
+                    onClick={() => setFeatureImportStep('mapping')}
+                    disabled={!featureFile1 || !featureFile2}
+                    className="px-4 py-1.5 bg-violet-600 text-white rounded-lg text-[9px] font-black uppercase tracking-widest hover:bg-violet-700 disabled:opacity-40 disabled:cursor-not-allowed transition-all"
+                  >
+                    Next: Map Columns
+                  </button>
+                </>
+              )}
+              {featureImportStep === 'mapping' && (
+                <>
+                  <button onClick={() => setFeatureImportStep('select')} className="px-4 py-1.5 text-[9px] font-black text-slate-500 uppercase tracking-widest hover:bg-slate-100 rounded-lg transition-all">Back</button>
+                  <button
+                    onClick={handleFeatureImportExecute}
+                    disabled={!featureColMap1.itemId || !featureColMap1.featureId || !featureColMap2.featureGroup || !featureColMap2.feature}
+                    className="px-4 py-1.5 bg-violet-600 text-white rounded-lg text-[9px] font-black uppercase tracking-widest hover:bg-violet-700 disabled:opacity-40 disabled:cursor-not-allowed transition-all"
+                  >
+                    Import &amp; Merge
+                  </button>
+                </>
+              )}
+              {featureImportStep === 'done' && (
+                <button onClick={resetFeatureImportModal} className="px-4 py-1.5 bg-emerald-600 text-white rounded-lg text-[9px] font-black uppercase tracking-widest hover:bg-emerald-700 transition-all">Done</button>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };

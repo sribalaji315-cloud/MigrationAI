@@ -393,6 +393,21 @@ def _run_mapping_generation_job(job_id: int):
 
         mapping_by_feature = _build_latest_mapping_by_feature(scan_db.query(models.GlobalMapping).all())
 
+        # Build exclusion indexes from global mappings
+        _gm_status_by_feature: Dict[str, str] = {}  # feature_id -> mapping status
+        _gm_ignored_values_by_feature: Dict[str, Set[str]] = {}  # feature_id -> ignored values
+        for gm in scan_db.query(models.GlobalMapping).all():
+            gm_status = (getattr(gm, "status", "active") or "active").strip().lower()
+            gm_ignored = set(getattr(gm, "ignored_values", []) or [])
+            for fid in (getattr(gm, "legacy_feature_ids", []) or []):
+                nfid = str(fid or "").strip()
+                if not nfid:
+                    continue
+                if gm_status != "active":
+                    _gm_status_by_feature[nfid] = gm_status
+                if gm_ignored:
+                    _gm_ignored_values_by_feature.setdefault(nfid, set()).update(gm_ignored)
+
         total_features = int(scan_db.query(func.count(models.BomFeature.id)).scalar() or 0)
         processed_features = 0
         total_values = 0
@@ -455,9 +470,15 @@ def _run_mapping_generation_job(job_id: int):
             feat_formula = (getattr(feat, "formula", "") or "").strip() or None
             value_mappings = getattr(mapping, "value_mappings", {}) if mapping else {}
 
+            # Determine mapping-level exclusion status
+            feature_gm_status = _gm_status_by_feature.get(feat_feature_id)  # deprecated/ignored or None
+            feature_ignored_values = _gm_ignored_values_by_feature.get(feat_feature_id, set())
+
             raw_values = getattr(feat, "values", []) or []
+            till_dates: Dict[str, str] = {}
             if isinstance(raw_values, dict):
                 values = [str(v) for v in (raw_values.get("values") or [])]
+                till_dates = raw_values.get("valueTillDates", {}) or {}
             elif isinstance(raw_values, list):
                 values = [str(v) for v in raw_values]
             else:
@@ -476,6 +497,7 @@ def _run_mapping_generation_job(job_id: int):
                         "condition": feat_condition,
                         "formula": feat_formula,
                         "mapped_from": "global",
+                        "value_status": feature_gm_status,
                         "signed_on_by_user_id": job.triggered_by_user_id,
                         "signed_on_by_username": job.triggered_by_username,
                         "signed_on_at": signed_ts,
@@ -485,24 +507,58 @@ def _run_mapping_generation_job(job_id: int):
                 generated_rows += 1
             else:
                 for legacy_value in values:
-                    resolved = _resolve_value_mapping(value_mappings, legacy_value)
-                    append_row(
-                        {
-                            "legacy_item_id": legacy_item_id,
-                            "legacy_feature_id": getattr(feat, "feature_id", "") or "",
-                            "legacy_value": str(legacy_value),
-                            "new_attribute_id": target_attr,
-                            "new_value": (resolved or ""),
-                            "attribute_type": attr_type,
-                            "condition": feat_condition,
-                            "formula": feat_formula,
-                            "mapped_from": "global" if resolved else "",
-                            "signed_on_by_user_id": job.triggered_by_user_id,
-                            "signed_on_by_username": job.triggered_by_username,
-                            "signed_on_at": signed_ts,
-                            "updated_at": time.time(),
-                        }
-                    )
+                    # Determine per-value exclusion status
+                    val_status = None
+                    if feature_gm_status:
+                        # Entire mapping is deprecated/ignored
+                        val_status = feature_gm_status
+                    elif legacy_value in feature_ignored_values:
+                        val_status = "ignored"
+                    else:
+                        td_str = till_dates.get(legacy_value)
+                        if td_str and str(td_str).strip():
+                            val_status = "discontinued"
+
+                    if val_status:
+                        # Excluded row: keep target attr, set value to NOT REQUIRED
+                        append_row(
+                            {
+                                "legacy_item_id": legacy_item_id,
+                                "legacy_feature_id": getattr(feat, "feature_id", "") or "",
+                                "legacy_value": str(legacy_value),
+                                "new_attribute_id": target_attr,
+                                "new_value": "NOT REQUIRED",
+                                "attribute_type": attr_type,
+                                "condition": feat_condition,
+                                "formula": feat_formula,
+                                "mapped_from": "global",
+                                "value_status": val_status,
+                                "signed_on_by_user_id": job.triggered_by_user_id,
+                                "signed_on_by_username": job.triggered_by_username,
+                                "signed_on_at": signed_ts,
+                                "updated_at": time.time(),
+                            }
+                        )
+                    else:
+                        resolved = _resolve_value_mapping(value_mappings, legacy_value)
+                        append_row(
+                            {
+                                "legacy_item_id": legacy_item_id,
+                                "legacy_feature_id": getattr(feat, "feature_id", "") or "",
+                                "legacy_value": str(legacy_value),
+                                "new_attribute_id": target_attr,
+                                "new_value": (resolved or ""),
+                                "attribute_type": attr_type,
+                                "condition": feat_condition,
+                                "formula": feat_formula,
+                                "mapped_from": "global" if resolved else "",
+                                "value_status": None,
+                                "signed_on_by_user_id": job.triggered_by_user_id,
+                                "signed_on_by_username": job.triggered_by_username,
+                                "signed_on_at": signed_ts,
+                                "updated_at": time.time(),
+                            }
+                        )
                     generated_rows += 1
                 total_values += len(values)
 
@@ -664,6 +720,21 @@ def _run_feature_combination_job(job_id: int):
                 if normalized_fid and new_attr:
                     d365_by_feature.setdefault(normalized_fid, []).append({"attr": new_attr, "vm": dict(vm)})
 
+        # Build exclusion indexes for combination filtering
+        _combo_excluded_features: Set[str] = set()  # features where entire mapping deprecated/ignored
+        _combo_ignored_values: Dict[str, Set[str]] = {}  # feature_id -> set of ignored values
+        for gm in scan_db.query(models.GlobalMapping).all():
+            gm_status = (getattr(gm, "status", "active") or "active").strip().lower()
+            gm_ignored = set(getattr(gm, "ignored_values", []) or [])
+            for fid in (getattr(gm, "legacy_feature_ids", []) or []):
+                nfid = str(fid or "").strip()
+                if not nfid:
+                    continue
+                if gm_status in ("deprecated", "ignored"):
+                    _combo_excluded_features.add(nfid)
+                if gm_ignored:
+                    _combo_ignored_values.setdefault(nfid, set()).update(gm_ignored)
+
         total_features = int(scan_db.query(func.count(models.BomFeature.id)).scalar() or 0)
         job.total_features = total_features
         job.updated_at = time.time()
@@ -680,8 +751,31 @@ def _run_feature_combination_job(job_id: int):
                 continue
 
             feature_id = str(getattr(feat, "feature_id", "") or "").strip()
+
+            # Skip entirely excluded features (deprecated/ignored mapping)
+            if feature_id in _combo_excluded_features:
+                processed += 1
+                continue
+
             normalized = _normalize_feature_values(getattr(feat, "values", []))
-            values_key = _make_values_key(normalized)
+
+            # Filter out ignored + discontinued values
+            ignored_for_fid = _combo_ignored_values.get(feature_id, set())
+            raw_vals_data = getattr(feat, "values", []) or []
+            till_dates: Dict[str, str] = {}
+            if isinstance(raw_vals_data, dict):
+                till_dates = raw_vals_data.get("valueTillDates", {}) or {}
+
+            active_values: List[str] = []
+            for v in normalized:
+                if v in ignored_for_fid:
+                    continue
+                td_str = till_dates.get(v)
+                if td_str and str(td_str).strip():
+                    continue
+                active_values.append(v)
+
+            values_key = _make_values_key(active_values)
             combo_key = f"{feature_id}||{values_key}"
 
             if combo_key not in combos:
@@ -689,7 +783,7 @@ def _run_feature_combination_job(job_id: int):
                     "feature_id": feature_id,
                     "description": str(getattr(feat, "description", "") or "").strip(),
                     "unit": str(getattr(feat, "unit", "") or "").strip(),
-                    "values": normalized,
+                    "values": active_values,
                     "item_ids": set(),
                 }
             combos[combo_key]["item_ids"].add(legacy_item_id)
@@ -938,6 +1032,7 @@ def list_feature_combinations(
     status: Optional[str] = None,
     sortBy: Optional[str] = None,
     sortDir: Optional[str] = None,
+    analysisMode: Optional[bool] = None,
     limit: int = Query(50, ge=1, le=5000),
     offset: int = Query(0, ge=0),
     db: Session = Depends(get_db),
@@ -981,6 +1076,37 @@ def list_feature_combinations(
             models.FeatureCombination.priorities_json.isnot(None),
             cast(models.FeatureCombination.priorities_json, String).contains(str(priority)),
         )
+
+    # Analysis mode: one row per feature_id, only features with 2+ combos
+    if analysisMode:
+        all_combos_brief = db.query(
+            models.FeatureCombination.id,
+            models.FeatureCombination.feature_id,
+            models.FeatureCombination.item_count,
+        ).all()
+        by_feature: Dict[str, list] = {}
+        for cid, fid, ic in all_combos_brief:
+            by_feature.setdefault(fid, []).append((cid, ic))
+        # Pick one representative (most items) per feature, only for features with 2+ combos
+        best_ids: Set[int] = set()
+        for fid, combos in by_feature.items():
+            if len(combos) < 2:
+                continue
+            best = max(combos, key=lambda x: (x[1], -x[0]))
+            best_ids.add(best[0])
+        if not best_ids:
+            return {"items": [], "total": 0}
+        base = base.filter(models.FeatureCombination.id.in_(best_ids))
+
+    # Also enrich with saved consolidation plan status when in analysis mode
+    saved_plans_map: Dict[str, str] = {}
+    if analysisMode:
+        saved_plans = db.query(
+            models.ConsolidationPlan.feature_id,
+            models.ConsolidationPlan.strategy,
+        ).all()
+        saved_plans_map = {fp: st for fp, st in saved_plans}
+
     total = base.count()
 
     # Sorting
@@ -1064,6 +1190,7 @@ def list_feature_combinations(
             "mappingStatus": r.mapping_status if hasattr(r, "mapping_status") else "unmapped",
             "priorities": r.priorities_json or [],
             "builtAt": r.built_at,
+            **({"savedPlanStrategy": saved_plans_map.get(r.feature_id)} if analysisMode else {}),
         }
         for r in rows
     ]
@@ -1116,6 +1243,560 @@ def get_feature_combination_items(
                 "classification": itm.classification or "",
             }
             for itm in bom_items
+        ]
+    }
+
+
+@router.get("/feature-combinations/analysis-variants")
+def get_feature_variants(
+    feature_id: str = Query(..., alias="featureId"),
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """On-demand: full variant comparison with product types and subset relationships."""
+    combos = (
+        db.query(models.FeatureCombination)
+        .filter(models.FeatureCombination.feature_id == feature_id)
+        .order_by(models.FeatureCombination.item_count.desc())
+        .all()
+    )
+    if not combos:
+        raise HTTPException(status_code=404, detail="no combinations found")
+
+    union_values: Set[str] = set()
+    variants: List[Dict[str, Any]] = []
+    for c in combos:
+        vals = set(c.normalized_values_json or [])
+        item_ids = c.item_ids_json or []
+        union_values.update(vals)
+
+        pt_set: Set[str] = set()
+        if item_ids:
+            pts = (
+                db.query(models.BomItem.product_type)
+                .filter(
+                    models.BomItem.item_id.in_(item_ids),
+                    models.BomItem.product_type.isnot(None),
+                    models.BomItem.product_type != "",
+                )
+                .distinct()
+                .all()
+            )
+            pt_set = {r[0] for r in pts}
+
+        variants.append({
+            "comboId": c.id,
+            "values": sorted(vals),
+            "itemCount": c.item_count,
+            "priorities": c.priorities_json or [],
+            "productTypes": sorted(pt_set),
+            "valuesSet": vals,
+        })
+
+    for v in variants:
+        vs = v["valuesSet"]
+        v["isSubsetOf"] = [o["comboId"] for o in variants if o["comboId"] != v["comboId"] and vs < o["valuesSet"]]
+        v["isSupersetOf"] = [o["comboId"] for o in variants if o["comboId"] != v["comboId"] and vs > o["valuesSet"]]
+        v["noiseIfUnion"] = len(union_values) - len(vs)
+        v["noiseItems"] = v["itemCount"] * (len(union_values) - len(vs))
+
+    serialized = [{k: v for k, v in var.items() if k != "valuesSet"} for var in variants]
+    return {"featureId": feature_id, "variants": serialized, "unionValues": sorted(union_values)}
+
+
+@router.get("/feature-combinations/analysis-cross-features")
+def get_cross_feature_matches(
+    feature_id: str = Query(..., alias="featureId"),
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """On-demand: cross-feature matches with overlapping value sets."""
+    combos = (
+        db.query(models.FeatureCombination)
+        .filter(models.FeatureCombination.feature_id == feature_id)
+        .all()
+    )
+    if not combos:
+        raise HTTPException(status_code=404, detail="no combinations found")
+
+    union_values: Set[str] = set()
+    for c in combos:
+        union_values.update(c.normalized_values_json or [])
+
+    other_features: Dict[str, Set[str]] = {}
+    other_combos = (
+        db.query(
+            models.FeatureCombination.feature_id,
+            models.FeatureCombination.normalized_values_json,
+        )
+        .filter(models.FeatureCombination.feature_id != feature_id)
+        .all()
+    )
+    for of_fid, of_vals_json in other_combos:
+        other_features.setdefault(of_fid, set()).update(of_vals_json or [])
+
+    cross_matches: List[Dict[str, Any]] = []
+    for of_fid, of_union in other_features.items():
+        if not of_union:
+            continue
+        intersection = union_values & of_union
+        if not intersection:
+            continue
+        overlap_pct = round(len(intersection) / max(len(union_values), len(of_union)) * 100)
+        if overlap_pct < 50:
+            continue
+        if of_union == union_values:
+            rel = "identical"
+        elif of_union < union_values:
+            rel = "subset"
+        elif of_union > union_values:
+            rel = "superset"
+        else:
+            rel = "overlap"
+        cross_matches.append({
+            "featureId": of_fid,
+            "unionValues": sorted(of_union),
+            "relationship": rel,
+            "overlapPercent": overlap_pct,
+        })
+
+    cross_matches.sort(key=lambda x: (-x["overlapPercent"], x["featureId"]))
+    return {"featureId": feature_id, "crossFeatureMatches": cross_matches[:20]}
+
+
+@router.get("/feature-combinations/analysis/{feature_id:path}")
+def get_feature_consolidation_analysis(
+    feature_id: str,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """Lightweight consolidation analysis: summary + merge options only.
+
+    Variant comparison and cross-feature matches are loaded on demand
+    via separate endpoints.
+    """
+    combos = (
+        db.query(models.FeatureCombination)
+        .filter(models.FeatureCombination.feature_id == feature_id)
+        .order_by(models.FeatureCombination.item_count.desc())
+        .all()
+    )
+    if not combos:
+        raise HTTPException(status_code=404, detail="no combinations found for this feature")
+
+    description = combos[0].description or ""
+
+    # Build lightweight variant data (no product type queries, no subset computation)
+    variant_sets: List[Set[str]] = []
+    all_item_ids: Set[str] = set()
+    union_values: Set[str] = set()
+    variant_item_counts: List[int] = []
+    variant_values_sorted: List[List[str]] = []
+    for c in combos:
+        vals = set(c.normalized_values_json or [])
+        item_ids = c.item_ids_json or []
+        all_item_ids.update(item_ids)
+        union_values.update(vals)
+        variant_sets.append(vals)
+        variant_item_counts.append(c.item_count)
+        variant_values_sorted.append(sorted(vals))
+
+    sorted_union = sorted(union_values)
+
+    # --- Merge Options (lightweight — just set math) ---
+    # 1. Full Union
+    full_union_noise = 0
+    full_union_max = 0
+    for i, vs in enumerate(variant_sets):
+        extra = len(union_values) - len(vs)
+        full_union_noise += extra * variant_item_counts[i]
+        full_union_max = max(full_union_max, extra)
+
+    # 2. Subset Merge
+    remaining = list(range(len(variant_sets)))
+    canonical_groups: List[List[int]] = []
+    while remaining:
+        best_idx = max(remaining, key=lambda i: len(variant_sets[i]))
+        best_set = variant_sets[best_idx]
+        group = [best_idx]
+        new_remaining = []
+        for idx in remaining:
+            if idx == best_idx:
+                continue
+            if variant_sets[idx] <= best_set:
+                group.append(idx)
+            else:
+                new_remaining.append(idx)
+        canonical_groups.append(group)
+        remaining = new_remaining
+
+    subset_canonical_lists = []
+    subset_noise = 0
+    subset_max_noise = 0
+    for group in canonical_groups:
+        canon_vals = sorted(set().union(*(variant_sets[i] for i in group)))
+        subset_canonical_lists.append(canon_vals)
+        for i in group:
+            extra = len(canon_vals) - len(variant_sets[i])
+            subset_noise += extra * variant_item_counts[i]
+            subset_max_noise = max(subset_max_noise, extra)
+
+    merge_options = [
+        {
+            "label": "Full Union",
+            "canonicalValues": [sorted_union],
+            "listsNeeded": 1,
+            "totalNoise": full_union_noise,
+            "maxNoisePerItem": full_union_max,
+        },
+        {
+            "label": "Subset Merge",
+            "canonicalValues": subset_canonical_lists,
+            "listsNeeded": len(canonical_groups),
+            "totalNoise": subset_noise,
+            "maxNoisePerItem": subset_max_noise,
+        },
+        {
+            "label": "No Merge",
+            "canonicalValues": variant_values_sorted,
+            "listsNeeded": len(variant_sets),
+            "totalNoise": 0,
+            "maxNoisePerItem": 0,
+        },
+    ]
+
+    return {
+        "featureId": feature_id,
+        "description": description,
+        "totalVariants": len(variant_sets),
+        "totalItems": len(all_item_ids),
+        "unionValues": sorted_union,
+        "variants": [],
+        "mergeOptions": merge_options,
+        "crossFeatureMatches": [],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Consolidation plan: per-feature background computation
+# ---------------------------------------------------------------------------
+
+_consolidation_lock = asyncio.Lock()
+
+
+def _compute_consolidation_plan(feature_id: str, strategy: str, username: str):
+    """Synchronous worker: compute consolidation for one feature and save to DB."""
+    db = SessionLocal()
+
+    def _safe_commit(session, max_retries: int = 5):
+        for attempt in range(1, max_retries + 1):
+            try:
+                session.commit()
+                return
+            except OperationalError as exc:
+                session.rollback()
+                if "database is locked" not in str(exc).lower() or attempt >= max_retries:
+                    raise
+                time.sleep(0.25 * attempt)
+
+    try:
+        combos = (
+            db.query(models.FeatureCombination)
+            .filter(models.FeatureCombination.feature_id == feature_id)
+            .order_by(models.FeatureCombination.item_count.desc())
+            .all()
+        )
+        if not combos:
+            plan = db.query(models.ConsolidationPlan).filter(
+                models.ConsolidationPlan.feature_id == feature_id
+            ).first()
+            if plan:
+                plan.status = "failed"
+                plan.error_message = "no combinations found"
+                plan.updated_at = time.time()
+                _safe_commit(db)
+            return
+
+        # Build variants
+        variants = []
+        for c in combos:
+            vals = set(c.normalized_values_json or [])
+            item_ids = c.item_ids_json or []
+            variants.append({
+                "comboId": c.id,
+                "values_set": vals,
+                "item_ids": item_ids,
+                "item_count": c.item_count,
+            })
+
+        # Compute groups based on strategy
+        if strategy == "full_union":
+            # Single group containing all variants
+            canonical_groups = [list(range(len(variants)))]
+        elif strategy == "no_merge":
+            # Each variant is its own group
+            canonical_groups = [[i] for i in range(len(variants))]
+        else:
+            # subset_merge: greedy — largest absorbs strict subsets
+            remaining = list(range(len(variants)))
+            canonical_groups = []
+            while remaining:
+                best_idx = max(remaining, key=lambda i: len(variants[i]["values_set"]))
+                best_set = variants[best_idx]["values_set"]
+                group = [best_idx]
+                new_remaining = []
+                for idx in remaining:
+                    if idx == best_idx:
+                        continue
+                    if variants[idx]["values_set"] <= best_set:
+                        group.append(idx)
+                    else:
+                        new_remaining.append(idx)
+                canonical_groups.append(group)
+                remaining = new_remaining
+
+        # Build result with item details per list
+        total_noise = 0
+        max_noise_per_item = 0
+        lists_result: List[Dict[str, Any]] = []
+        canonical_lists: List[List[str]] = []
+        item_assignments: List[List[str]] = []
+
+        for gi, group in enumerate(canonical_groups):
+            if strategy == "full_union":
+                canon_vals = sorted(set().union(*(variants[i]["values_set"] for i in group)))
+            elif strategy == "no_merge":
+                canon_vals = sorted(variants[group[0]]["values_set"])
+            else:
+                canon_vals = sorted(set().union(*(variants[i]["values_set"] for i in group)))
+
+            # Gather all item_ids across this group
+            group_item_ids: List[str] = []
+            for i in group:
+                group_item_ids.extend(variants[i]["item_ids"])
+            # Dedup while preserving order
+            seen: Set[str] = set()
+            unique_item_ids: List[str] = []
+            for iid in group_item_ids:
+                if iid not in seen:
+                    seen.add(iid)
+                    unique_item_ids.append(iid)
+
+            # Compute noise per group
+            for i in group:
+                extra = len(canon_vals) - len(variants[i]["values_set"])
+                total_noise += extra * variants[i]["item_count"]
+                max_noise_per_item = max(max_noise_per_item, extra)
+
+            # Fetch item details (cap at 200 per list for performance)
+            item_details: List[Dict[str, Any]] = []
+            fetch_ids = unique_item_ids[:200]
+            if fetch_ids:
+                item_rows = (
+                    db.query(models.BomItem)
+                    .filter(models.BomItem.item_id.in_(fetch_ids))
+                    .all()
+                )
+                item_map = {it.item_id: it for it in item_rows}
+                for iid in fetch_ids:
+                    it = item_map.get(iid)
+                    if it:
+                        item_details.append({
+                            "itemId": it.item_id,
+                            "description": it.description or "",
+                            "category": it.category or "",
+                            "priority": it.priority,
+                            "productType": it.product_type or "",
+                        })
+
+            # Build variant details for this group
+            group_variants = []
+            for i in group:
+                group_variants.append({
+                    "comboId": variants[i]["comboId"],
+                    "values": sorted(variants[i]["values_set"]),
+                    "itemCount": variants[i]["item_count"],
+                })
+
+            canonical_lists.append(canon_vals)
+            item_assignments.append(unique_item_ids)
+            lists_result.append({
+                "index": gi,
+                "values": canon_vals,
+                "itemCount": len(unique_item_ids),
+                "items": item_details,
+                "totalItemIds": unique_item_ids,
+                "variants": group_variants,
+            })
+
+        # Upsert the plan
+        now = time.time()
+        plan = db.query(models.ConsolidationPlan).filter(
+            models.ConsolidationPlan.feature_id == feature_id
+        ).first()
+        if plan:
+            plan.strategy = strategy
+            plan.status = "completed"
+            plan.lists_needed = len(canonical_groups)
+            plan.canonical_lists_json = canonical_lists
+            plan.item_assignments_json = item_assignments
+            plan.details_json = lists_result
+            plan.total_noise = total_noise
+            plan.max_noise_per_item = max_noise_per_item
+            plan.error_message = None
+            plan.updated_by = username
+            plan.updated_at = now
+        else:
+            plan = models.ConsolidationPlan(
+                feature_id=feature_id,
+                strategy=strategy,
+                status="completed",
+                lists_needed=len(canonical_groups),
+                canonical_lists_json=canonical_lists,
+                item_assignments_json=item_assignments,
+                details_json=lists_result,
+                total_noise=total_noise,
+                max_noise_per_item=max_noise_per_item,
+                created_by=username,
+                created_at=now,
+            )
+            db.add(plan)
+        _safe_commit(db)
+
+    except Exception as exc:
+        logger.exception("consolidation compute failed for feature_id=%s: %s", feature_id, exc)
+        db.rollback()
+        try:
+            fail_db = SessionLocal()
+            plan = fail_db.query(models.ConsolidationPlan).filter(
+                models.ConsolidationPlan.feature_id == feature_id
+            ).first()
+            if plan:
+                plan.status = "failed"
+                plan.error_message = str(exc)[:500]
+                plan.updated_at = time.time()
+                fail_db.commit()
+            fail_db.close()
+        except Exception:
+            pass
+    finally:
+        db.close()
+
+
+async def _run_consolidation_async(feature_id: str, strategy: str, username: str):
+    async with _consolidation_lock:
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, _compute_consolidation_plan, feature_id, strategy, username)
+
+
+@router.post("/feature-combinations/consolidation-plans/compute")
+def trigger_consolidation_compute(
+    body: Dict[str, Any] = Body(...),
+    background_tasks: BackgroundTasks = BackgroundTasks(),
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """Trigger background computation of a consolidation plan for a single feature."""
+    feature_id = body.get("featureId")
+    strategy = body.get("strategy", "subset_merge")
+
+    if not feature_id:
+        raise HTTPException(status_code=400, detail="featureId is required")
+    if strategy not in ("full_union", "subset_merge", "no_merge"):
+        raise HTTPException(status_code=400, detail="strategy must be full_union, subset_merge, or no_merge")
+
+    now = time.time()
+    # Upsert a "computing" placeholder
+    existing = (
+        db.query(models.ConsolidationPlan)
+        .filter(models.ConsolidationPlan.feature_id == feature_id)
+        .first()
+    )
+    if existing:
+        existing.strategy = strategy
+        existing.status = "computing"
+        existing.error_message = None
+        existing.updated_by = current_user.username
+        existing.updated_at = now
+    else:
+        existing = models.ConsolidationPlan(
+            feature_id=feature_id,
+            strategy=strategy,
+            status="computing",
+            lists_needed=0,
+            canonical_lists_json=[],
+            item_assignments_json=[],
+            total_noise=0,
+            max_noise_per_item=0,
+            created_by=current_user.username,
+            created_at=now,
+        )
+        db.add(existing)
+    db.commit()
+    db.refresh(existing)
+
+    background_tasks.add_task(_run_consolidation_async, feature_id, strategy, current_user.username)
+
+    return {
+        "featureId": feature_id,
+        "strategy": strategy,
+        "status": "computing",
+    }
+
+
+@router.get("/feature-combinations/consolidation-plans/by-feature")
+def get_consolidation_plan_by_feature(
+    feature_id: str = Query(..., alias="featureId"),
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """Return the saved consolidation plan for a feature_id, including full details."""
+    plan = (
+        db.query(models.ConsolidationPlan)
+        .filter(models.ConsolidationPlan.feature_id == feature_id)
+        .first()
+    )
+    if not plan:
+        raise HTTPException(status_code=404, detail="no plan found for this feature")
+
+    return {
+        "featureId": plan.feature_id,
+        "strategy": plan.strategy,
+        "status": plan.status,
+        "listsNeeded": plan.lists_needed,
+        "totalNoise": plan.total_noise,
+        "maxNoisePerItem": plan.max_noise_per_item,
+        "applied": plan.status == "completed",
+        "appliedAt": plan.updated_at or plan.created_at,
+        "appliedBy": plan.updated_by or plan.created_by,
+        "errorMessage": plan.error_message,
+        "lists": plan.details_json or [],
+    }
+
+
+@router.get("/feature-combinations/consolidation-plans")
+def list_consolidation_plans(
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """List all saved consolidation plans."""
+    plans = db.query(models.ConsolidationPlan).order_by(models.ConsolidationPlan.feature_id).all()
+    return {
+        "plans": [
+            {
+                "id": p.id,
+                "featureId": p.feature_id,
+                "strategy": p.strategy,
+                "status": p.status,
+                "listsNeeded": p.lists_needed,
+                "totalNoise": p.total_noise,
+                "maxNoisePerItem": p.max_noise_per_item,
+                "createdBy": p.created_by,
+                "createdAt": p.created_at,
+                "updatedBy": p.updated_by,
+                "updatedAt": p.updated_at,
+            }
+            for p in plans
         ]
     }
 
@@ -1305,6 +1986,7 @@ def get_workspace_mappings_for_item(
             "condition": (row.condition or "").strip() or None,
             "formula": (row.formula or "").strip() or None,
             "mappedFrom": source,
+            "valueStatus": row.value_status,
             "signedOnByUserId": row.signed_on_by_user_id,
             "signedOnByUsername": row.signed_on_by_username,
             "signedOnAt": row.signed_on_at,
@@ -1329,6 +2011,22 @@ def _regenerate_item_from_global(item_id: str, user_id: str, username: str, db: 
         return {"ok": True, "rowsDeleted": deleted, "rowsGenerated": 0}
 
     mapping_by_feature = _build_latest_mapping_by_feature(db.query(models.GlobalMapping).all())
+
+    # Build exclusion indexes
+    _gm_status_by_feature: Dict[str, str] = {}
+    _gm_ignored_values_by_feature: Dict[str, Set[str]] = {}
+    for gm in db.query(models.GlobalMapping).all():
+        gm_status = (getattr(gm, "status", "active") or "active").strip().lower()
+        gm_ignored = set(getattr(gm, "ignored_values", []) or [])
+        for fid in (getattr(gm, "legacy_feature_ids", []) or []):
+            nfid = str(fid or "").strip()
+            if not nfid:
+                continue
+            if gm_status != "active":
+                _gm_status_by_feature[nfid] = gm_status
+            if gm_ignored:
+                _gm_ignored_values_by_feature.setdefault(nfid, set()).update(gm_ignored)
+
     features = db.query(models.BomFeature).filter(models.BomFeature.item_id == bom_item.id).all()
 
     signed_ts = time.time()
@@ -1342,9 +2040,14 @@ def _regenerate_item_from_global(item_id: str, user_id: str, username: str, db: 
         feat_formula = (getattr(feat, "formula", "") or "").strip() or None
         value_mappings = getattr(mapping, "value_mappings", {}) if mapping else {}
 
+        feature_gm_status = _gm_status_by_feature.get(feat_feature_id)
+        feature_ignored_values = _gm_ignored_values_by_feature.get(feat_feature_id, set())
+
         raw_values = getattr(feat, "values", []) or []
+        till_dates: Dict[str, str] = {}
         if isinstance(raw_values, dict):
             values = [str(v) for v in (raw_values.get("values") or [])]
+            till_dates = raw_values.get("valueTillDates", {}) or {}
         elif isinstance(raw_values, list):
             values = [str(v) for v in raw_values]
         else:
@@ -1361,6 +2064,7 @@ def _regenerate_item_from_global(item_id: str, user_id: str, username: str, db: 
                 condition=feat_condition,
                 formula=feat_formula,
                 mapped_from="global",
+                value_status=feature_gm_status,
                 signed_on_by_user_id=user_id,
                 signed_on_by_username=username,
                 signed_on_at=signed_ts,
@@ -1373,26 +2077,59 @@ def _regenerate_item_from_global(item_id: str, user_id: str, username: str, db: 
             generated += 1
         else:
             for legacy_value in values:
-                resolved = _resolve_value_mapping(value_mappings, legacy_value)
-                db.add(models.WorkspaceMapping(
-                    legacy_item_id=item_id,
-                    legacy_feature_id=feat_feature_id,
-                    legacy_value=str(legacy_value),
-                    new_attribute_id=target_attr,
-                    new_value=(resolved or ""),
-                    attribute_type=attr_type,
-                    condition=feat_condition,
-                    formula=feat_formula,
-                    mapped_from="global" if resolved else "",
-                    signed_on_by_user_id=user_id,
-                    signed_on_by_username=username,
-                    signed_on_at=signed_ts,
-                    updated_at=time.time(),
-                    version=1,
-                    created_by=user_id,
-                    modified_by=user_id,
-                    modified_at=time.time(),
-                ))
+                val_status = None
+                if feature_gm_status:
+                    val_status = feature_gm_status
+                elif legacy_value in feature_ignored_values:
+                    val_status = "ignored"
+                else:
+                    td_str = till_dates.get(legacy_value)
+                    if td_str and str(td_str).strip():
+                        val_status = "discontinued"
+
+                if val_status:
+                    db.add(models.WorkspaceMapping(
+                        legacy_item_id=item_id,
+                        legacy_feature_id=feat_feature_id,
+                        legacy_value=str(legacy_value),
+                        new_attribute_id=target_attr,
+                        new_value="NOT REQUIRED",
+                        attribute_type=attr_type,
+                        condition=feat_condition,
+                        formula=feat_formula,
+                        mapped_from="global",
+                        value_status=val_status,
+                        signed_on_by_user_id=user_id,
+                        signed_on_by_username=username,
+                        signed_on_at=signed_ts,
+                        updated_at=time.time(),
+                        version=1,
+                        created_by=user_id,
+                        modified_by=user_id,
+                        modified_at=time.time(),
+                    ))
+                else:
+                    resolved = _resolve_value_mapping(value_mappings, legacy_value)
+                    db.add(models.WorkspaceMapping(
+                        legacy_item_id=item_id,
+                        legacy_feature_id=feat_feature_id,
+                        legacy_value=str(legacy_value),
+                        new_attribute_id=target_attr,
+                        new_value=(resolved or ""),
+                        attribute_type=attr_type,
+                        condition=feat_condition,
+                        formula=feat_formula,
+                        mapped_from="global" if resolved else "",
+                        value_status=None,
+                        signed_on_by_user_id=user_id,
+                        signed_on_by_username=username,
+                        signed_on_at=signed_ts,
+                        updated_at=time.time(),
+                        version=1,
+                        created_by=user_id,
+                        modified_by=user_id,
+                        modified_at=time.time(),
+                    ))
                 generated += 1
 
     db.commit()
@@ -1671,6 +2408,8 @@ def get_state(
                 "newAttributeId": getattr(m, "new_attribute_id", ""),
                 "attributeType": getattr(m, "attribute_type", "") or "",
                 "valueMappings": getattr(m, "value_mappings", {}) or {},
+                "status": getattr(m, "status", "active") or "active",
+                "ignoredValues": getattr(m, "ignored_values", []) or [],
             }
         )
     state["mappings"] = mappings_payload
@@ -1730,10 +2469,19 @@ def _get_unmapped_item_ids(db: Session) -> Set[str]:
     WM = models.WorkspaceMapping
     has_empty_val = func.sum(
         case(
+            # Rows with value_status set are resolved (excluded) — not empty
+            (WM.value_status.isnot(None), 0),
             (func.trim(func.coalesce(WM.new_value, literal_column("''"))) == literal_column("''"), 1),
             else_=0,
         )
     ).label("empty_count")
+
+    status_excluded_count = func.sum(
+        case(
+            (WM.value_status.isnot(None), 1),
+            else_=0,
+        )
+    ).label("status_excluded_count")
 
     feature_q = (
         db.query(
@@ -1742,6 +2490,7 @@ def _get_unmapped_item_ids(db: Session) -> Set[str]:
             func.max(WM.new_attribute_id).label("new_attribute_id"),
             func.max(WM.attribute_type).label("attribute_type"),
             has_empty_val,
+            status_excluded_count,
         )
         .group_by(WM.legacy_item_id, WM.legacy_feature_id)
         .all()
@@ -1760,6 +2509,7 @@ def _get_unmapped_item_ids(db: Session) -> Set[str]:
         if target == "NOT REQUIRED":
             stats["not_required"] += 1
         elif target and target != "UNMAPPED":
+            # A feature is mapped when all active (non-excluded) values have a new_value
             if row.empty_count == 0:
                 stats["mapped"] += 1
 
@@ -2207,11 +2957,13 @@ async def sync_state(payload: StateIn, db: Session = Depends(get_db), current_us
 
                     raw_values = feat.get("values") or []
                     value_descriptions = feat.get("valueDescriptions") or {}
+                    value_till_dates = feat.get("valueTillDates") or {}
 
-                    if value_descriptions:
+                    if value_descriptions or value_till_dates:
                         composite_values: Any = {
                             "values": raw_values,
                             "valueDescriptions": value_descriptions,
+                            "valueTillDates": value_till_dates,
                         }
                     else:
                         composite_values = raw_values
@@ -2315,6 +3067,8 @@ async def sync_state(payload: StateIn, db: Session = Depends(get_db), current_us
                         "new_attribute_id": str(m.get("newAttributeId") or "").strip(),
                         "attribute_type": str(m.get("attributeType") or "").strip().lower(),
                         "value_mappings": _normalize_value_mappings(m.get("valueMappings") or {}),
+                        "status": str(m.get("status") or "active").strip().lower(),
+                        "ignored_values": list(m.get("ignoredValues") or []),
                         "version": int(m.get("version") or 1),
                         "created_by": m.get("createdBy") or current_user_id,
                         "modified_at": m.get("modifiedAt"),
@@ -2363,6 +3117,8 @@ async def sync_state(payload: StateIn, db: Session = Depends(get_db), current_us
                             new_attribute_id=row["new_attribute_id"],
                             attribute_type=row["attribute_type"],
                             value_mappings=row["value_mappings"],
+                            status=row.get("status") or "active",
+                            ignored_values=row.get("ignored_values") or [],
                             version=max(int(row.get("version") or 1), 1),
                             created_by=row.get("created_by") or current_user_id,
                             modified_by=current_user_id,
@@ -2386,6 +3142,8 @@ async def sync_state(payload: StateIn, db: Session = Depends(get_db), current_us
                     existing_row.new_attribute_id = row["new_attribute_id"]
                     existing_row.attribute_type = row["attribute_type"]
                     existing_row.value_mappings = row["value_mappings"]
+                    existing_row.status = row.get("status") or "active"
+                    existing_row.ignored_values = row.get("ignored_values") or []
                     existing_row.version = max(existing_version + 1, int(row.get("version") or existing_version))
                     existing_row.modified_by = current_user_id
                     existing_row.modified_at = now_ts
@@ -2771,7 +3529,8 @@ def get_dashboard_metrics(
             COALESCE(wm.attribute_type, '') AS attribute_type,
             COALESCE(wm.new_attribute_id, '') AS new_attribute_id,
             COUNT(*) AS total_values,
-            SUM(CASE WHEN wm.new_value IS NOT NULL AND wm.new_value != '' THEN 1 ELSE 0 END) AS mapped_values
+            SUM(CASE WHEN wm.new_value IS NOT NULL AND wm.new_value != '' THEN 1 ELSE 0 END) AS mapped_values,
+            SUM(CASE WHEN wm.value_status IS NOT NULL AND wm.value_status != '' THEN 1 ELSE 0 END) AS status_excluded_values
         FROM workspace_mappings wm
         INNER JOIN bom_items bi ON bi.item_id = wm.legacy_item_id
         WHERE {filter_clause}
@@ -2803,7 +3562,12 @@ def get_dashboard_metrics(
         new_attr = (row.new_attribute_id or "").strip().upper()
         num_values = int(row.total_values)
         num_mapped = int(row.mapped_values)
+        num_status_excluded = int(row.status_excluded_values)
         is_excluded = bool(included_type_set and attr_type and attr_type not in included_type_set)
+
+        # Effective values = total minus those with a value_status set
+        effective_values = num_values - num_status_excluded
+        effective_mapped = min(num_mapped, effective_values)
 
         stats["total"] += 1
         total_features += 1
@@ -2822,14 +3586,14 @@ def get_dashboard_metrics(
         if new_attr == "NOT REQUIRED":
             stats["not_required"] += 1
             not_required_features += 1
-        elif new_attr and new_attr != "UNMAPPED" and (num_values == 0 or num_mapped >= num_values):
+        elif new_attr and new_attr != "UNMAPPED" and (effective_values == 0 or effective_mapped >= effective_values):
             stats["mapped"] += 1
             mapped_features += 1
 
-        stats["total_vals"] += num_values
-        total_values += num_values
-        stats["mapped_vals"] += num_mapped
-        mapped_values += num_mapped
+        stats["total_vals"] += effective_values
+        total_values += effective_values
+        stats["mapped_vals"] += effective_mapped
+        mapped_values += effective_mapped
 
     items_fully_mapped = 0
     item_rows: List[Dict[str, Any]] = []
@@ -2922,6 +3686,8 @@ def get_item_statuses(db: Session = Depends(get_db)):
         WM = models.WorkspaceMapping
         has_empty_val = func.sum(
                 case(
+                        # Rows with value_status set are resolved — not empty
+                        (WM.value_status.isnot(None), 0),
                         (func.trim(func.coalesce(WM.new_value, literal_column("''"))) == literal_column("''"), 1),
                         else_=0,
                 )
@@ -3353,6 +4119,8 @@ def global_mappings_by_features(
                     "newAttributeId": getattr(m, "new_attribute_id", ""),
                     "attributeType": getattr(m, "attribute_type", "") or "",
                     "valueMappings": getattr(m, "value_mappings", {}) or {},
+                    "status": getattr(m, "status", "active") or "active",
+                    "ignoredValues": getattr(m, "ignored_values", []) or [],
                     "version": getattr(m, "version", 1),
                 })
 
@@ -3394,6 +4162,8 @@ def list_global_mappings(
             "newAttributeId": getattr(m, "new_attribute_id", ""),
             "attributeType": getattr(m, "attribute_type", "") or "",
             "valueMappings": getattr(m, "value_mappings", {}) or {},
+            "status": getattr(m, "status", "active") or "active",
+            "ignoredValues": getattr(m, "ignored_values", []) or [],
             "version": getattr(m, "version", 1),
             "createdBy": getattr(m, "created_by", None),
             "modifiedBy": getattr(m, "modified_by", None),
@@ -3662,6 +4432,8 @@ def upsert_global_mapping(
     new_attribute_id = str(payload.get("newAttributeId") or "").strip()
     attribute_type = str(payload.get("attributeType") or "").strip().lower()
     value_mappings = _normalize_value_mappings(payload.get("valueMappings") or {})
+    gm_status = str(payload.get("status") or "active").strip().lower()
+    gm_ignored_values = list(payload.get("ignoredValues") or [])
     original_legacy_feature_ids = _normalize_legacy_feature_ids(payload.get("_originalLegacyFeatureIds") or [])
     original_new_attribute_id = str(payload.get("_originalNewAttributeId") or "").strip()
     current_user_id = f"USR-{current_user.id}"
@@ -3703,6 +4475,8 @@ def upsert_global_mapping(
             new_attribute_id=new_attribute_id,
             attribute_type=attribute_type,
             value_mappings=value_mappings,
+            status=gm_status,
+            ignored_values=gm_ignored_values,
             version=1,
             created_by=current_user_id,
             modified_by=current_user_id,
@@ -3717,12 +4491,14 @@ def upsert_global_mapping(
             new_attribute_id,
             attribute_type,
             value_mappings,
-        ):
+        ) or (getattr(row, "status", "active") or "active") != gm_status or list(getattr(row, "ignored_values", []) or []) != gm_ignored_values:
             existing_version = int(getattr(row, "version", 1) or 1)
             row.legacy_feature_ids = legacy_feature_ids
             row.new_attribute_id = new_attribute_id
             row.attribute_type = attribute_type
             row.value_mappings = value_mappings
+            row.status = gm_status
+            row.ignored_values = gm_ignored_values
             row.version = existing_version + 1
             row.modified_by = current_user_id
             row.modified_at = now_ts
@@ -3743,6 +4519,8 @@ def upsert_global_mapping(
             "newAttributeId": getattr(row, "new_attribute_id", "") or "",
             "attributeType": getattr(row, "attribute_type", "") or "",
             "valueMappings": getattr(row, "value_mappings", {}) or {},
+            "status": getattr(row, "status", "active") or "active",
+            "ignoredValues": getattr(row, "ignored_values", []) or [],
             "version": getattr(row, "version", 1),
             "createdBy": getattr(row, "created_by", None),
             "modifiedBy": getattr(row, "modified_by", None),

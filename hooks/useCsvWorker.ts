@@ -1,5 +1,5 @@
 import { useRef, useCallback } from 'react';
-import type { CsvWorkerRequest, CsvWorkerResponse } from '../workers/csvWorker';
+import type { CsvWorkerRequest, CsvWorkerResponse, MergeGroupFeaturesInput, MergedBomItem } from '../workers/csvWorker';
 
 let workerInstance: Worker | null = null;
 let pendingId = 0;
@@ -48,6 +48,20 @@ export function useCsvWorker() {
     }
   }, []);
 
+  /** Parse CSV/TSV with auto-detected delimiter (off main thread). */
+  const parseAutoAsync = useCallback(async (text: string): Promise<{ [key: string]: string }[]> => {
+    try {
+      const result = await postToWorker<CsvWorkerResponse & { type: 'parseAuto'; rows: any[] }>({
+        type: 'parseAuto',
+        text,
+      });
+      return result.rows;
+    } catch {
+      const { parseDelimited } = await import('../utils/csvHelpers');
+      return parseDelimited(text);
+    }
+  }, []);
+
   const buildCsvAsync = useCallback(async (rows: string[][]): Promise<string> => {
     try {
       const result = await postToWorker<CsvWorkerResponse & { type: 'build'; csv: string }>({
@@ -61,5 +75,13 @@ export function useCsvWorker() {
     }
   }, []);
 
-  return { parseCsvAsync, buildCsvAsync };
+  const mergeGroupFeaturesAsync = useCallback(async (input: MergeGroupFeaturesInput): Promise<{ items: MergedBomItem[]; stats: { totalItems: number; totalFeatures: number; groupFeaturesExpanded: number } }> => {
+    const result = await postToWorker<CsvWorkerResponse & { type: 'mergeGroupFeatures'; items: MergedBomItem[]; stats: any }>({
+      type: 'mergeGroupFeatures',
+      input,
+    });
+    return { items: result.items, stats: result.stats };
+  }, []);
+
+  return { parseCsvAsync, parseAutoAsync, buildCsvAsync, mergeGroupFeaturesAsync };
 }

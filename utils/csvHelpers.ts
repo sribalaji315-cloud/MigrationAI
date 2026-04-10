@@ -77,3 +77,54 @@ export const parseCsv = (text: string): { [key: string]: string }[] => {
 
   return rows;
 };
+
+/** Detect delimiter from the first line (supports comma, tab, semicolon). */
+export const detectDelimiter = (firstLine: string): string => {
+  const tabCount = (firstLine.match(/\t/g) || []).length;
+  const commaCount = (firstLine.match(/,/g) || []).length;
+  const semiCount = (firstLine.match(/;/g) || []).length;
+  if (tabCount >= commaCount && tabCount >= semiCount && tabCount > 0) return '\t';
+  if (semiCount > commaCount && semiCount > 0) return ';';
+  return ',';
+};
+
+/** Split a line by an arbitrary single-char delimiter, respecting quoted fields. */
+export const splitDelimitedLine = (line: string, delimiter: string): string[] => {
+  if (delimiter === ',' ) return splitCsvLine(line);
+  if (line.indexOf('"') === -1) return line.split(delimiter);
+  const result: string[] = [];
+  let current = '';
+  let inQuotes = false;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (ch === '"') {
+      if (inQuotes && line[i + 1] === '"') { current += '"'; i++; }
+      else inQuotes = !inQuotes;
+    } else if (ch === delimiter && !inQuotes) {
+      result.push(current);
+      current = '';
+    } else {
+      current += ch;
+    }
+  }
+  result.push(current);
+  return result;
+};
+
+/** Parse CSV/TSV text with auto-detected delimiter. */
+export const parseDelimited = (text: string): { [key: string]: string }[] => {
+  const rawLines = assembleLogicalLines(text);
+  if (!rawLines.length) return [];
+  const delimiter = detectDelimiter(rawLines[0]);
+
+  const headers = splitDelimitedLine(rawLines[0], delimiter).map(h => h.trim());
+  const rows: { [key: string]: string }[] = [];
+  for (let i = 1; i < rawLines.length; i++) {
+    const cols = splitDelimitedLine(rawLines[i], delimiter);
+    if (!cols.some(c => c.trim().length > 0)) continue;
+    const row: { [key: string]: string } = {};
+    headers.forEach((h, idx) => { row[h] = (cols[idx] ?? '').trim(); });
+    rows.push(row);
+  }
+  return rows;
+};
