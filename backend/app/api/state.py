@@ -5510,600 +5510,171 @@ def get_attribute_combination_items(
 
 
 # ---------------------------------------------------------------------------
-# Migration manifest (unified value-merge + attribute-merge view)
+# Migration manifest (live queries — no build step needed)
 # ---------------------------------------------------------------------------
 
-_migration_manifest_lock = asyncio.Lock()
 
-_manifest_cleanup_last_ts: float = 0.0
-_MANIFEST_CLEANUP_INTERVAL = 60.0  # only run stale-job cleanup once per 60 s
-
-
-def _cleanup_stale_manifest_jobs(db: Session, stale_after_seconds: float = GENERATION_STALE_TIMEOUT_SECONDS) -> int:
-    """Mark orphaned queued/running migration-manifest jobs as failed after heartbeat timeout.
-
-    Throttled to run at most once per _MANIFEST_CLEANUP_INTERVAL seconds so
-    that frequent poll requests don't add synchronous DB work on every call.
-    """
-    global _manifest_cleanup_last_ts
-    now_ts = time.time()
-    if now_ts - _manifest_cleanup_last_ts < _MANIFEST_CLEANUP_INTERVAL:
-        return 0
-    _manifest_cleanup_last_ts = now_ts
-
-    stale_cutoff = now_ts - stale_after_seconds
-    stale_jobs = (
-        db.query(models.MigrationManifestJob)
-        .filter(models.MigrationManifestJob.status.in_(["queued", "running"]))
-        .filter(models.MigrationManifestJob.updated_at < stale_cutoff)
-        .all()
-    )
-    if not stale_jobs:
-        return 0
-
-    for stale_job in stale_jobs:
-        stale_job.status = "failed"
-        stale_job.error_message = "Migration manifest worker heartbeat timed out"
-        stale_job.finished_at = now_ts
-        stale_job.updated_at = now_ts
-
-    db.commit()
-    return len(stale_jobs)
+# ---------------------------------------------------------------------------
+# Shared helpers for live manifest queries
+# ---------------------------------------------------------------------------
 
 
-def _manifest_default_value(attribute_type: Optional[str]) -> str:
-    lower = str(attribute_type or "").strip().lower()
-    numeric_tokens = (
-        "int",
-        "integer",
-        "decimal",
-        "double",
-        "float",
-        "number",
-        "numeric",
-        "qty",
-        "quantity",
-        "count",
-        "length",
-        "width",
-        "height",
-        "diameter",
-        "measure",
-        "ratio",
-    )
-    return "0" if any(token in lower for token in numeric_tokens) else "NA"
+def _build_ac_item_count_map(db: Session) -> Dict[str, int]:
+    """Build item_id → item_count from the pre-computed attribute_combinations table."""
+    result: Dict[str, int] = {}
+    for ac in db.query(models.AttributeCombination).all():
+        count = ac.item_count or 1
+        for iid in (ac.item_ids_json or []):
+            result[iid] = count
+    return result
 
 
-def _serialize_manifest_entry(entry: models.MigrationManifestEntry) -> Dict[str, Any]:
-    return {
-        "id": entry.id,
-        "itemId": entry.item_id,
-        "itemDescription": entry.item_description or "",
-        "itemCategory": entry.item_category or "",
-        "itemProductType": entry.item_product_type or "",
-        "itemPriority": entry.item_priority,
-        "legacyFeatureId": entry.legacy_feature_id,
-        "targetAttributeId": entry.target_attribute_id or "",
-        "attributeType": entry.attribute_type or "",
-        "source": entry.source or "original",
-        "isNoise": bool(entry.is_noise),
-        "noiseType": entry.noise_type or "",
-        "originalValues": entry.original_values_json or [],
-        "targetValues": entry.target_values_json or [],
-        "noiseValues": entry.noise_values_json or [],
-        "hasMapping": bool(entry.has_mapping),
-        "isAccepted": bool(getattr(entry, "is_accepted", 0)),
-        "acceptedAt": getattr(entry, "accepted_at", None),
-        "acceptedBy": getattr(entry, "accepted_by_username", None),
-        "builtAt": entry.built_at,
-    }
-
-
-def _manifest_entry_signature(
-    item_id: str,
-    legacy_feature_id: str,
-    target_attribute_id: Optional[str],
-    attribute_type: Optional[str],
-    source: str,
-    noise_type: Optional[str],
-    original_values: Optional[List[str]],
-    target_values: Optional[List[str]],
-    noise_values: Optional[List[str]],
-) -> str:
-    payload = {
-        "itemId": str(item_id or "").strip(),
-        "legacyFeatureId": str(legacy_feature_id or "").strip(),
-        "targetAttributeId": str(target_attribute_id or "").strip(),
-        "attributeType": str(attribute_type or "").strip(),
-        "source": str(source or "").strip(),
-        "noiseType": str(noise_type or "").strip(),
-        "originalValues": list(original_values or []),
-        "targetValues": list(target_values or []),
-        "noiseValues": list(noise_values or []),
-    }
-    return json.dumps(payload, sort_keys=True, separators=(",", ":"))
-
-
-def _run_migration_manifest_job(job_id: int):
-    """Build the unified migration manifest from BOM, mappings, value merges, and attribute merges.
-
-    Uses a single DB session to avoid SQLite write-lock contention between two
-    connections, and yields the GIL between heavy phases so other asyncio tasks
-    and API request threads are not starved.
-    """
-    db = SessionLocal()
-
-    def _safe_commit(max_retries: int = 5):
-        for attempt in range(1, max_retries + 1):
-            try:
-                db.commit()
-                return
-            except OperationalError as exc:
-                db.rollback()
-                if "database is locked" not in str(exc).lower() or attempt >= max_retries:
-                    raise
-                time.sleep(0.25 * attempt)
-
-    try:
-        job = db.query(models.MigrationManifestJob).filter(models.MigrationManifestJob.id == job_id).first()
-        if not job or job.status not in ("queued", "running"):
-            return
-
-        job.status = "running"
-        job.started_at = time.time()
-        job.updated_at = job.started_at
-        _safe_commit()
-
-        total_item_count = db.query(models.BomItem).count()
-        job.total_items = total_item_count
-        job.updated_at = time.time()
-        _safe_commit()
-
-        # Yield to other threads between heavy phases
-        time.sleep(0)
-
-        # Load BOM items in chunks to reduce memory pressure.
-        _BOM_CHUNK = 500
-        bom_items: list = []
-        for chunk_offset in range(0, total_item_count, _BOM_CHUNK):
-            chunk = (
-                db.query(models.BomItem)
-                .options(selectinload(models.BomItem.features))
-                .order_by(models.BomItem.item_id)
-                .offset(chunk_offset)
-                .limit(_BOM_CHUNK)
-                .all()
-            )
-            bom_items.extend(chunk)
-            db.expire_all()  # release ORM-held memory for already-processed rows
-
-        global_entries_by_feature: Dict[str, List[Dict[str, Any]]] = {}
-        attr_type_by_feature: Dict[str, str] = {}
-        for gm in db.query(models.GlobalMapping).all():
-            gm_status = (getattr(gm, "status", "active") or "active").strip().lower()
-            if gm_status in ("deprecated", "ignored"):
-                continue
-            attr = str(getattr(gm, "new_attribute_id", "") or "").strip()
-            attr_type = str(getattr(gm, "attribute_type", "") or "").strip()
-            value_mappings = dict(getattr(gm, "value_mappings", None) or {})
-            ignored_values = {
-                str(v or "").strip()
-                for v in (getattr(gm, "ignored_values", None) or [])
-                if str(v or "").strip()
-            }
-            for fid in (getattr(gm, "legacy_feature_ids", None) or []):
-                normalized_fid = str(fid or "").strip()
-                if not normalized_fid:
-                    continue
-                if attr_type and normalized_fid not in attr_type_by_feature:
-                    attr_type_by_feature[normalized_fid] = attr_type
-                if attr:
-                    global_entries_by_feature.setdefault(normalized_fid, []).append({
-                        "attr": attr,
-                        "vm": value_mappings,
-                        "ignored": ignored_values,
-                    })
-
-        workspace_by_key: Dict[tuple, Dict[str, str]] = {}
-        for wm in db.query(models.WorkspaceMapping).all():
-            key = (
-                str(wm.legacy_item_id or "").strip(),
-                str(wm.legacy_feature_id or "").strip(),
-                str(wm.legacy_value or "").strip(),
-            )
-            if not all(key):
-                continue
-            workspace_by_key[key] = {
-                "attr": str(wm.new_attribute_id or "").strip(),
-                "value": str(wm.new_value or "").strip(),
-            }
-
-        plan_by_feature: Dict[str, models.ConsolidationPlan] = {
-            plan.feature_id: plan
-            for plan in db.query(models.ConsolidationPlan)
-            .filter(models.ConsolidationPlan.status == "completed")
-            .all()
-            if str(plan.feature_id or "").strip()
+def _build_feature_target_map(db: Session) -> Dict[str, Dict[str, Any]]:
+    """Build feature_id → {attr, attrType, valueMappings, ignoredValues} from GlobalMapping."""
+    result: Dict[str, Dict[str, Any]] = {}
+    for gm in db.query(models.GlobalMapping).all():
+        gm_status = (getattr(gm, "status", "active") or "active").strip().lower()
+        if gm_status in ("deprecated", "ignored"):
+            continue
+        attr = str(getattr(gm, "new_attribute_id", "") or "").strip()
+        attr_type = str(getattr(gm, "attribute_type", "") or "").strip()
+        value_mappings = dict(getattr(gm, "value_mappings", None) or {})
+        ignored_values = {
+            str(v or "").strip()
+            for v in (getattr(gm, "ignored_values", None) or [])
+            if str(v or "").strip()
         }
+        for fid in (getattr(gm, "legacy_feature_ids", None) or []):
+            normalized_fid = str(fid or "").strip()
+            if not normalized_fid:
+                continue
+            if normalized_fid not in result:
+                result[normalized_fid] = {
+                    "attr": attr,
+                    "attrType": attr_type,
+                    "valueMappings": value_mappings,
+                    "ignoredValues": ignored_values,
+                }
+    return result
 
-        def _resolve_targets(item_id: str, feature_id: str, values: List[str]) -> Dict[str, Any]:
-            attrs: List[str] = []
-            seen_attrs: Set[str] = set()
-            target_values: List[str] = []
-            seen_target_values: Set[str] = set()
-            has_mapping = False
 
-            def _push_attr(attr_name: str):
-                if attr_name and attr_name not in seen_attrs:
-                    seen_attrs.add(attr_name)
-                    attrs.append(attr_name)
+def _build_workspace_overrides(db: Session, item_id: Optional[str] = None) -> Dict[tuple, Dict[str, str]]:
+    """Build (item_id, feature_id, value) → {attr, value} from WorkspaceMapping."""
+    q = db.query(models.WorkspaceMapping)
+    if item_id:
+        q = q.filter(models.WorkspaceMapping.legacy_item_id == item_id)
+    result: Dict[tuple, Dict[str, str]] = {}
+    for wm in q.all():
+        key = (
+            str(wm.legacy_item_id or "").strip(),
+            str(wm.legacy_feature_id or "").strip(),
+            str(wm.legacy_value or "").strip(),
+        )
+        if not all(key):
+            continue
+        result[key] = {
+            "attr": str(wm.new_attribute_id or "").strip(),
+            "value": str(wm.new_value or "").strip(),
+        }
+    return result
 
-            def _push_value(target_value: str):
-                if target_value and target_value not in seen_target_values:
-                    seen_target_values.add(target_value)
-                    target_values.append(target_value)
 
-            for entry in global_entries_by_feature.get(feature_id, []):
-                _push_attr(str(entry.get("attr") or "").strip())
+def _get_completed_consolidation_plans(db: Session) -> Dict[str, Any]:
+    """Build feature_id → ConsolidationPlan for completed plans."""
+    return {
+        str(plan.feature_id).strip(): plan
+        for plan in db.query(models.ConsolidationPlan)
+        .filter(models.ConsolidationPlan.status == "completed")
+        .all()
+        if str(plan.feature_id or "").strip()
+    }
 
-            for raw_value in values:
-                legacy_value = str(raw_value or "").strip()
-                if not legacy_value:
-                    continue
-                workspace = workspace_by_key.get((item_id, feature_id, legacy_value))
-                if workspace:
-                    _push_attr(workspace.get("attr", ""))
-                    _push_value(workspace.get("value", ""))
-                    has_mapping = True
-                    continue
 
-                for entry in global_entries_by_feature.get(feature_id, []):
-                    if legacy_value in entry.get("ignored", set()):
-                        continue
-                    mapped_value = entry.get("vm", {}).get(legacy_value)
-                    if mapped_value is not None and str(mapped_value).strip():
-                        _push_value(str(mapped_value).strip())
-                        has_mapping = True
+def _resolve_feature_targets(
+    item_id: str,
+    feature_id: str,
+    values: List[str],
+    feature_map: Dict[str, Dict[str, Any]],
+    workspace_overrides: Dict[tuple, Dict[str, str]],
+) -> Dict[str, Any]:
+    """Resolve target attribute/values for a feature — same logic as old manifest build."""
+    attrs: List[str] = []
+    seen_attrs: Set[str] = set()
+    target_values: List[str] = []
+    seen_target: Set[str] = set()
+    has_mapping = False
 
-            if not values and attrs:
+    fm = feature_map.get(feature_id)
+    if fm:
+        a = fm.get("attr", "")
+        if a and a not in seen_attrs:
+            seen_attrs.add(a)
+            attrs.append(a)
+
+    for raw_value in values:
+        lv = str(raw_value or "").strip()
+        if not lv:
+            continue
+        ws = workspace_overrides.get((item_id, feature_id, lv))
+        if ws:
+            a = ws.get("attr", "")
+            if a and a not in seen_attrs:
+                seen_attrs.add(a)
+                attrs.append(a)
+            v = ws.get("value", "")
+            if v and v not in seen_target:
+                seen_target.add(v)
+                target_values.append(v)
+            has_mapping = True
+            continue
+        if fm:
+            if lv in fm.get("ignoredValues", set()):
+                continue
+            mapped = fm.get("valueMappings", {}).get(lv)
+            if mapped is not None and str(mapped).strip():
+                tv = str(mapped).strip()
+                if tv not in seen_target:
+                    seen_target.add(tv)
+                    target_values.append(tv)
                 has_mapping = True
 
-            return {
-                "attrs": attrs,
-                "targetValues": sorted(target_values),
-                "hasMapping": has_mapping or bool(attrs),
-            }
-
-        accepted_entry_by_signature = {
-            _manifest_entry_signature(
-                entry.item_id,
-                entry.legacy_feature_id,
-                entry.target_attribute_id,
-                entry.attribute_type,
-                entry.source,
-                entry.noise_type,
-                entry.original_values_json,
-                entry.target_values_json,
-                entry.noise_values_json,
-            ): {
-                "is_accepted": int(getattr(entry, "is_accepted", 0) or 0),
-                "accepted_at": getattr(entry, "accepted_at", None),
-                "accepted_by_username": getattr(entry, "accepted_by_username", None),
-            }
-            for entry in db.query(models.MigrationManifestEntry).all()
-            if int(getattr(entry, "is_accepted", 0) or 0) == 1
-        }
-
-        def _make_manifest_row(
-            item: models.BomItem,
-            feature_id: str,
-            source: str,
-            original_values: Optional[List[str]],
-            target_attribute_ids: List[str],
-            target_values: Optional[List[str]],
-            noise_values: Optional[List[str]],
-            has_mapping: bool,
-            noise_type: Optional[str] = None,
-        ) -> Dict[str, Any]:
-            row = {
-                "item_id": item.item_id,
-                "item_description": item.description or "",
-                "item_category": item.category or "",
-                "item_product_type": item.product_type or "",
-                "item_priority": item.priority,
-                "legacy_feature_id": feature_id,
-                "target_attribute_id": "; ".join(target_attribute_ids) if target_attribute_ids else None,
-                "attribute_type": attr_type_by_feature.get(feature_id) or None,
-                "source": source,
-                "is_noise": 1 if source != "original" else 0,
-                "noise_type": noise_type,
-                "original_values_json": original_values or None,
-                "target_values_json": target_values or None,
-                "noise_values_json": noise_values or None,
-                "has_mapping": 1 if has_mapping else 0,
-                "is_accepted": 0,
-                "accepted_at": None,
-                "accepted_by_username": None,
-                "built_at": built_at,
-            }
-            signature = _manifest_entry_signature(
-                row["item_id"],
-                row["legacy_feature_id"],
-                row["target_attribute_id"],
-                row["attribute_type"],
-                row["source"],
-                row["noise_type"],
-                row["original_values_json"],
-                row["target_values_json"],
-                row["noise_values_json"],
-            )
-            preserved = accepted_entry_by_signature.get(signature)
-            if preserved:
-                row.update(preserved)
-            return row
-
-        item_by_id = {item.item_id: item for item in bom_items}
-
-        built_at = time.time()
-        rows: List[Dict[str, Any]] = []
-        item_feature_values: Dict[str, Dict[str, List[str]]] = {}
-        item_feature_sets: Dict[str, Set[str]] = {}
-        combo_groups: Dict[str, Dict[str, Any]] = {}
-        processed = 0
-
-        for item in bom_items:
-            feature_values_for_item: Dict[str, List[str]] = {}
-            feature_set_for_item: Set[str] = set()
-            for feature in item.features or []:
-                feature_id = str(feature.feature_id or "").strip()
-                if not feature_id:
-                    continue
-                normalized_values = _normalize_feature_values(getattr(feature, "values", None))
-                feature_values_for_item[feature_id] = normalized_values
-                feature_set_for_item.add(feature_id)
-
-                resolved = _resolve_targets(item.item_id, feature_id, normalized_values)
-                rows.append(_make_manifest_row(
-                    item=item,
-                    feature_id=feature_id,
-                    source="original",
-                    original_values=normalized_values,
-                    target_attribute_ids=resolved["attrs"],
-                    target_values=resolved["targetValues"],
-                    noise_values=None,
-                    has_mapping=resolved["hasMapping"],
-                ))
-
-            item_feature_values[item.item_id] = feature_values_for_item
-            item_feature_sets[item.item_id] = feature_set_for_item
-
-            key = "|".join(sorted(feature_set_for_item))
-            combo_groups.setdefault(key, {
-                "feature_set": set(feature_set_for_item),
-                "item_ids": [],
-            })["item_ids"].append(item.item_id)
-
-            processed += 1
-            if processed % 500 == 0:
-                job.processed_items = processed
-                job.generated_rows = len(rows)
-                job.updated_at = time.time()
-                _safe_commit()
-                time.sleep(0)  # yield to other threads
-
-        for feature_id, plan in plan_by_feature.items():
-            canonical_lists = plan.canonical_lists_json or []
-            item_assignments = plan.item_assignments_json or []
-            for idx, canonical_values in enumerate(canonical_lists):
-                canonical_sorted = sorted({str(v or "").strip() for v in (canonical_values or []) if str(v or "").strip()})
-                assigned_items = item_assignments[idx] if idx < len(item_assignments) else []
-                for item_id in assigned_items or []:
-                    current_values = item_feature_values.get(item_id, {}).get(feature_id, [])
-                    extra_values = sorted(set(canonical_sorted) - set(current_values))
-                    if not extra_values:
-                        continue
-                    item = item_by_id.get(item_id)
-                    if not item:
-                        continue
-                    resolved = _resolve_targets(item_id, feature_id, extra_values)
-                    rows.append(_make_manifest_row(
-                        item=item,
-                        feature_id=feature_id,
-                        source="value_merge",
-                        original_values=current_values,
-                        target_attribute_ids=resolved["attrs"],
-                        target_values=resolved["targetValues"],
-                        noise_values=extra_values,
-                        has_mapping=resolved["hasMapping"],
-                        noise_type="missing_value",
-                    ))
-
-        combo_variants = list(combo_groups.values())
-        remaining = list(range(len(combo_variants)))
-        canonical_attr_groups: List[Dict[str, Any]] = []
-        while remaining:
-            best_idx = max(remaining, key=lambda idx: len(combo_variants[idx]["feature_set"]))
-            best_set = combo_variants[best_idx]["feature_set"]
-            group_indices = [best_idx]
-            new_remaining: List[int] = []
-            for idx in remaining:
-                if idx == best_idx:
-                    continue
-                if combo_variants[idx]["feature_set"] <= best_set:
-                    group_indices.append(idx)
-                else:
-                    new_remaining.append(idx)
-            group_item_ids: List[str] = []
-            for idx in group_indices:
-                group_item_ids.extend(combo_variants[idx]["item_ids"])
-            canonical_attr_groups.append({
-                "feature_ids": sorted(best_set),
-                "item_ids": group_item_ids,
-            })
-            remaining = new_remaining
-
-        for group in canonical_attr_groups:
-            canonical_feature_ids = group["feature_ids"]
-            if not canonical_feature_ids:
-                continue
-            for item_id in group["item_ids"]:
-                item = item_by_id.get(item_id)
-                if not item:
-                    continue
-                current_feature_ids = item_feature_sets.get(item_id, set())
-                for feature_id in canonical_feature_ids:
-                    if feature_id in current_feature_ids:
-                        continue
-                    target_attrs = [
-                        str(entry.get("attr") or "").strip()
-                        for entry in global_entries_by_feature.get(feature_id, [])
-                        if str(entry.get("attr") or "").strip()
-                    ]
-                    default_value = _manifest_default_value(attr_type_by_feature.get(feature_id))
-                    rows.append(_make_manifest_row(
-                        item=item,
-                        feature_id=feature_id,
-                        source="attr_merge",
-                        original_values=None,
-                        target_attribute_ids=sorted(set(target_attrs)),
-                        target_values=[default_value] if target_attrs else None,
-                        noise_values=[default_value],
-                        has_mapping=bool(target_attrs),
-                        noise_type="missing_attribute",
-                    ))
-
-        # Delete old entries in one statement.  For SQLite this is faster than
-        # batched select-then-delete and holds the write lock only once.
-        db.query(models.MigrationManifestEntry).delete(synchronize_session=False)
-        _safe_commit()
-
-        # Insert new entries in batches so each transaction is short-lived.
-        BATCH_SIZE = 2000
-        if rows:
-            for i in range(0, len(rows), BATCH_SIZE):
-                db.bulk_insert_mappings(models.MigrationManifestEntry, rows[i : i + BATCH_SIZE])
-                job.generated_rows = min(i + BATCH_SIZE, len(rows))
-                job.updated_at = time.time()
-                _safe_commit()
-                time.sleep(0)  # yield to other threads
-
-        job.status = "completed"
-        job.processed_items = len(bom_items)
-        job.generated_rows = len(rows)
-        job.finished_at = time.time()
-        job.updated_at = job.finished_at
-        job.error_message = None
-        _safe_commit()
-
-        # Invalidate the filters cache so the next poll picks up fresh data.
-        global _manifest_filters_cache
-        _manifest_filters_cache = None
-
-    except Exception as exc:
-        db.rollback()
-        logger.exception("migration manifest job=%s failed: %s", job_id, exc)
-        fail_db = SessionLocal()
-        try:
-            failed_job = fail_db.query(models.MigrationManifestJob).filter(models.MigrationManifestJob.id == job_id).first()
-            if failed_job:
-                failed_job.status = "failed"
-                failed_job.error_message = str(exc)
-                failed_job.finished_at = time.time()
-                failed_job.updated_at = failed_job.finished_at
-                fail_db.commit()
-        except Exception:
-            fail_db.rollback()
-        finally:
-            fail_db.close()
-    finally:
-        db.close()
-
-
-async def _run_migration_manifest_async(job_id: int):
-    await asyncio.to_thread(_run_migration_manifest_job, job_id)
-
-
-@router.post("/migration-manifest/trigger")
-def trigger_migration_manifest_build(
-    background_tasks: BackgroundTasks,
-    db: Session = Depends(get_db),
-    current_user: models.User = Depends(get_current_user),
-):
-    """Trigger a background rebuild of the unified migration manifest."""
-    _cleanup_stale_manifest_jobs(db)
-    active_job = (
-        db.query(models.MigrationManifestJob)
-        .filter(models.MigrationManifestJob.status.in_(["queued", "running"]))
-        .order_by(models.MigrationManifestJob.updated_at.desc(), models.MigrationManifestJob.id.desc())
-        .first()
-    )
-    if active_job:
-        return {"ok": True, "jobId": int(active_job.id)}
-
-    now_ts = time.time()
-    job = models.MigrationManifestJob(
-        status="queued",
-        triggered_by_username=getattr(current_user, "username", None),
-        total_items=0,
-        processed_items=0,
-        generated_rows=0,
-        started_at=None,
-        finished_at=None,
-        updated_at=now_ts,
-        error_message=None,
-    )
-    db.add(job)
-    db.commit()
-    db.refresh(job)
-
-    background_tasks.add_task(_run_migration_manifest_async, int(job.id))
-    return {"ok": True, "jobId": int(job.id)}
-
-
-@router.get("/migration-manifest/progress")
-def get_migration_manifest_progress(
-    db: Session = Depends(get_db),
-    current_user: models.User = Depends(get_current_user),
-):
-    """Return the latest migration manifest job progress."""
-    _cleanup_stale_manifest_jobs(db)
-    job = (
-        db.query(models.MigrationManifestJob)
-        .order_by(models.MigrationManifestJob.updated_at.desc(), models.MigrationManifestJob.id.desc())
-        .first()
-    )
-    if not job:
-        return {
-            "status": "idle",
-            "isActive": False,
-            "progress": 0,
-            "totalItems": 0,
-            "processedItems": 0,
-            "generatedRows": 0,
-            "error": None,
-        }
-
-    total_items = int(job.total_items or 0)
-    processed_items = int(job.processed_items or 0)
-    progress = 0
-    if total_items > 0:
-        progress = max(0, min(100, int(round((processed_items / total_items) * 100))))
-    elif job.status == "completed":
-        progress = 100
+    if not values and attrs:
+        has_mapping = True
 
     return {
-        "id": job.id,
-        "status": job.status,
-        "isActive": job.status in ("queued", "running"),
-        "progress": progress,
-        "totalItems": total_items,
-        "processedItems": processed_items,
-        "generatedRows": int(job.generated_rows or 0),
-        "startedAt": job.started_at,
-        "finishedAt": job.finished_at,
-        "updatedAt": job.updated_at,
-        "error": job.error_message,
+        "attrs": attrs,
+        "targetValues": sorted(target_values),
+        "hasMapping": has_mapping or bool(attrs),
     }
+
+
+def _compute_value_merge_noise(
+    item_id: str,
+    feature_id: str,
+    original_values: List[str],
+    plans: Dict[str, Any],
+) -> Optional[List[str]]:
+    """Return noise values (canonical - original) if item is in a consolidation plan."""
+    plan = plans.get(feature_id)
+    if not plan:
+        return None
+    canonical_lists = plan.canonical_lists_json or []
+    item_assignments = plan.item_assignments_json or []
+    original_set = set(original_values)
+
+    for idx, assigned_items in enumerate(item_assignments):
+        if item_id in (assigned_items or []):
+            if idx < len(canonical_lists):
+                canonical = set(canonical_lists[idx] or [])
+                noise = sorted(canonical - original_set)
+                return noise if noise else None
+    return None
+
+
+
+# ---------------------------------------------------------------------------
+# Migration manifest endpoints (live queries against AC, FC, plans)
+# ---------------------------------------------------------------------------
 
 
 _manifest_filters_cache: Optional[Dict[str, Any]] = None
@@ -6111,198 +5682,70 @@ _manifest_filters_cache_ts: float = 0.0
 _MANIFEST_FILTERS_TTL = 30.0  # seconds
 
 
+@router.get("/migration-manifest/ready")
+def check_migration_manifest_ready(
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """Check whether prerequisite tables are built."""
+    ac_count = db.query(func.count(models.AttributeCombination.id)).scalar() or 0
+    fc_count = db.query(func.count(models.FeatureCombination.id)).scalar() or 0
+    return {
+        "ready": ac_count > 0 and fc_count > 0,
+        "attributeCombinations": ac_count,
+        "featureCombinations": fc_count,
+    }
+
+
 @router.get("/migration-manifest/filters")
 def get_migration_manifest_filters(
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user),
 ):
-    """Return distinct filter values for the migration manifest page.
-
-    Results are cached in-process for up to 30 seconds so that repeated
-    polls do not hammer the database with 7 DISTINCT full-table scans.
-    """
+    """Return distinct filter values from live BOM + mapping data."""
     global _manifest_filters_cache, _manifest_filters_cache_ts
     now = time.time()
     if _manifest_filters_cache is not None and now - _manifest_filters_cache_ts < _MANIFEST_FILTERS_TTL:
         return _manifest_filters_cache
 
-    categories = [
-        row[0]
-        for row in db.query(models.MigrationManifestEntry.item_category)
-        .filter(models.MigrationManifestEntry.item_category.isnot(None))
-        .filter(models.MigrationManifestEntry.item_category != "")
-        .distinct()
-        .order_by(models.MigrationManifestEntry.item_category)
-        .all()
-    ]
-    product_types = [
-        row[0]
-        for row in db.query(models.MigrationManifestEntry.item_product_type)
-        .filter(models.MigrationManifestEntry.item_product_type.isnot(None))
-        .filter(models.MigrationManifestEntry.item_product_type != "")
-        .distinct()
-        .order_by(models.MigrationManifestEntry.item_product_type)
-        .all()
-    ]
-    priorities = sorted({
-        row[0]
-        for row in db.query(models.MigrationManifestEntry.item_priority)
-        .filter(models.MigrationManifestEntry.item_priority.isnot(None))
-        .distinct()
-        .all()
+    B = models.BomItem
+    categories = sorted({
+        str(r[0]).strip()
+        for r in db.query(B.category).filter(B.category.isnot(None), B.category != "").distinct().all()
     })
-    sources = [
-        row[0]
-        for row in db.query(models.MigrationManifestEntry.source)
-        .filter(models.MigrationManifestEntry.source.isnot(None))
-        .distinct()
-        .order_by(models.MigrationManifestEntry.source)
-        .all()
-    ]
-    noise_types = [
-        row[0]
-        for row in db.query(models.MigrationManifestEntry.noise_type)
-        .filter(models.MigrationManifestEntry.noise_type.isnot(None))
-        .filter(models.MigrationManifestEntry.noise_type != "")
-        .distinct()
-        .order_by(models.MigrationManifestEntry.noise_type)
-        .all()
-    ]
-    attribute_types = [
-        row[0]
-        for row in db.query(models.MigrationManifestEntry.attribute_type)
-        .filter(models.MigrationManifestEntry.attribute_type.isnot(None))
-        .filter(models.MigrationManifestEntry.attribute_type != "")
-        .distinct()
-        .order_by(models.MigrationManifestEntry.attribute_type)
-        .all()
-    ]
-    target_attributes = [
-        row[0]
-        for row in db.query(models.MigrationManifestEntry.target_attribute_id)
-        .filter(models.MigrationManifestEntry.target_attribute_id.isnot(None))
-        .filter(models.MigrationManifestEntry.target_attribute_id != "")
-        .distinct()
-        .order_by(models.MigrationManifestEntry.target_attribute_id)
-        .all()
-    ]
+    product_types = sorted({
+        str(r[0]).strip()
+        for r in db.query(B.product_type).filter(B.product_type.isnot(None), B.product_type != "").distinct().all()
+    })
+    priorities = sorted({
+        r[0] for r in db.query(B.priority).filter(B.priority.isnot(None)).distinct().all()
+    })
+    attribute_types = sorted({
+        str(r[0]).strip()
+        for r in db.query(models.GlobalMapping.attribute_type)
+        .filter(models.GlobalMapping.attribute_type.isnot(None), models.GlobalMapping.attribute_type != "")
+        .filter(models.GlobalMapping.status != "deprecated", models.GlobalMapping.status != "ignored")
+        .distinct().all()
+    })
+    target_attributes = sorted({
+        str(r[0]).strip()
+        for r in db.query(models.GlobalMapping.new_attribute_id)
+        .filter(models.GlobalMapping.new_attribute_id.isnot(None), models.GlobalMapping.new_attribute_id != "")
+        .filter(models.GlobalMapping.status != "deprecated", models.GlobalMapping.status != "ignored")
+        .distinct().all()
+    })
     result = {
         "categories": categories,
         "productTypes": product_types,
         "priorities": priorities,
-        "sources": sources,
-        "noiseTypes": noise_types,
+        "sources": ["original", "value_merge"],
+        "noiseTypes": ["missing_value"],
         "attributeTypes": attribute_types,
         "targetAttributes": target_attributes,
     }
     _manifest_filters_cache = result
     _manifest_filters_cache_ts = time.time()
     return result
-
-
-@router.get("/migration-manifest/list")
-def list_migration_manifest_rows(
-    search: Optional[str] = Query(None),
-    category: Optional[str] = Query(None),
-    product_type: Optional[str] = Query(None, alias="productType"),
-    priority: Optional[int] = Query(None),
-    source: Optional[str] = Query(None),
-    noise_type: Optional[str] = Query(None, alias="noiseType"),
-    attribute_type: Optional[str] = Query(None, alias="attributeType"),
-    target_attribute_id: Optional[str] = Query(None, alias="targetAttributeId"),
-    has_noise: Optional[bool] = Query(None, alias="hasNoise"),
-    has_mapping: Optional[bool] = Query(None, alias="hasMapping"),
-    sort_by: str = Query("itemPriority", alias="sortBy"),
-    sort_dir: str = Query("desc", alias="sortDir"),
-    limit: int = Query(50, ge=1, le=500),
-    offset: int = Query(0, ge=0),
-    db: Session = Depends(get_db),
-    current_user: models.User = Depends(get_current_user),
-):
-    """Return filtered manifest rows for the unified merge page."""
-    search = _validate_search(search)
-    base = db.query(models.MigrationManifestEntry)
-
-    if category:
-        base = base.filter(models.MigrationManifestEntry.item_category == category)
-    if product_type:
-        base = base.filter(models.MigrationManifestEntry.item_product_type == product_type)
-    if priority is not None:
-        base = base.filter(models.MigrationManifestEntry.item_priority == priority)
-    if source:
-        base = base.filter(models.MigrationManifestEntry.source == source)
-    if noise_type:
-        base = base.filter(models.MigrationManifestEntry.noise_type == noise_type)
-    if attribute_type:
-        base = base.filter(models.MigrationManifestEntry.attribute_type == attribute_type)
-    if target_attribute_id:
-        base = base.filter(models.MigrationManifestEntry.target_attribute_id == target_attribute_id)
-    if has_noise is not None:
-        base = base.filter(models.MigrationManifestEntry.is_noise == (1 if has_noise else 0))
-    if has_mapping is not None:
-        base = base.filter(models.MigrationManifestEntry.has_mapping == (1 if has_mapping else 0))
-    if search:
-        q = f"%{search.strip()}%"
-        base = base.filter(or_(
-            models.MigrationManifestEntry.item_id.ilike(q),
-            models.MigrationManifestEntry.item_description.ilike(q),
-            models.MigrationManifestEntry.legacy_feature_id.ilike(q),
-            models.MigrationManifestEntry.target_attribute_id.ilike(q),
-            cast(models.MigrationManifestEntry.original_values_json, String).ilike(q),
-            cast(models.MigrationManifestEntry.target_values_json, String).ilike(q),
-            cast(models.MigrationManifestEntry.noise_values_json, String).ilike(q),
-        ))
-
-    sort_map = {
-        "itemId": models.MigrationManifestEntry.item_id,
-        "itemPriority": models.MigrationManifestEntry.item_priority,
-        "legacyFeatureId": models.MigrationManifestEntry.legacy_feature_id,
-        "targetAttributeId": models.MigrationManifestEntry.target_attribute_id,
-        "source": models.MigrationManifestEntry.source,
-        "builtAt": models.MigrationManifestEntry.built_at,
-    }
-    sort_column = sort_map.get(sort_by, models.MigrationManifestEntry.item_priority)
-    if sort_dir == "asc":
-        base = base.order_by(sort_column.asc(), models.MigrationManifestEntry.id.asc())
-    else:
-        base = base.order_by(sort_column.desc(), models.MigrationManifestEntry.id.desc())
-
-    rows = base.offset(offset).limit(limit).all()
-
-    # Compute total only when necessary — skip the extra COUNT scan when it's
-    # obvious from the page size that we have fewer results than the limit (last
-    # page or small dataset).  This halves query cost for most requests.
-    if len(rows) < limit and offset == 0:
-        total = len(rows)
-    elif len(rows) < limit:
-        total = offset + len(rows)
-    else:
-        total = base.order_by(None).count()
-
-    return {
-        "items": [_serialize_manifest_entry(row) for row in rows],
-        "total": total,
-    }
-
-
-@router.get("/migration-manifest/items/{item_id}")
-def get_migration_manifest_item_rows(
-    item_id: str,
-    db: Session = Depends(get_db),
-    current_user: models.User = Depends(get_current_user),
-):
-    """Return all manifest rows for a single BOM item."""
-    rows = (
-        db.query(models.MigrationManifestEntry)
-        .filter(models.MigrationManifestEntry.item_id == item_id)
-        .order_by(
-            models.MigrationManifestEntry.source.asc(),
-            models.MigrationManifestEntry.legacy_feature_id.asc(),
-            models.MigrationManifestEntry.id.asc(),
-        )
-        .all()
-    )
-    return {"items": [_serialize_manifest_entry(row) for row in rows]}
 
 
 @router.get("/migration-manifest/item-summaries")
@@ -6321,94 +5764,116 @@ def list_migration_manifest_item_summaries(
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user),
 ):
-    """Return one row per distinct item_id with aggregated counts.
-
-    This powers the simplified manifest list: top-20 items at a time,
-    with counts of total rows, attribute merges, and value merges per item.
-    """
+    """Return one row per BOM item with live aggregated counts from AC, FC, plans."""
     search = _validate_search(search)
-    E = models.MigrationManifestEntry
 
-    base = db.query(
-        E.item_id,
-        E.item_description,
-        E.item_category,
-        E.item_product_type,
-        E.item_priority,
-        func.count(E.id).label("totalRows"),
-        func.sum(case((E.source == "attr_merge", 1), else_=0)).label("attrMergeCount"),
-        func.sum(case((E.source == "value_merge", 1), else_=0)).label("valueMergeCount"),
-        func.sum(case((E.has_mapping == 1, 1), else_=0)).label("mappedCount"),
-        func.sum(case((E.is_noise == 1, 1), else_=0)).label("noiseCount"),
-    ).group_by(E.item_id, E.item_description, E.item_category, E.item_product_type, E.item_priority)
+    # Pre-load lookup maps
+    ac_map = _build_ac_item_count_map(db)
+    feature_map = _build_feature_target_map(db)
+    plans = _get_completed_consolidation_plans(db)
 
+    # Set of item_ids that have at least one merged workspace mapping row (= "saved")
+    saved_items: Set[str] = set()
+    for r in db.query(func.distinct(models.MergedWorkspaceMapping.legacy_item_id)).all():
+        if r[0]:
+            saved_items.add(r[0])
+
+    # Build base BOM item query
+    B = models.BomItem
+    base = db.query(B)
     if category:
-        base = base.filter(E.item_category == category)
+        base = base.filter(B.category == category)
     if product_type:
-        base = base.filter(E.item_product_type == product_type)
+        base = base.filter(B.product_type == product_type)
     if priority is not None:
-        base = base.filter(E.item_priority == priority)
-    if source:
-        base = base.having(func.sum(case((E.source == source, 1), else_=0)) > 0)
-    if has_noise is not None:
-        if has_noise:
-            base = base.having(func.sum(case((E.is_noise == 1, 1), else_=0)) > 0)
-        else:
-            base = base.having(func.sum(case((E.is_noise == 1, 1), else_=0)) == 0)
-    if has_mapping is not None:
-        if has_mapping:
-            base = base.having(func.sum(case((E.has_mapping == 1, 1), else_=0)) > 0)
-        else:
-            base = base.having(func.sum(case((E.has_mapping == 1, 1), else_=0)) == 0)
+        base = base.filter(B.priority == priority)
     if search:
         q = f"%{search.strip()}%"
-        base = base.filter(or_(
-            E.item_id.ilike(q),
-            E.item_description.ilike(q),
-        ))
+        base = base.filter(or_(B.item_id.ilike(q), B.description.ilike(q)))
 
+    # Sort map (sort on BomItem columns)
     sort_map = {
-        "itemId": E.item_id,
-        "itemPriority": E.item_priority,
-        "totalRows": "totalRows",
-        "attrMergeCount": "attrMergeCount",
-        "valueMergeCount": "valueMergeCount",
+        "itemId": B.item_id,
+        "itemPriority": B.priority,
     }
-    sort_col = sort_map.get(sort_by, E.item_priority)
-    if isinstance(sort_col, str):
-        sort_col = literal_column(sort_col)
+    sort_col = sort_map.get(sort_by, B.priority)
     if sort_dir == "asc":
-        base = base.order_by(sort_col.asc(), E.item_id.asc())
+        base = base.order_by(sort_col.asc(), B.item_id.asc())
     else:
-        base = base.order_by(sort_col.desc(), E.item_id.asc())
+        base = base.order_by(sort_col.desc(), B.item_id.asc())
 
-    items = base.offset(offset).limit(limit).all()
+    # Count total before paginating
+    total_q = base.order_by(None)
+    # Paginate
+    items = base.options(selectinload(B.features)).offset(offset).limit(limit).all()
 
     if len(items) < limit and offset == 0:
         total = len(items)
     elif len(items) < limit:
         total = offset + len(items)
     else:
-        total = base.order_by(None).count()
+        total = total_q.count()
 
-    return {
-        "items": [
-            {
-                "itemId": row.item_id,
-                "itemDescription": row.item_description or "",
-                "itemCategory": row.item_category or "",
-                "itemProductType": row.item_product_type or "",
-                "itemPriority": row.item_priority,
-                "totalRows": int(row.totalRows or 0),
-                "attrMergeCount": int(row.attrMergeCount or 0),
-                "valueMergeCount": int(row.valueMergeCount or 0),
-                "mappedCount": int(row.mappedCount or 0),
-                "noiseCount": int(row.noiseCount or 0),
-            }
-            for row in items
-        ],
-        "total": total,
-    }
+    result_items = []
+    for item in items:
+        features = item.features or []
+        total_rows = len(features)
+        combo_item_count = ac_map.get(item.item_id, 1)
+
+        value_merge_count = 0
+        mapped_count = 0
+        has_noise_flag = False
+        has_mapping_flag = False
+
+        for feat in features:
+            fid = str(feat.feature_id or "").strip()
+            if not fid:
+                continue
+            normalized = _normalize_feature_values(getattr(feat, "values", None))
+            fm = feature_map.get(fid)
+            has_gm = fm is not None and fm.get("attr", "")
+
+            # Check workspace override for any value
+            ws_hit = any(
+                (item.item_id, fid, str(v or "").strip()) in {}  # placeholder
+                for v in normalized
+            )
+            if has_gm or ws_hit:
+                mapped_count += 1
+                has_mapping_flag = True
+
+            # Value merge noise
+            noise = _compute_value_merge_noise(item.item_id, fid, normalized, plans)
+            if noise:
+                value_merge_count += 1
+                has_noise_flag = True
+
+        # Apply post-filters
+        if source == "value_merge" and value_merge_count == 0:
+            continue
+        if has_noise is True and not has_noise_flag:
+            continue
+        if has_noise is False and has_noise_flag:
+            continue
+        if has_mapping is True and not has_mapping_flag:
+            continue
+        if has_mapping is False and has_mapping_flag:
+            continue
+
+        result_items.append({
+            "itemId": item.item_id,
+            "itemDescription": item.description or "",
+            "itemCategory": item.category or "",
+            "itemProductType": item.product_type or "",
+            "itemPriority": item.priority,
+            "totalRows": total_rows,
+            "comboItemCount": combo_item_count,
+            "valueMergeCount": value_merge_count,
+            "mappedCount": mapped_count,
+            "noiseCount": value_merge_count,
+        })
+
+    return {"items": result_items, "total": total}
 
 
 @router.get("/migration-manifest/items/{item_id}/attributes")
@@ -6417,37 +5882,88 @@ def get_migration_manifest_item_attributes(
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user),
 ):
-    """Return attribute-level merge suggestions for a specific item.
+    """Return attribute-level merge suggestions from live BOM + mapping + plan data."""
+    item = db.query(models.BomItem).filter(models.BomItem.item_id == item_id).first()
+    if not item:
+        raise HTTPException(status_code=404, detail="item not found")
 
-    Groups manifest entries by target_attribute_id and returns one row per
-    attribute with original vs merged values and noise details.
-    """
-    rows = (
-        db.query(models.MigrationManifestEntry)
-        .filter(models.MigrationManifestEntry.item_id == item_id)
-        .order_by(
-            models.MigrationManifestEntry.target_attribute_id.asc(),
-            models.MigrationManifestEntry.source.asc(),
-            models.MigrationManifestEntry.id.asc(),
-        )
+    feature_map = _build_feature_target_map(db)
+    workspace_overrides = _build_workspace_overrides(db, item_id)
+    plans = _get_completed_consolidation_plans(db)
+
+    # Check which (item, feature) pairs are already saved in merged workspace mappings
+    saved_keys: Set[str] = set()
+    for r in db.query(models.MergedWorkspaceMapping.legacy_feature_id).filter(
+        models.MergedWorkspaceMapping.legacy_item_id == item_id
+    ).all():
+        if r[0]:
+            saved_keys.add(str(r[0]).strip())
+
+    features = (
+        db.query(models.BomFeature)
+        .filter(models.BomFeature.item_id == item.id)
+        .order_by(models.BomFeature.feature_id.asc())
         .all()
     )
 
     attrs: dict = {}
-    for entry in rows:
-        attr_key = entry.target_attribute_id or entry.legacy_feature_id or "(unmapped)"
+    for feat in features:
+        fid = str(feat.feature_id or "").strip()
+        if not fid:
+            continue
+        normalized = _normalize_feature_values(getattr(feat, "values", None))
+        resolved = _resolve_feature_targets(item_id, fid, normalized, feature_map, workspace_overrides)
+        noise = _compute_value_merge_noise(item_id, fid, normalized, plans)
+
+        attr_key = "; ".join(resolved["attrs"]) if resolved["attrs"] else fid
+        fm = feature_map.get(fid)
+        attr_type = fm.get("attrType", "") if fm else ""
+
+        is_saved = fid in saved_keys
+
+        # Build "original" row
+        entry_original = {
+            "id": 0,
+            "itemId": item_id,
+            "itemDescription": item.description or "",
+            "itemCategory": item.category or "",
+            "itemProductType": item.product_type or "",
+            "itemPriority": item.priority,
+            "legacyFeatureId": fid,
+            "targetAttributeId": attr_key if resolved["attrs"] else "",
+            "attributeType": attr_type,
+            "source": "original",
+            "isNoise": False,
+            "noiseType": "",
+            "originalValues": normalized,
+            "targetValues": resolved["targetValues"],
+            "noiseValues": [],
+            "hasMapping": resolved["hasMapping"],
+            "isAccepted": is_saved,
+            "acceptedAt": None,
+            "acceptedBy": None,
+            "comboItemCount": 1,
+            "builtAt": None,
+        }
+
         if attr_key not in attrs:
             attrs[attr_key] = {
-                "targetAttributeId": entry.target_attribute_id or "",
-                "attributeType": entry.attribute_type or "",
+                "targetAttributeId": attr_key if resolved["attrs"] else "",
+                "attributeType": attr_type,
                 "features": [],
                 "hasAttrMerge": False,
                 "hasValueMerge": False,
             }
-        attrs[attr_key]["features"].append(_serialize_manifest_entry(entry))
-        if entry.source == "attr_merge":
-            attrs[attr_key]["hasAttrMerge"] = True
-        if entry.source == "value_merge":
+        attrs[attr_key]["features"].append(entry_original)
+
+        # Build "value_merge" row if noise exists
+        if noise:
+            entry_vm = dict(entry_original)
+            entry_vm["source"] = "value_merge"
+            entry_vm["isNoise"] = True
+            entry_vm["noiseType"] = "missing_value"
+            entry_vm["noiseValues"] = noise
+            attrs[attr_key]["features"].append(entry_vm)
             attrs[attr_key]["hasValueMerge"] = True
 
     return {"attributes": list(attrs.values())}
@@ -6460,100 +5976,265 @@ def get_migration_manifest_value_merge_detail(
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user),
 ):
-    """Return value-level merge detail for one item + attribute combination.
+    """Return value-level merge detail from live BOM + mapping + plan data."""
+    item = db.query(models.BomItem).filter(models.BomItem.item_id == item_id).first()
+    if not item:
+        raise HTTPException(status_code=404, detail="item not found")
 
-    Shows original values, target mapped values, and noise/merge additions.
-    """
-    rows = (
-        db.query(models.MigrationManifestEntry)
-        .filter(models.MigrationManifestEntry.item_id == item_id)
-        .filter(models.MigrationManifestEntry.target_attribute_id == target_attribute_id)
-        .order_by(
-            models.MigrationManifestEntry.source.asc(),
-            models.MigrationManifestEntry.id.asc(),
-        )
+    feature_map = _build_feature_target_map(db)
+    workspace_overrides = _build_workspace_overrides(db, item_id)
+    plans = _get_completed_consolidation_plans(db)
+
+    # Find which features map to this target_attribute_id
+    features = (
+        db.query(models.BomFeature)
+        .filter(models.BomFeature.item_id == item.id)
+        .order_by(models.BomFeature.feature_id.asc())
         .all()
     )
 
-    original_values: list = []
-    target_values: list = []
-    noise_values: list = []
+    entries: list = []
+    all_orig: list = []
+    all_target: list = []
+    all_noise: list = []
     seen_orig: set = set()
     seen_target: set = set()
     seen_noise: set = set()
 
-    for entry in rows:
-        for v in (entry.original_values_json or []):
+    for feat in features:
+        fid = str(feat.feature_id or "").strip()
+        if not fid:
+            continue
+        normalized = _normalize_feature_values(getattr(feat, "values", None))
+        resolved = _resolve_feature_targets(item_id, fid, normalized, feature_map, workspace_overrides)
+        attr_key = "; ".join(resolved["attrs"]) if resolved["attrs"] else fid
+
+        if attr_key != target_attribute_id and (not resolved["attrs"] and fid != target_attribute_id):
+            continue
+
+        fm = feature_map.get(fid)
+        attr_type = fm.get("attrType", "") if fm else ""
+        noise = _compute_value_merge_noise(item_id, fid, normalized, plans)
+
+        entry = {
+            "id": 0,
+            "itemId": item_id,
+            "itemDescription": item.description or "",
+            "itemCategory": item.category or "",
+            "itemProductType": item.product_type or "",
+            "itemPriority": item.priority,
+            "legacyFeatureId": fid,
+            "targetAttributeId": target_attribute_id,
+            "attributeType": attr_type,
+            "source": "original",
+            "isNoise": False,
+            "noiseType": "",
+            "originalValues": normalized,
+            "targetValues": resolved["targetValues"],
+            "noiseValues": [],
+            "hasMapping": resolved["hasMapping"],
+            "isAccepted": False,
+            "acceptedAt": None,
+            "acceptedBy": None,
+            "comboItemCount": 1,
+            "builtAt": None,
+        }
+        entries.append(entry)
+
+        for v in normalized:
             if v not in seen_orig:
                 seen_orig.add(v)
-                original_values.append(v)
-        for v in (entry.target_values_json or []):
+                all_orig.append(v)
+        for v in resolved["targetValues"]:
             if v not in seen_target:
                 seen_target.add(v)
-                target_values.append(v)
-        for v in (entry.noise_values_json or []):
-            if v not in seen_noise:
-                seen_noise.add(v)
-                noise_values.append(v)
+                all_target.append(v)
+
+        if noise:
+            vm_entry = dict(entry)
+            vm_entry["source"] = "value_merge"
+            vm_entry["isNoise"] = True
+            vm_entry["noiseType"] = "missing_value"
+            vm_entry["noiseValues"] = noise
+            entries.append(vm_entry)
+            for v in noise:
+                if v not in seen_noise:
+                    seen_noise.add(v)
+                    all_noise.append(v)
 
     return {
         "itemId": item_id,
         "targetAttributeId": target_attribute_id,
-        "entries": [_serialize_manifest_entry(r) for r in rows],
-        "originalValues": original_values,
-        "targetValues": target_values,
-        "noiseValues": noise_values,
+        "entries": entries,
+        "originalValues": all_orig,
+        "targetValues": all_target,
+        "noiseValues": all_noise,
     }
 
 
-@router.post("/migration-manifest/save-selection")
-def save_migration_manifest_selection(
+@router.post("/migration-manifest/save-to-workspace")
+def save_manifest_to_workspace(
     payload: Dict[str, Any],
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user),
 ):
-    """Mark manifest suggestion rows as explicitly accepted by the user.
-
-    This persists only to the migration manifest table and does not write back
-    to workspace mappings.
-    """
+    """Compute merge values live and upsert into merged_workspace_mappings."""
     item_id = str(payload.get("itemId") or "").strip()
     target_attribute_id = str(payload.get("targetAttributeId") or "").strip()
-    sources = payload.get("sources") or []
     if not item_id:
         raise HTTPException(status_code=400, detail="itemId is required")
     if not target_attribute_id:
         raise HTTPException(status_code=400, detail="targetAttributeId is required")
-    if not isinstance(sources, list) or not sources:
-        raise HTTPException(status_code=400, detail="sources must be a non-empty array")
 
-    normalized_sources = sorted({str(source or "").strip() for source in sources if str(source or "").strip()})
-    allowed_sources = {"attr_merge", "value_merge"}
-    if not normalized_sources or any(source not in allowed_sources for source in normalized_sources):
-        raise HTTPException(status_code=400, detail="sources must contain only attr_merge and/or value_merge")
+    item = db.query(models.BomItem).filter(models.BomItem.item_id == item_id).first()
+    if not item:
+        raise HTTPException(status_code=404, detail="item not found")
 
-    rows = (
-        db.query(models.MigrationManifestEntry)
-        .filter(models.MigrationManifestEntry.item_id == item_id)
-        .filter(models.MigrationManifestEntry.target_attribute_id == target_attribute_id)
-        .filter(models.MigrationManifestEntry.source.in_(normalized_sources))
+    feature_map = _build_feature_target_map(db)
+    workspace_overrides = _build_workspace_overrides(db, item_id)
+    plans = _get_completed_consolidation_plans(db)
+
+    features = (
+        db.query(models.BomFeature)
+        .filter(models.BomFeature.item_id == item.id)
+        .order_by(models.BomFeature.feature_id.asc())
         .all()
     )
-    if not rows:
-        raise HTTPException(status_code=404, detail="no manifest rows found for the requested selection")
 
     now_ts = time.time()
     username = getattr(current_user, "username", None)
-    for row in rows:
-        row.is_accepted = 1
-        row.accepted_at = now_ts
-        row.accepted_by_username = username
+    user_id = str(getattr(current_user, "id", ""))
+    created_count = 0
+    updated_count = 0
+
+    for feat in features:
+        fid = str(feat.feature_id or "").strip()
+        if not fid:
+            continue
+        normalized = _normalize_feature_values(getattr(feat, "values", None))
+        resolved = _resolve_feature_targets(item_id, fid, normalized, feature_map, workspace_overrides)
+        attr_key = "; ".join(resolved["attrs"]) if resolved["attrs"] else ""
+
+        if attr_key != target_attribute_id:
+            continue
+
+        fm = feature_map.get(fid)
+        attr_type = fm.get("attrType", "") if fm else ""
+
+        # Build full set of target values including noise from consolidation plan
+        all_values = list(resolved["targetValues"])
+        noise = _compute_value_merge_noise(item_id, fid, normalized, plans)
+        if noise:
+            all_values.extend(noise)
+
+        if not all_values:
+            all_values = [""]
+
+        for target_value in all_values:
+            existing = (
+                db.query(models.MergedWorkspaceMapping)
+                .filter(
+                    models.MergedWorkspaceMapping.legacy_item_id == item_id,
+                    models.MergedWorkspaceMapping.legacy_feature_id == fid,
+                    models.MergedWorkspaceMapping.legacy_value == (target_value or ""),
+                )
+                .first()
+            )
+            if existing:
+                existing.new_attribute_id = target_attribute_id
+                existing.new_value = target_value or ""
+                existing.attribute_type = attr_type
+                existing.mapped_from = "manifest"
+                existing.modified_by = username
+                existing.modified_at = now_ts
+                existing.updated_at = now_ts
+                existing.version = (existing.version or 1) + 1
+                updated_count += 1
+            else:
+                new_row = models.MergedWorkspaceMapping(
+                    legacy_item_id=item_id,
+                    legacy_feature_id=fid,
+                    legacy_value=target_value or "",
+                    new_attribute_id=target_attribute_id,
+                    new_value=target_value or "",
+                    attribute_type=attr_type,
+                    mapped_from="manifest",
+                    signed_on_by_user_id=user_id,
+                    signed_on_by_username=username,
+                    signed_on_at=now_ts,
+                    updated_at=now_ts,
+                    created_by=username,
+                )
+                db.add(new_row)
+                created_count += 1
 
     db.commit()
     return {
         "ok": True,
-        "rowsSaved": len(rows),
+        "mergedMappingsCreated": created_count,
+        "mergedMappingsUpdated": updated_count,
         "savedAt": now_ts,
         "savedBy": username,
-        "sources": normalized_sources,
+    }
+
+
+@router.get("/merged-workspace-mappings/{item_id}")
+def get_merged_workspace_mappings(
+    item_id: str,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """Return all merged workspace mapping rows for a given item.
+
+    Used by the toggle view to compare old workspace mappings with new merged ones.
+    """
+    rows = (
+        db.query(models.MergedWorkspaceMapping)
+        .filter(models.MergedWorkspaceMapping.legacy_item_id == item_id)
+        .order_by(
+            models.MergedWorkspaceMapping.legacy_feature_id.asc(),
+            models.MergedWorkspaceMapping.legacy_value.asc(),
+        )
+        .all()
+    )
+    return {
+        "items": [
+            {
+                "id": r.id,
+                "legacyItemId": r.legacy_item_id,
+                "legacyFeatureId": r.legacy_feature_id,
+                "legacyValue": r.legacy_value,
+                "newAttributeId": r.new_attribute_id,
+                "newValue": r.new_value,
+                "attributeType": r.attribute_type or "",
+                "condition": r.condition,
+                "formula": r.formula,
+                "mappedFrom": r.mapped_from,
+                "valueStatus": r.value_status,
+                "manifestEntryId": r.manifest_entry_id,
+                "signedOnByUsername": r.signed_on_by_username,
+                "signedOnAt": r.signed_on_at,
+                "updatedAt": r.updated_at,
+                "version": r.version,
+                "createdBy": r.created_by,
+                "modifiedBy": r.modified_by,
+                "modifiedAt": r.modified_at,
+            }
+            for r in rows
+        ],
+        "total": len(rows),
+    }
+
+
+@router.get("/merged-workspace-mappings-summary")
+def get_merged_workspace_mappings_summary(
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """Return a summary of merged workspace mappings: total rows and distinct items."""
+    total_rows = db.query(func.count(models.MergedWorkspaceMapping.id)).scalar() or 0
+    distinct_items = db.query(func.count(func.distinct(models.MergedWorkspaceMapping.legacy_item_id))).scalar() or 0
+    return {
+        "totalRows": int(total_rows),
+        "distinctItems": int(distinct_items),
     }

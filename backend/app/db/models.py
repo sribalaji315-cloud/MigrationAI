@@ -424,4 +424,46 @@ class MigrationManifestEntry(Base):
     is_accepted = Column(Integer, nullable=False, default=0)  # 0 or 1
     accepted_at = Column(Float, nullable=True)
     accepted_by_username = Column(String, nullable=True)
+    combo_item_count = Column(Integer, nullable=False, default=1)  # items sharing same feature combo
     built_at = Column(Float, nullable=True)
+
+
+class MergedWorkspaceMapping(Base):
+    """New workspace mapping rows produced by accepting Migration Manifest merges.
+
+    Same schema as WorkspaceMapping but stored in a separate table so the
+    original workspace_mappings (and all dashboard metrics tied to it) stay
+    untouched.  Users can toggle between old and new mappings in the UI.
+    """
+
+    __tablename__ = "merged_workspace_mappings"
+    __table_args__ = (
+        UniqueConstraint(
+            "legacy_item_id",
+            "legacy_feature_id",
+            "legacy_value",
+            name="uq_merged_ws_mappings_item_feature_value",
+        ),
+        Index("ix_merged_ws_mappings_item_feature", "legacy_item_id", "legacy_feature_id"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    legacy_item_id = Column(String, index=True, nullable=False)
+    legacy_feature_id = Column(String, index=True, nullable=False)
+    legacy_value = Column(String, nullable=False, default="")
+    new_attribute_id = Column(String, nullable=False)
+    new_value = Column(String, nullable=False, default="")
+    attribute_type = Column(String, nullable=False, default="")
+    condition = Column(String, nullable=True)
+    formula = Column(String, nullable=True)
+    mapped_from = Column(String, nullable=False, default="manifest")
+    value_status = Column(String, nullable=True, index=True)
+    manifest_entry_id = Column(Integer, nullable=True, index=True)
+    signed_on_by_user_id = Column(String, index=True, nullable=True)
+    signed_on_by_username = Column(String, nullable=True)
+    signed_on_at = Column(Float, nullable=True)
+    updated_at = Column(Float, nullable=False, default=0)
+    version = Column(Integer, nullable=False, default=1)
+    created_by = Column(String, nullable=True)
+    modified_by = Column(String, nullable=True)
+    modified_at = Column(Float, nullable=True)

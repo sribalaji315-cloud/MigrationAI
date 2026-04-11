@@ -1,9 +1,9 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
+  MergedWorkspaceMappingRow,
   MigrationManifestAttributeGroup,
   MigrationManifestFilters,
   MigrationManifestItemSummary,
-  MigrationManifestJobProgress,
   MigrationManifestRow,
   MigrationManifestValueDetail,
   User,
@@ -23,15 +23,6 @@ const sourceTone: Record<string, string> = {
   original: 'bg-slate-100 text-slate-700 border-slate-200',
   value_merge: 'bg-amber-100 text-amber-800 border-amber-200',
   attr_merge: 'bg-sky-100 text-sky-800 border-sky-200',
-};
-
-const formatTimestamp = (value?: number | null) => {
-  if (!value) return 'Never';
-  try {
-    return new Date(value * 1000).toLocaleString();
-  } catch {
-    return 'Invalid date';
-  }
 };
 
 const joinValues = (values: string[]) => values.length > 0 ? values.join(', ') : '—';
@@ -54,9 +45,8 @@ const dedupeValues = (rows: MigrationManifestRow[], selector: (row: MigrationMan
 const MigrationManifest: React.FC<MigrationManifestProps> = ({ currentUser, onClose }) => {
   void currentUser;
 
-  const [jobProgress, setJobProgress] = useState<MigrationManifestJobProgress | null>(null);
-  const [isTriggering, setIsTriggering] = useState(false);
-  const pollRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [isReady, setIsReady] = useState<boolean | null>(null);
+  const [readyInfo, setReadyInfo] = useState<{ attributeCombinations: number; featureCombinations: number }>({ attributeCombinations: 0, featureCombinations: 0 });
 
   const [filters, setFilters] = useState<MigrationManifestFilters>({
     categories: [],
@@ -89,16 +79,19 @@ const MigrationManifest: React.FC<MigrationManifestProps> = ({ currentUser, onCl
   const [selectedAttribute, setSelectedAttribute] = useState<MigrationManifestAttributeGroup | null>(null);
   const [valueDetail, setValueDetail] = useState<MigrationManifestValueDetail | null>(null);
   const [isLoadingValues, setIsLoadingValues] = useState(false);
-  const [isSavingAttribute, setIsSavingAttribute] = useState(false);
   const [isSavingValue, setIsSavingValue] = useState(false);
   const [statusMessage, setStatusMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
+
+  const [showMergedView, setShowMergedView] = useState(false);
+  const [mergedMappings, setMergedMappings] = useState<MergedWorkspaceMappingRow[]>([]);
+  const [isLoadingMerged, setIsLoadingMerged] = useState(false);
+  const [mergedSummary, setMergedSummary] = useState<{ totalRows: number; distinctItems: number }>({ totalRows: 0, distinctItems: 0 });
 
   const containerRef = useRef<HTMLDivElement>(null);
   const draggingRef = useRef(false);
   const [rightPanelWidth, setRightPanelWidth] = useState(420);
 
   const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
-  const isActive = jobProgress?.status === 'queued' || jobProgress?.status === 'running';
 
   const resetSelection = useCallback(() => {
     setSelectedItem(null);
@@ -206,36 +199,35 @@ const MigrationManifest: React.FC<MigrationManifestProps> = ({ currentUser, onCl
     }
   }, []);
 
-  const pollProgress = useCallback(async () => {
+  const loadMergedMappings = useCallback(async (itemId: string) => {
+    setIsLoadingMerged(true);
     try {
-      const progress = await dbService.fetchMigrationManifestProgress();
-      setJobProgress(progress);
-      const waitMs = progress.isActive ? 5000 : 60000;
-      pollRef.current = setTimeout(pollProgress, waitMs);
+      const response = await dbService.fetchMergedWorkspaceMappings(itemId);
+      setMergedMappings(response.items);
     } catch {
-      pollRef.current = setTimeout(pollProgress, 60000);
+      setMergedMappings([]);
+    } finally {
+      setIsLoadingMerged(false);
+    }
+  }, []);
+
+  const loadMergedSummary = useCallback(async () => {
+    try {
+      const summary = await dbService.fetchMergedWorkspaceMappingsSummary();
+      setMergedSummary(summary);
+    } catch {
+      // Ignore summary refresh errors.
     }
   }, []);
 
   useEffect(() => {
     loadFilters();
-  }, [loadFilters]);
-
-  useEffect(() => {
-    pollProgress();
-    return () => {
-      if (pollRef.current) clearTimeout(pollRef.current);
-    };
-  }, [pollProgress]);
-
-  const previousStatusRef = useRef<string | undefined>(undefined);
-  useEffect(() => {
-    if (previousStatusRef.current === 'running' && jobProgress?.status === 'completed') {
-      loadItemSummaries(0, search);
-      loadFilters();
-    }
-    previousStatusRef.current = jobProgress?.status;
-  }, [jobProgress?.status, loadFilters, loadItemSummaries, search]);
+    loadMergedSummary();
+    dbService.checkMigrationManifestReady().then((res) => {
+      setIsReady(res.ready);
+      setReadyInfo({ attributeCombinations: res.attributeCombinations, featureCombinations: res.featureCombinations });
+    }).catch(() => setIsReady(false));
+  }, [loadFilters, loadMergedSummary]);
 
   useEffect(() => {
     loadItemSummaries(page, search);
@@ -248,24 +240,20 @@ const MigrationManifest: React.FC<MigrationManifestProps> = ({ currentUser, onCl
   }, [selectedItem?.itemId, loadAttributes]);
 
   useEffect(() => {
+    if (selectedItem?.itemId && showMergedView) {
+      loadMergedMappings(selectedItem.itemId);
+    } else {
+      setMergedMappings([]);
+    }
+  }, [selectedItem?.itemId, showMergedView, loadMergedMappings]);
+
+  useEffect(() => {
     if (selectedItem?.itemId && selectedAttribute?.targetAttributeId) {
       loadValueDetail(selectedItem.itemId, selectedAttribute.targetAttributeId);
     } else {
       setValueDetail(null);
     }
   }, [selectedItem?.itemId, selectedAttribute?.targetAttributeId, loadValueDetail]);
-
-  const triggerBuild = useCallback(async () => {
-    setIsTriggering(true);
-    try {
-      await dbService.triggerMigrationManifestBuild();
-      const progress = await dbService.fetchMigrationManifestProgress();
-      setJobProgress(progress);
-      setStatusMessage({ type: 'success', text: 'Migration manifest rebuild started in background.' });
-    } finally {
-      setIsTriggering(false);
-    }
-  }, []);
 
   const refreshCurrentSelection = useCallback(async () => {
     await loadItemSummaries(page, search);
@@ -277,35 +265,21 @@ const MigrationManifest: React.FC<MigrationManifestProps> = ({ currentUser, onCl
     }
   }, [loadAttributes, loadItemSummaries, loadValueDetail, page, search, selectedAttribute?.targetAttributeId, selectedItem?.itemId]);
 
-  const handleSaveAttributeMerge = useCallback(async () => {
-    if (!selectedItem?.itemId || !selectedAttribute?.targetAttributeId) return;
-    setIsSavingAttribute(true);
-    setStatusMessage(null);
-    try {
-      const result = await dbService.saveMigrationManifestSelection(selectedItem.itemId, selectedAttribute.targetAttributeId, ['attr_merge']);
-      await refreshCurrentSelection();
-      setStatusMessage({ type: 'success', text: `Saved ${result.rowsSaved} attribute merge row(s) in the migration manifest.` });
-    } catch (error: any) {
-      setStatusMessage({ type: 'error', text: error?.message || 'Failed to save attribute merge selection.' });
-    } finally {
-      setIsSavingAttribute(false);
-    }
-  }, [refreshCurrentSelection, selectedAttribute?.targetAttributeId, selectedItem?.itemId]);
-
   const handleSaveValueMerge = useCallback(async () => {
     if (!selectedItem?.itemId || !selectedAttribute?.targetAttributeId) return;
     setIsSavingValue(true);
     setStatusMessage(null);
     try {
-      const result = await dbService.saveMigrationManifestSelection(selectedItem.itemId, selectedAttribute.targetAttributeId, ['value_merge']);
+      const result = await dbService.saveManifestToWorkspace(selectedItem.itemId, selectedAttribute.targetAttributeId, ['value_merge']);
       await refreshCurrentSelection();
-      setStatusMessage({ type: 'success', text: `Saved ${result.rowsSaved} value merge row(s) in the migration manifest.` });
+      await loadMergedSummary();
+      setStatusMessage({ type: 'success', text: `Saved ${result.mergedMappingsCreated + result.mergedMappingsUpdated} merged mapping(s) to workspace.` });
     } catch (error: any) {
       setStatusMessage({ type: 'error', text: error?.message || 'Failed to save value merge selection.' });
     } finally {
       setIsSavingValue(false);
     }
-  }, [refreshCurrentSelection, selectedAttribute?.targetAttributeId, selectedItem?.itemId]);
+  }, [refreshCurrentSelection, loadMergedSummary, selectedAttribute?.targetAttributeId, selectedItem?.itemId]);
 
   const handleSearch = useCallback(() => {
     setPage(0);
@@ -331,20 +305,6 @@ const MigrationManifest: React.FC<MigrationManifestProps> = ({ currentUser, onCl
 
   const sortArrow = (column: string) => sortBy === column ? (sortDir === 'asc' ? ' ↑' : ' ↓') : '';
 
-  const statusColor = (() => {
-    switch (jobProgress?.status) {
-      case 'queued':
-      case 'running':
-        return 'text-amber-600';
-      case 'completed':
-        return 'text-emerald-600';
-      case 'failed':
-        return 'text-rose-600';
-      default:
-        return 'text-slate-400';
-    }
-  })();
-
   const selectedOriginalValues = useMemo(() => (
     selectedAttribute ? dedupeValues(selectedAttribute.features, (row) => row.originalValues) : []
   ), [selectedAttribute]);
@@ -353,9 +313,6 @@ const MigrationManifest: React.FC<MigrationManifestProps> = ({ currentUser, onCl
   ), [selectedAttribute]);
   const selectedNoiseValues = useMemo(() => (
     selectedAttribute ? dedupeValues(selectedAttribute.features, (row) => row.noiseValues) : []
-  ), [selectedAttribute]);
-  const isAttributeMergeSaved = useMemo(() => (
-    selectedAttribute ? selectedAttribute.features.some((row) => row.source === 'attr_merge' && row.isAccepted) : false
   ), [selectedAttribute]);
   const isValueMergeSaved = useMemo(() => (
     valueDetail ? valueDetail.entries.some((row) => row.source === 'value_merge' && row.isAccepted) : false
@@ -366,32 +323,26 @@ const MigrationManifest: React.FC<MigrationManifestProps> = ({ currentUser, onCl
       <div className="flex items-center justify-between px-5 py-3 bg-white border-b border-slate-200 shrink-0">
         <div className="flex items-center gap-3">
           <h1 className="text-sm font-black text-slate-800 uppercase tracking-wider">Migration Manifest</h1>
-          {jobProgress ? (
-            <span className={`text-[9px] font-black uppercase tracking-wider ${statusColor}`}>
-              {jobProgress.status === 'running' ? `Building ${jobProgress.progress}%` : jobProgress.status}
-              {jobProgress.status === 'completed' ? ` — ${jobProgress.generatedRows.toLocaleString()} rows` : ''}
+          {isReady === false ? (
+            <span className="text-[9px] font-black uppercase tracking-wider text-amber-600">
+              Prerequisites missing
             </span>
           ) : null}
         </div>
         <div className="flex items-center gap-2">
+          {mergedSummary.totalRows > 0 ? (
+            <span className="text-[9px] font-bold text-slate-500">
+              {mergedSummary.totalRows} merged mapping{mergedSummary.totalRows !== 1 ? 's' : ''} · {mergedSummary.distinctItems} item{mergedSummary.distinctItems !== 1 ? 's' : ''}
+            </span>
+          ) : null}
           <button
-            onClick={triggerBuild}
-            disabled={isActive || isTriggering}
-            className="flex items-center gap-1.5 px-3 py-1.5 bg-blue-600 text-white rounded-md text-[9px] font-black uppercase tracking-wider hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed transition-all"
+            onClick={() => setShowMergedView((prev) => !prev)}
+            className={`flex items-center gap-1.5 px-3 py-1.5 rounded-md text-[9px] font-black uppercase tracking-wider transition-all ${showMergedView ? 'bg-violet-600 text-white hover:bg-violet-700' : 'bg-violet-100 text-violet-700 hover:bg-violet-200'}`}
           >
-            {isActive ? (
-              <>
-                <div className="w-3 h-3 border-2 border-white border-t-transparent rounded-full animate-spin" />
-                Building...
-              </>
-            ) : (
-              <>
-                <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
-                </svg>
-                Build Manifest
-              </>
-            )}
+            <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 7h12m0 0l-4-4m4 4l-4 4m0 6H4m0 0l4 4m-4-4l4-4" />
+            </svg>
+            {showMergedView ? 'Showing Merged' : 'Show Merged'}
           </button>
           <button
             onClick={onClose}
@@ -411,9 +362,11 @@ const MigrationManifest: React.FC<MigrationManifestProps> = ({ currentUser, onCl
         </div>
       ) : null}
 
-      {isActive ? (
-        <div className="w-full h-1 bg-slate-200 shrink-0">
-          <div className="h-full bg-blue-500 transition-all duration-500" style={{ width: `${jobProgress?.progress ?? 0}%` }} />
+      {isReady === false ? (
+        <div className="px-5 py-3 text-[11px] border-b shrink-0 bg-amber-50 text-amber-800 border-amber-100">
+          Attribute Combinations ({readyInfo.attributeCombinations}) and Feature Combinations ({readyInfo.featureCombinations}) must be built before viewing the manifest.
+          {readyInfo.attributeCombinations === 0 ? ' Run Attribute Combinations analysis first.' : ''}
+          {readyInfo.featureCombinations === 0 ? ' Run Feature Combinations analysis first.' : ''}
         </div>
       ) : null}
 
@@ -493,7 +446,7 @@ const MigrationManifest: React.FC<MigrationManifestProps> = ({ currentUser, onCl
                   <th className="text-left px-3 py-2 text-[9px] font-black uppercase tracking-wider text-slate-500 border-b border-slate-200">Category / Product</th>
                   <th className="text-right px-3 py-2 text-[9px] font-black uppercase tracking-wider text-slate-500 border-b border-slate-200 cursor-pointer select-none hover:text-blue-600" onClick={() => handleSort('itemPriority')}>Priority{sortArrow('itemPriority')}</th>
                   <th className="text-right px-3 py-2 text-[9px] font-black uppercase tracking-wider text-slate-500 border-b border-slate-200 cursor-pointer select-none hover:text-blue-600" onClick={() => handleSort('totalRows')}>Rows{sortArrow('totalRows')}</th>
-                  <th className="text-right px-3 py-2 text-[9px] font-black uppercase tracking-wider text-slate-500 border-b border-slate-200 cursor-pointer select-none hover:text-blue-600" onClick={() => handleSort('attrMergeCount')}>Attr Merge{sortArrow('attrMergeCount')}</th>
+                  <th className="text-right px-3 py-2 text-[9px] font-black uppercase tracking-wider text-slate-500 border-b border-slate-200 cursor-pointer select-none hover:text-blue-600" onClick={() => handleSort('comboItemCount')}>Combo Items{sortArrow('comboItemCount')}</th>
                   <th className="text-right px-3 py-2 text-[9px] font-black uppercase tracking-wider text-slate-500 border-b border-slate-200 cursor-pointer select-none hover:text-blue-600" onClick={() => handleSort('valueMergeCount')}>Value Merge{sortArrow('valueMergeCount')}</th>
                   <th className="text-right px-3 py-2 text-[9px] font-black uppercase tracking-wider text-slate-500 border-b border-slate-200">Mapped</th>
                 </tr>
@@ -530,7 +483,7 @@ const MigrationManifest: React.FC<MigrationManifestProps> = ({ currentUser, onCl
                     </td>
                     <td className="px-3 py-2 text-right"><span className="inline-flex items-center justify-center min-w-[26px] px-1.5 py-0.5 rounded-full bg-amber-50 text-amber-700 text-[10px] font-bold">{item.itemPriority ?? '—'}</span></td>
                     <td className="px-3 py-2 text-right"><span className="inline-flex items-center justify-center min-w-[30px] px-2 py-0.5 rounded-full bg-slate-100 text-slate-700 text-[10px] font-bold">{item.totalRows}</span></td>
-                    <td className="px-3 py-2 text-right"><span className="inline-flex items-center justify-center min-w-[30px] px-2 py-0.5 rounded-full bg-sky-50 text-sky-700 text-[10px] font-bold">{item.attrMergeCount}</span></td>
+                    <td className="px-3 py-2 text-right"><span className="inline-flex items-center justify-center min-w-[30px] px-2 py-0.5 rounded-full bg-sky-50 text-sky-700 text-[10px] font-bold">{item.comboItemCount}</span></td>
                     <td className="px-3 py-2 text-right"><span className="inline-flex items-center justify-center min-w-[30px] px-2 py-0.5 rounded-full bg-amber-50 text-amber-700 text-[10px] font-bold">{item.valueMergeCount}</span></td>
                     <td className="px-3 py-2 text-right"><span className="inline-flex items-center justify-center min-w-[30px] px-2 py-0.5 rounded-full bg-emerald-50 text-emerald-700 text-[10px] font-bold">{item.mappedCount}</span></td>
                   </tr>
@@ -573,6 +526,7 @@ const MigrationManifest: React.FC<MigrationManifestProps> = ({ currentUser, onCl
                   <span className="inline-flex items-center px-2 py-0.5 rounded-full bg-slate-100 text-slate-700 text-[10px] font-bold">{selectedItem.itemCategory || 'No category'}</span>
                   <span className="inline-flex items-center px-2 py-0.5 rounded-full bg-slate-100 text-slate-700 text-[10px] font-bold">{selectedItem.itemProductType || 'No product type'}</span>
                   <span className="inline-flex items-center px-2 py-0.5 rounded-full bg-amber-50 text-amber-700 text-[10px] font-bold">P{selectedItem.itemPriority ?? '—'}</span>
+                  <span className="inline-flex items-center px-2 py-0.5 rounded-full bg-sky-50 text-sky-700 text-[10px] font-bold">{selectedItem.comboItemCount} item{selectedItem.comboItemCount !== 1 ? 's' : ''} in combo</span>
                 </div>
               </>
             ) : (
@@ -609,8 +563,7 @@ const MigrationManifest: React.FC<MigrationManifestProps> = ({ currentUser, onCl
                       <div className="text-[10px] text-slate-400">{group.attributeType || 'No type'} · {group.features.length} feature rows</div>
                     </div>
                     <div className="flex gap-1">
-                      {group.hasAttrMerge ? <span className="inline-flex items-center px-1.5 py-0.5 rounded bg-sky-50 text-sky-700 text-[9px] font-bold uppercase">Attr</span> : null}
-                      {group.hasValueMerge ? <span className="inline-flex items-center px-1.5 py-0.5 rounded bg-amber-50 text-amber-700 text-[9px] font-bold uppercase">Value</span> : null}
+                      {group.hasValueMerge ? <span className="inline-flex items-center px-1.5 py-0.5 rounded bg-amber-50 text-amber-700 text-[9px] font-bold uppercase">Value Merge</span> : null}
                     </div>
                   </div>
                   <div className="mt-2 text-[10px] text-slate-500 break-words">Features: {group.features.map((row) => row.legacyFeatureId).join(', ') || '—'}</div>
@@ -627,21 +580,6 @@ const MigrationManifest: React.FC<MigrationManifestProps> = ({ currentUser, onCl
                     <div className="text-sm font-black text-slate-800 break-words">{selectedAttribute.targetAttributeId || '(unmapped attribute)'}</div>
                     <div className="text-[10px] text-slate-400">{selectedAttribute.attributeType || 'No type'}</div>
                     </div>
-                    <div className="flex items-center gap-2 shrink-0">
-                      {isAttributeMergeSaved ? <span className="inline-flex items-center px-2 py-0.5 rounded bg-emerald-50 text-emerald-700 text-[9px] font-bold uppercase">Saved</span> : null}
-                      <button
-                        type="button"
-                        onClick={handleSaveAttributeMerge}
-                        disabled={!selectedAttribute.targetAttributeId || !selectedAttribute.hasAttrMerge || isSavingAttribute || isAttributeMergeSaved}
-                        className="px-2.5 py-1 rounded-md bg-sky-600 text-white text-[9px] font-black uppercase tracking-wider hover:bg-sky-700 disabled:opacity-40 disabled:cursor-not-allowed"
-                      >
-                        {isSavingAttribute ? 'Saving...' : isAttributeMergeSaved ? 'Saved' : 'Save Attribute Merge'}
-                      </button>
-                    </div>
-                  </div>
-                  <div>
-                    <div className="text-[9px] font-black uppercase tracking-wider text-slate-400">Suggested Attribute Merge</div>
-                    <div className="mt-1 text-slate-700">{selectedAttribute.hasAttrMerge ? 'Merge suggested for missing attribute coverage.' : 'No attribute merge needed.'}</div>
                   </div>
                   <div>
                     <div className="text-[9px] font-black uppercase tracking-wider text-slate-400">Original Values</div>
@@ -740,11 +678,55 @@ const MigrationManifest: React.FC<MigrationManifestProps> = ({ currentUser, onCl
                 </div>
               )}
             </div>
+
+            {showMergedView && selectedItem ? (
+              <div className="px-4 py-3 border-t border-violet-200 bg-violet-50/30">
+                <div className="flex items-center justify-between gap-2 mb-3">
+                  <div>
+                    <div className="text-[9px] font-black uppercase tracking-wider text-violet-600">Merged Workspace Mappings</div>
+                    <div className="text-[11px] text-slate-400">Saved merge results for {selectedItem.itemId} — separate from original workspace mappings.</div>
+                  </div>
+                  <span className="text-[10px] text-violet-500 font-bold">{mergedMappings.length} row{mergedMappings.length !== 1 ? 's' : ''}</span>
+                </div>
+                {isLoadingMerged ? (
+                  <div className="flex items-center justify-center gap-2 py-6 text-sm text-slate-400">
+                    <div className="w-4 h-4 border-2 border-violet-500 border-t-transparent rounded-full animate-spin" />
+                    Loading merged mappings...
+                  </div>
+                ) : mergedMappings.length === 0 ? (
+                  <div className="py-6 text-sm text-slate-400 text-center">No merged mappings saved yet for this item.</div>
+                ) : (
+                  <div className="rounded-xl border border-violet-200 overflow-hidden">
+                    <table className="w-full text-[11px]">
+                      <thead className="bg-violet-50">
+                        <tr>
+                          <th className="text-left px-3 py-1.5 text-[9px] font-black uppercase tracking-wider text-violet-500 border-b border-violet-200">Legacy Feature</th>
+                          <th className="text-left px-3 py-1.5 text-[9px] font-black uppercase tracking-wider text-violet-500 border-b border-violet-200">New Attribute</th>
+                          <th className="text-left px-3 py-1.5 text-[9px] font-black uppercase tracking-wider text-violet-500 border-b border-violet-200">Value</th>
+                          <th className="text-left px-3 py-1.5 text-[9px] font-black uppercase tracking-wider text-violet-500 border-b border-violet-200">Type</th>
+                          <th className="text-left px-3 py-1.5 text-[9px] font-black uppercase tracking-wider text-violet-500 border-b border-violet-200">Saved By</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-violet-100">
+                        {mergedMappings.map((row) => (
+                          <tr key={row.id} className="hover:bg-violet-50/50">
+                            <td className="px-3 py-1.5 text-slate-700 font-medium">{row.legacyFeatureId}</td>
+                            <td className="px-3 py-1.5 text-slate-700">{row.newAttributeId}</td>
+                            <td className="px-3 py-1.5 text-slate-600">{row.newValue || '—'}</td>
+                            <td className="px-3 py-1.5"><span className="px-1.5 py-0.5 rounded bg-violet-100 text-violet-700 text-[9px] font-bold">{row.attributeType || '—'}</span></td>
+                            <td className="px-3 py-1.5 text-slate-400">{row.signedOnByUsername || row.createdBy || '—'}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+              </div>
+            ) : null}
           </div>
 
           <div className="px-4 py-2 border-t border-slate-200 bg-slate-50 text-[10px] text-slate-500 shrink-0">
-            Updated {formatTimestamp(jobProgress?.updatedAt)}
-            {jobProgress?.error ? <span className="ml-2 text-rose-600">{jobProgress.error}</span> : null}
+            {total.toLocaleString()} items loaded
           </div>
         </div>
       </div>

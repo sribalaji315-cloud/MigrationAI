@@ -374,20 +374,6 @@ export interface AttrComboConsolidationAnalysis {
   mergeOptions: MergeOption[];
 }
 
-export interface MigrationManifestJobProgress {
-  id?: number;
-  status: 'idle' | 'queued' | 'running' | 'completed' | 'failed';
-  isActive: boolean;
-  progress: number;
-  totalItems: number;
-  processedItems: number;
-  generatedRows: number;
-  startedAt?: number | null;
-  finishedAt?: number | null;
-  updatedAt?: number | null;
-  error?: string | null;
-}
-
 export interface MigrationManifestRow {
   id: number;
   itemId: string;
@@ -408,6 +394,7 @@ export interface MigrationManifestRow {
   isAccepted: boolean;
   acceptedAt?: number | null;
   acceptedBy?: string | null;
+  comboItemCount: number;
   builtAt?: number | null;
 }
 
@@ -428,7 +415,7 @@ export interface MigrationManifestItemSummary {
   itemProductType: string;
   itemPriority?: number | null;
   totalRows: number;
-  attrMergeCount: number;
+  comboItemCount: number;
   valueMergeCount: number;
   mappedCount: number;
   noiseCount: number;
@@ -449,4 +436,26 @@ export interface MigrationManifestValueDetail {
   originalValues: string[];
   targetValues: string[];
   noiseValues: string[];
+}
+
+export interface MergedWorkspaceMappingRow {
+  id: number;
+  legacyItemId: string;
+  legacyFeatureId: string;
+  legacyValue: string;
+  newAttributeId: string;
+  newValue: string;
+  attributeType: string;
+  condition?: string | null;
+  formula?: string | null;
+  mappedFrom: string;
+  valueStatus?: string | null;
+  manifestEntryId?: number | null;
+  signedOnByUsername?: string | null;
+  signedOnAt?: number | null;
+  updatedAt: number;
+  version: number;
+  createdBy?: string | null;
+  modifiedBy?: string | null;
+  modifiedAt?: number | null;
 }
