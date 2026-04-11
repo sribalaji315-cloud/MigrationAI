@@ -15,6 +15,8 @@ const DataInspector = lazy(() => import('./components/DataInspector'));
 const MappingDashboard = lazy(() => import('./components/MappingDashboard'));
 const BOMHierarchy = lazy(() => import('./components/BOMHierarchy'));
 const FeatureCombinations = lazy(() => import('./components/FeatureCombinations'));
+const AttributeCombinations = lazy(() => import('./components/AttributeCombinations'));
+const MigrationManifest = lazy(() => import('./components/MigrationManifest'));
 
 const LazyFallback = () => (
   <div className="flex items-center justify-center p-8">
@@ -56,6 +58,8 @@ const App: React.FC = () => {
   const [showDashboard, setShowDashboard] = useState(false);
   const [showHierarchy, setShowHierarchy] = useState(false);
   const [showFeatureCombinations, setShowFeatureCombinations] = useState(false);
+  const [showAttributeCombinations, setShowAttributeCombinations] = useState(false);
+  const [showMigrationManifest, setShowMigrationManifest] = useState(false);
   const [showUnmappedOnlyInSidebar, setShowUnmappedOnlyInSidebar] = useState(false);
   const [featureFlags, setFeatureFlags] = useState<FeatureFlags>(() => ({
     useNewClassTargetMapping: import.meta.env.VITE_USE_NEW_CLASS_TARGET_MAPPING === 'true',
@@ -710,6 +714,12 @@ const App: React.FC = () => {
         onOpenFeatureCombinations={() => {
           setShowFeatureCombinations(true);
         }}
+        onOpenAttributeCombinations={() => {
+          setShowAttributeCombinations(true);
+        }}
+        onOpenMigrationManifest={() => {
+          setShowMigrationManifest(true);
+        }}
         mappingGenerationProgress={mappingGenerationProgress}
         onRetriggerGeneration={handleRetriggerGeneration}
         onRevertAllToGlobal={handleRevertAllToGlobal}
@@ -852,6 +862,24 @@ const App: React.FC = () => {
             <FeatureCombinations
               currentUser={currentUser}
               onClose={() => setShowFeatureCombinations(false)}
+            />
+          </Suspense>
+        )}
+
+        {showAttributeCombinations && (
+          <Suspense fallback={<LazyFallback />}>
+            <AttributeCombinations
+              currentUser={currentUser}
+              onClose={() => setShowAttributeCombinations(false)}
+            />
+          </Suspense>
+        )}
+
+        {showMigrationManifest && (
+          <Suspense fallback={<LazyFallback />}>
+            <MigrationManifest
+              currentUser={currentUser}
+              onClose={() => setShowMigrationManifest(false)}
             />
           </Suspense>
         )}

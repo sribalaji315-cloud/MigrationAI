@@ -1,5 +1,5 @@
 
-import { GlobalMapping, DatabaseState, User, ConnectionMode, NewAttribute, WorkspaceMappingRow, MappingGenerationProgress, ValueListGroup, ValueListRow, NewClassification, BomHierarchyItem, MLPrediction, MLSettings, FeatureCombinationJobProgress, FeatureCombinationRow, FeatureCombinationItem, ConsolidationAnalysis, SubsetMergeDetail } from '../types';
+import { GlobalMapping, DatabaseState, User, ConnectionMode, NewAttribute, WorkspaceMappingRow, MappingGenerationProgress, ValueListGroup, ValueListRow, NewClassification, BomHierarchyItem, MLPrediction, MLSettings, FeatureCombinationJobProgress, FeatureCombinationRow, FeatureCombinationItem, ConsolidationAnalysis, SubsetMergeDetail, AttributeCombinationJobProgress, AttributeCombinationRow, AttributeCombinationItem, AttrComboConsolidationAnalysis, MigrationManifestJobProgress, MigrationManifestRow, MigrationManifestFilters, MigrationManifestItemSummary, MigrationManifestAttributeGroup, MigrationManifestValueDetail } from '../types';
 
 export interface SaveAllResult {
   mode: ConnectionMode;
@@ -1268,6 +1268,183 @@ export const dbService = {
       const errText = await resp.text();
       throw new Error(`Failed to fetch consolidation plan: ${resp.status} ${errText}`);
     }
+    return resp.json();
+  },
+
+  async triggerAttributeCombinationBuild(attributeTypes?: string[]): Promise<{ ok: boolean; jobId: number | null }> {
+    if (!SQL_ENDPOINT) throw new Error('Database connection not available.');
+    const resp = await this._fetchWithRefresh(`${SQL_ENDPOINT}/attribute-combinations/trigger`, {
+      method: 'POST',
+      headers: { ...this._authHeaders(), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ attributeTypes: attributeTypes && attributeTypes.length > 0 ? attributeTypes : undefined }),
+    });
+    if (!resp.ok) {
+      const errText = await resp.text();
+      throw new Error(`Failed to trigger attribute combination build: ${resp.status} ${errText}`);
+    }
+    return resp.json();
+  },
+
+  async fetchAttributeCombinationProgress(): Promise<AttributeCombinationJobProgress> {
+    if (!SQL_ENDPOINT) throw new Error('Database connection not available.');
+    return this._cachedFetch(`${SQL_ENDPOINT}/attribute-combinations/progress`, {
+      headers: this._authHeaders(),
+    }, 3000);
+  },
+
+  async fetchAttributeCombinations(options?: { search?: string; category?: string; productType?: string; attributeType?: string; priority?: number; minFeatures?: number; maxFeatures?: number; sortBy?: string; sortDir?: string; analysisMode?: boolean; limit?: number; offset?: number }): Promise<{ items: AttributeCombinationRow[]; total: number }> {
+    if (!SQL_ENDPOINT) throw new Error('Database connection not available.');
+    const params = new URLSearchParams();
+    if (options?.search) params.set('search', options.search);
+    if (options?.category) params.set('category', options.category);
+    if (options?.productType) params.set('productType', options.productType);
+    if (options?.attributeType) params.set('attributeType', options.attributeType);
+    if (options?.priority !== undefined) params.set('priority', String(options.priority));
+    if (options?.minFeatures !== undefined) params.set('minFeatures', String(options.minFeatures));
+    if (options?.maxFeatures !== undefined) params.set('maxFeatures', String(options.maxFeatures));
+    if (options?.sortBy) params.set('sortBy', options.sortBy);
+    if (options?.sortDir) params.set('sortDir', options.sortDir ?? 'desc');
+    if (options?.analysisMode) params.set('analysisMode', 'true');
+    if (options?.limit !== undefined) params.set('limit', String(options.limit));
+    if (options?.offset !== undefined) params.set('offset', String(options.offset));
+    const query = params.toString();
+    return this._cachedFetch(`${SQL_ENDPOINT}/attribute-combinations/list${query ? `?${query}` : ''}`, {
+      headers: this._authHeaders(),
+    }, 5000);
+  },
+
+  async fetchAttributeCombinationFilters(): Promise<{ categories: string[]; productTypes: string[]; priorities: number[]; attributeTypes: string[]; availableAttributeTypes: string[] }> {
+    if (!SQL_ENDPOINT) throw new Error('Database connection not available.');
+    return this._cachedFetch(`${SQL_ENDPOINT}/attribute-combinations/filters`, {
+      headers: this._authHeaders(),
+    }, 30000);
+  },
+
+  async fetchAttributeCombinationItems(comboId: number): Promise<{ items: AttributeCombinationItem[] }> {
+    if (!SQL_ENDPOINT) throw new Error('Database connection not available.');
+    return this._cachedFetch(`${SQL_ENDPOINT}/attribute-combinations/${comboId}/items`, {
+      headers: this._authHeaders(),
+    }, 5000);
+  },
+
+  async fetchAttrComboConsolidationAnalysis(comboId: number): Promise<AttrComboConsolidationAnalysis> {
+    if (!SQL_ENDPOINT) throw new Error('Database connection not available.');
+    return this._cachedFetch(`${SQL_ENDPOINT}/attribute-combinations/analysis/${comboId}`, {
+      headers: this._authHeaders(),
+      _ttlMs: 15000,
+    });
+  },
+
+  async triggerMigrationManifestBuild(): Promise<{ ok: boolean; jobId: number | null }> {
+    if (!SQL_ENDPOINT) throw new Error('Database connection not available.');
+    const resp = await this._fetchWithRefresh(`${SQL_ENDPOINT}/migration-manifest/trigger`, {
+      method: 'POST',
+      headers: this._authHeaders(),
+    });
+    if (!resp.ok) {
+      const errText = await resp.text();
+      throw new Error(`Failed to trigger migration manifest build: ${resp.status} ${errText}`);
+    }
+    return resp.json();
+  },
+
+  async fetchMigrationManifestProgress(): Promise<MigrationManifestJobProgress> {
+    if (!SQL_ENDPOINT) throw new Error('Database connection not available.');
+    return this._cachedFetch(`${SQL_ENDPOINT}/migration-manifest/progress`, {
+      headers: this._authHeaders(),
+      _ttlMs: 4000,
+    });
+  },
+
+  async fetchMigrationManifestFilters(): Promise<MigrationManifestFilters> {
+    if (!SQL_ENDPOINT) throw new Error('Database connection not available.');
+    return this._cachedFetch(`${SQL_ENDPOINT}/migration-manifest/filters`, {
+      headers: this._authHeaders(),
+      _ttlMs: 30000,
+    });
+  },
+
+  async fetchMigrationManifest(options?: { search?: string; category?: string; productType?: string; priority?: number; source?: string; noiseType?: string; attributeType?: string; targetAttributeId?: string; hasNoise?: boolean; hasMapping?: boolean; sortBy?: string; sortDir?: string; limit?: number; offset?: number }): Promise<{ items: MigrationManifestRow[]; total: number }> {
+    if (!SQL_ENDPOINT) throw new Error('Database connection not available.');
+    const params = new URLSearchParams();
+    if (options?.search) params.set('search', options.search);
+    if (options?.category) params.set('category', options.category);
+    if (options?.productType) params.set('productType', options.productType);
+    if (options?.priority !== undefined) params.set('priority', String(options.priority));
+    if (options?.source) params.set('source', options.source);
+    if (options?.noiseType) params.set('noiseType', options.noiseType);
+    if (options?.attributeType) params.set('attributeType', options.attributeType);
+    if (options?.targetAttributeId) params.set('targetAttributeId', options.targetAttributeId);
+    if (options?.hasNoise !== undefined) params.set('hasNoise', String(options.hasNoise));
+    if (options?.hasMapping !== undefined) params.set('hasMapping', String(options.hasMapping));
+    if (options?.sortBy) params.set('sortBy', options.sortBy);
+    if (options?.sortDir) params.set('sortDir', options.sortDir ?? 'desc');
+    if (options?.limit !== undefined) params.set('limit', String(options.limit));
+    if (options?.offset !== undefined) params.set('offset', String(options.offset));
+    const query = params.toString();
+    return this._cachedFetch(`${SQL_ENDPOINT}/migration-manifest/list${query ? `?${query}` : ''}`, {
+      headers: this._authHeaders(),
+      _ttlMs: 5000,
+    });
+  },
+
+  async fetchMigrationManifestItem(itemId: string): Promise<{ items: MigrationManifestRow[] }> {
+    if (!SQL_ENDPOINT) throw new Error('Database connection not available.');
+    return this._cachedFetch(`${SQL_ENDPOINT}/migration-manifest/items/${encodeURIComponent(itemId)}`, {
+      headers: this._authHeaders(),
+      _ttlMs: 5000,
+    });
+  },
+
+  async fetchMigrationManifestItemSummaries(options?: { search?: string; category?: string; productType?: string; priority?: number; source?: string; hasNoise?: boolean; hasMapping?: boolean; sortBy?: string; sortDir?: string; limit?: number; offset?: number }): Promise<{ items: MigrationManifestItemSummary[]; total: number }> {
+    if (!SQL_ENDPOINT) throw new Error('Database connection not available.');
+    const params = new URLSearchParams();
+    if (options?.search) params.set('search', options.search);
+    if (options?.category) params.set('category', options.category);
+    if (options?.productType) params.set('productType', options.productType);
+    if (options?.priority !== undefined) params.set('priority', String(options.priority));
+    if (options?.source) params.set('source', options.source);
+    if (options?.hasNoise !== undefined) params.set('hasNoise', String(options.hasNoise));
+    if (options?.hasMapping !== undefined) params.set('hasMapping', String(options.hasMapping));
+    if (options?.sortBy) params.set('sortBy', options.sortBy);
+    if (options?.sortDir) params.set('sortDir', options.sortDir ?? 'desc');
+    if (options?.limit !== undefined) params.set('limit', String(options.limit));
+    if (options?.offset !== undefined) params.set('offset', String(options.offset));
+    const query = params.toString();
+    return this._cachedFetch(`${SQL_ENDPOINT}/migration-manifest/item-summaries${query ? `?${query}` : ''}`, {
+      headers: this._authHeaders(),
+      _ttlMs: 5000,
+    });
+  },
+
+  async fetchMigrationManifestItemAttributes(itemId: string): Promise<{ attributes: MigrationManifestAttributeGroup[] }> {
+    if (!SQL_ENDPOINT) throw new Error('Database connection not available.');
+    return this._cachedFetch(`${SQL_ENDPOINT}/migration-manifest/items/${encodeURIComponent(itemId)}/attributes`, {
+      headers: this._authHeaders(),
+      _ttlMs: 5000,
+    });
+  },
+
+  async fetchMigrationManifestValueDetail(itemId: string, targetAttributeId: string): Promise<MigrationManifestValueDetail> {
+    if (!SQL_ENDPOINT) throw new Error('Database connection not available.');
+    return this._cachedFetch(`${SQL_ENDPOINT}/migration-manifest/items/${encodeURIComponent(itemId)}/attributes/${encodeURIComponent(targetAttributeId)}/values`, {
+      headers: this._authHeaders(),
+      _ttlMs: 5000,
+    });
+  },
+
+  async saveMigrationManifestSelection(itemId: string, targetAttributeId: string, sources: Array<'attr_merge' | 'value_merge'>): Promise<{ ok: boolean; rowsSaved: number; savedAt: number; savedBy?: string | null; sources: string[] }> {
+    if (!SQL_ENDPOINT) throw new Error('Database connection not available.');
+    const resp = await this._fetchWithRefresh(`${SQL_ENDPOINT}/migration-manifest/save-selection`, {
+      method: 'POST',
+      headers: { ...this._authHeaders(), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ itemId, targetAttributeId, sources }),
+    });
+    if (!resp.ok) {
+      const errText = await resp.text();
+      throw new Error(`Failed to save migration manifest selection: ${resp.status} ${errText}`);
+    }
+    this._invalidateCache();
     return resp.json();
   },
 };

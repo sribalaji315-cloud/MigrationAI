@@ -328,3 +328,100 @@ class ConsolidationPlan(Base):
     created_at = Column(Float, nullable=True)
     updated_by = Column(String, nullable=True)
     updated_at = Column(Float, nullable=True)
+
+
+class AttributeCombinationJob(Base):
+    """Tracks async attribute-combination build job state."""
+
+    __tablename__ = "attribute_combination_jobs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    status = Column(String, index=True, nullable=False)  # queued|running|completed|failed
+    triggered_by_user_id = Column(String, nullable=True)
+    triggered_by_username = Column(String, nullable=True)
+    selected_attribute_types = Column(JSON, nullable=True)  # list of attribute type strings chosen by user
+    total_items = Column(Integer, nullable=False, default=0)
+    processed_items = Column(Integer, nullable=False, default=0)
+    generated_rows = Column(Integer, nullable=False, default=0)
+    started_at = Column(Float, nullable=True)
+    finished_at = Column(Float, nullable=True)
+    updated_at = Column(Float, nullable=False, default=0)
+    error_message = Column(String, nullable=True)
+
+
+class AttributeCombination(Base):
+    """Pre-built summary: one row per unique set of attribute/feature IDs across BOM items.
+
+    Each row represents all BOM items that have the exact same set of feature/attribute IDs
+    (their attribute fingerprint). ``feature_ids_key`` is a pipe-joined sorted list of feature IDs.
+    """
+
+    __tablename__ = "attribute_combinations"
+    __table_args__ = (
+        Index("ix_attribute_combinations_key", "feature_ids_key"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    feature_ids_key = Column(String, nullable=False)
+    feature_ids_json = Column(JSON, nullable=False)   # sorted list of feature_id strings
+    feature_count = Column(Integer, nullable=False, default=0)
+    item_count = Column(Integer, nullable=False, default=0)
+    item_ids_json = Column(JSON, nullable=True)         # list of item_id strings
+    attribute_types_json = Column(JSON, nullable=True)  # sorted distinct attribute types for the features
+    priorities_json = Column(JSON, nullable=True)       # sorted distinct priorities
+    categories_json = Column(JSON, nullable=True)       # sorted distinct categories
+    product_types_json = Column(JSON, nullable=True)    # sorted distinct product types
+    built_at = Column(Float, nullable=True)
+
+
+class MigrationManifestJob(Base):
+    """Tracks async migration-manifest build job state."""
+
+    __tablename__ = "migration_manifest_jobs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    status = Column(String, index=True, nullable=False)  # queued|running|completed|failed
+    triggered_by_username = Column(String, nullable=True)
+    total_items = Column(Integer, nullable=False, default=0)
+    processed_items = Column(Integer, nullable=False, default=0)
+    generated_rows = Column(Integer, nullable=False, default=0)
+    started_at = Column(Float, nullable=True)
+    finished_at = Column(Float, nullable=True)
+    updated_at = Column(Float, nullable=False, default=0)
+    error_message = Column(String, nullable=True)
+
+
+class MigrationManifestEntry(Base):
+    """One row per item x legacy feature — the unified merge output.
+
+    Captures original mappings, value-merge noise, and attribute-merge noise
+    in a single flat table for the Migration Manifest view.
+    """
+
+    __tablename__ = "migration_manifest_entries"
+    __table_args__ = (
+        Index("ix_manifest_item", "item_id"),
+        Index("ix_manifest_feature", "legacy_feature_id"),
+        Index("ix_manifest_target", "target_attribute_id"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    item_id = Column(String, nullable=False)
+    item_description = Column(String, nullable=True)
+    item_category = Column(String, nullable=True)
+    item_product_type = Column(String, nullable=True)
+    item_priority = Column(Integer, nullable=True)
+    legacy_feature_id = Column(String, nullable=False)
+    target_attribute_id = Column(String, nullable=True)
+    attribute_type = Column(String, nullable=True)
+    source = Column(String, nullable=False, default="original")  # original|value_merge|attr_merge
+    is_noise = Column(Integer, nullable=False, default=0)  # 0 or 1
+    noise_type = Column(String, nullable=True)  # missing_value|missing_attribute|null
+    original_values_json = Column(JSON, nullable=True)  # legacy values the item actually had
+    target_values_json = Column(JSON, nullable=True)     # mapped target values
+    noise_values_json = Column(JSON, nullable=True)      # values added by value merge
+    has_mapping = Column(Integer, nullable=False, default=0)  # 0 or 1
+    is_accepted = Column(Integer, nullable=False, default=0)  # 0 or 1
+    accepted_at = Column(Float, nullable=True)
+    accepted_by_username = Column(String, nullable=True)
+    built_at = Column(Float, nullable=True)

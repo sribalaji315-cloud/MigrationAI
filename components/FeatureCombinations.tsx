@@ -209,7 +209,7 @@ const FeatureCombinations: React.FC<FeatureCombinationsProps> = ({ currentUser, 
   }, [pollProgress]);
 
   // Auto-refresh list + filters after job completes
-  const prevStatusRef = useRef<string | undefined>();
+  const prevStatusRef = useRef<string | undefined>(undefined);
   useEffect(() => {
     if (prevStatusRef.current === 'running' && jobProgress?.status === 'completed') {
       fetchList(0, search, filterFeatureIds, filterAttributeTypes, filterPriorities, filterStatuses, sortBy, sortDir, analysisMode);

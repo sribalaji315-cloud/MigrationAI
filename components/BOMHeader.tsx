@@ -15,6 +15,8 @@ interface BOMHeaderProps {
   onOpenDashboard: () => void;
   onOpenHierarchy: () => void;
   onOpenFeatureCombinations: () => void;
+  onOpenAttributeCombinations: () => void;
+  onOpenMigrationManifest: () => void;
   mappingGenerationProgress?: MappingGenerationProgress | null;
   onRetriggerGeneration?: () => void;
   onRevertAllToGlobal?: () => void;
@@ -23,7 +25,7 @@ interface BOMHeaderProps {
   mlPredictionProgress?: { status: string; progress: number; total: number; processed: number } | null;
 }
 
-const BOMHeader: React.FC<BOMHeaderProps> = ({ onRegenerate, isRefreshing, onInspectData, onCommit, currentUser, onLogout, onClearCache, onExportBomCsv, onOpenDashboard, onOpenHierarchy, onOpenFeatureCombinations, mappingGenerationProgress, onRetriggerGeneration, onRevertAllToGlobal, isMappingGenerationActive, onPredictAll, mlPredictionProgress }) => {
+const BOMHeader: React.FC<BOMHeaderProps> = ({ onRegenerate, isRefreshing, onInspectData, onCommit, currentUser, onLogout, onClearCache, onExportBomCsv, onOpenDashboard, onOpenHierarchy, onOpenFeatureCombinations, onOpenAttributeCombinations, onOpenMigrationManifest, mappingGenerationProgress, onRetriggerGeneration, onRevertAllToGlobal, isMappingGenerationActive, onPredictAll, mlPredictionProgress }) => {
   const uploadOptions: { label: string; id: DataCategory; icon: string; adminOnly?: boolean }[] = [
     { label: 'Global Mapping', id: 'mapping', icon: 'M8 7v8a2 2 0 002 2h6M8 7V5a2 2 0 012-2h4.586a1 1 0 01.707.293l4.414 4.414a1 1 0 01.293.707V15a2 2 0 01-2 2h-2' },
     { label: 'Classifications', id: 'classification', icon: 'M4 6h16M4 10h16M4 14h16M4 18h16' },
@@ -338,6 +340,28 @@ const BOMHeader: React.FC<BOMHeaderProps> = ({ onRegenerate, isRefreshing, onIns
                       <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10" />
                     </svg>
                     Feature Combos
+                  </button>
+
+                  <button 
+                    type="button"
+                    onClick={onOpenAttributeCombinations}
+                    className="flex items-center gap-1.5 px-2.5 py-1.5 bg-sky-50 text-sky-700 border border-sky-100 hover:bg-sky-100 rounded-md text-[9px] font-black transition-all whitespace-nowrap uppercase tracking-wider"
+                  >
+                    <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 6a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2H6a2 2 0 01-2-2V6zM14 6a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2V6zM4 16a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2H6a2 2 0 01-2-2v-2zM14 16a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2v-2z" />
+                    </svg>
+                    Attribute Combos
+                  </button>
+
+                  <button 
+                    type="button"
+                    onClick={onOpenMigrationManifest}
+                    className="flex items-center gap-1.5 px-2.5 py-1.5 bg-indigo-50 text-indigo-700 border border-indigo-100 hover:bg-indigo-100 rounded-md text-[9px] font-black transition-all whitespace-nowrap uppercase tracking-wider"
+                  >
+                    <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6M7 4h7l5 5v11a2 2 0 01-2 2H7a2 2 0 01-2-2V6a2 2 0 012-2z" />
+                    </svg>
+                    Migration Manifest
                   </button>
 
                   <button 

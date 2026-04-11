@@ -3317,16 +3317,49 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
                     {(editingRecord.legacyFeatureIds || []).join(' | ') || 'New Mapping'}
                   </p>
                 </div>
-                <button
-                  type="button"
-                  onClick={() => setEditingRecord(null)}
-                  className="p-1.5 rounded-md text-slate-300 hover:text-slate-600 hover:bg-slate-50 transition-all"
-                  title="Close mapping detail"
-                >
-                  <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
-                  </svg>
-                </button>
+                <div className="flex items-center gap-2">
+                  {currentUser.role === 'admin' && editingRecord._clientEditedAt !== undefined && (
+                    <button
+                      type="button"
+                      disabled={isSaving}
+                      onClick={async () => {
+                        setIsSaving(true);
+                        try {
+                          await dbService.upsertGlobalMapping(editingRecord);
+                          setEditingRecord(null);
+                          const freshPage = await dbService.fetchGlobalMappingsPaginated({
+                            limit: PAGE_SIZE,
+                            offset: 0,
+                            search: mappingSearch || undefined,
+                          });
+                          setServerMappings(freshPage.items);
+                          setLocalMapping(freshPage.items);
+                          setServerMappingTotal(freshPage.total);
+                          onCountsChanged?.({ mappingTotal: freshPage.total });
+                          setPage(0);
+                        } catch (err: any) {
+                          console.error('Failed to save mapping', err);
+                          alert(`Save failed: ${err?.message || String(err)}`);
+                        } finally {
+                          setIsSaving(false);
+                        }
+                      }}
+                      className="px-4 py-1.5 bg-blue-600 text-white rounded-lg text-[9px] font-black hover:bg-blue-700 shadow-sm transition-all active:scale-95 uppercase tracking-widest disabled:opacity-60 disabled:cursor-not-allowed"
+                    >
+                      {isSaving ? 'Saving...' : 'Save'}
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    onClick={() => setEditingRecord(null)}
+                    className="p-1.5 rounded-md text-slate-300 hover:text-slate-600 hover:bg-slate-50 transition-all"
+                    title="Close mapping detail"
+                  >
+                    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                    </svg>
+                  </button>
+                </div>
               </div>
 
               <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-4">

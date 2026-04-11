@@ -313,3 +313,140 @@ export interface SubsetMergeDetail {
   errorMessage?: string | null;
   lists: SubsetMergeList[];
 }
+
+export interface AttributeCombinationJobProgress {
+  id?: number;
+  status: 'idle' | 'queued' | 'running' | 'completed' | 'failed';
+  isActive: boolean;
+  progress: number;
+  totalItems: number;
+  processedItems: number;
+  generatedRows: number;
+  selectedAttributeTypes: string[];
+  startedAt?: number | null;
+  finishedAt?: number | null;
+  error?: string | null;
+}
+
+export interface AttributeCombinationRow {
+  id: number;
+  featureIdsKey: string;
+  featureIds: string[];
+  featureCount: number;
+  itemCount: number;
+  filteredItemCount?: number | null;
+  similarCount?: number;
+  attributeTypes: string[];
+  priorities: number[];
+  categories: string[];
+  productTypes: string[];
+  builtAt?: number | null;
+}
+
+export interface AttributeCombinationItem {
+  itemId: string;
+  description: string;
+  category: string;
+  productType: string;
+  priority?: number | null;
+}
+
+export interface AttrComboSimilarFingerprint {
+  comboId: number;
+  featureIds: string[];
+  featureCount: number;
+  itemCount: number;
+  relationship: 'identical' | 'subset' | 'superset' | 'overlap';
+  overlapPercent: number;
+  commonAttributes: string[];
+  uniqueAttributes: string[];
+}
+
+export interface AttrComboConsolidationAnalysis {
+  comboId: number;
+  fingerprint: string[];
+  featureCount: number;
+  totalSimilar: number;
+  totalItems: number;
+  commonAttributes: string[];
+  unionAttributes: string[];
+  similarCombos: AttrComboSimilarFingerprint[];
+  mergeOptions: MergeOption[];
+}
+
+export interface MigrationManifestJobProgress {
+  id?: number;
+  status: 'idle' | 'queued' | 'running' | 'completed' | 'failed';
+  isActive: boolean;
+  progress: number;
+  totalItems: number;
+  processedItems: number;
+  generatedRows: number;
+  startedAt?: number | null;
+  finishedAt?: number | null;
+  updatedAt?: number | null;
+  error?: string | null;
+}
+
+export interface MigrationManifestRow {
+  id: number;
+  itemId: string;
+  itemDescription: string;
+  itemCategory: string;
+  itemProductType: string;
+  itemPriority?: number | null;
+  legacyFeatureId: string;
+  targetAttributeId: string;
+  attributeType: string;
+  source: 'original' | 'value_merge' | 'attr_merge';
+  isNoise: boolean;
+  noiseType: string;
+  originalValues: string[];
+  targetValues: string[];
+  noiseValues: string[];
+  hasMapping: boolean;
+  isAccepted: boolean;
+  acceptedAt?: number | null;
+  acceptedBy?: string | null;
+  builtAt?: number | null;
+}
+
+export interface MigrationManifestFilters {
+  categories: string[];
+  productTypes: string[];
+  priorities: number[];
+  sources: string[];
+  noiseTypes: string[];
+  attributeTypes: string[];
+  targetAttributes: string[];
+}
+
+export interface MigrationManifestItemSummary {
+  itemId: string;
+  itemDescription: string;
+  itemCategory: string;
+  itemProductType: string;
+  itemPriority?: number | null;
+  totalRows: number;
+  attrMergeCount: number;
+  valueMergeCount: number;
+  mappedCount: number;
+  noiseCount: number;
+}
+
+export interface MigrationManifestAttributeGroup {
+  targetAttributeId: string;
+  attributeType: string;
+  features: MigrationManifestRow[];
+  hasAttrMerge: boolean;
+  hasValueMerge: boolean;
+}
+
+export interface MigrationManifestValueDetail {
+  itemId: string;
+  targetAttributeId: string;
+  entries: MigrationManifestRow[];
+  originalValues: string[];
+  targetValues: string[];
+  noiseValues: string[];
+}
