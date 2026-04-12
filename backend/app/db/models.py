@@ -125,6 +125,7 @@ class WorkspaceMapping(Base):
     formula = Column(String, nullable=True)
     mapped_from = Column(String, nullable=False, default="global")
     value_status = Column(String, nullable=True, index=True)  # null|discontinued|ignored|deprecated
+    feasibility = Column(String, nullable=True)  # Yes|No — auto-derived from new_value
     signed_on_by_user_id = Column(String, index=True, nullable=True)
     signed_on_by_username = Column(String, nullable=True)
     signed_on_at = Column(Float, nullable=True)
@@ -425,6 +426,10 @@ class MigrationManifestEntry(Base):
     accepted_at = Column(Float, nullable=True)
     accepted_by_username = Column(String, nullable=True)
     combo_item_count = Column(Integer, nullable=False, default=1)  # items sharing same feature combo
+    attribute_footprint = Column(String, nullable=True, index=True)
+    value_footprint = Column(String, nullable=True, index=True)
+    attribute_footprint_item_count = Column(Integer, nullable=False, default=1)
+    value_footprint_item_count = Column(Integer, nullable=False, default=1)
     built_at = Column(Float, nullable=True)
 
 
@@ -458,6 +463,7 @@ class MergedWorkspaceMapping(Base):
     formula = Column(String, nullable=True)
     mapped_from = Column(String, nullable=False, default="manifest")
     value_status = Column(String, nullable=True, index=True)
+    feasibility = Column(String, nullable=True)  # Yes|No — auto-derived from new_value
     manifest_entry_id = Column(Integer, nullable=True, index=True)
     signed_on_by_user_id = Column(String, index=True, nullable=True)
     signed_on_by_username = Column(String, nullable=True)
@@ -470,6 +476,26 @@ class MergedWorkspaceMapping(Base):
     # Valuelist strategy columns
     valuelist_id = Column(String, nullable=True, index=True)
     is_effective_fixed = Column(Integer, nullable=False, default=0)
+    # Batch job footprint columns
+    attribute_footprint = Column(String, nullable=True, index=True)
+    value_footprint = Column(String, nullable=True, index=True)
+
+
+class ManifestItemStats(Base):
+    """Pre-computed per-item summary counts for migration manifest.
+
+    Populated by the merge batch job for fast API reads.
+    """
+
+    __tablename__ = "manifest_item_stats"
+
+    id = Column(Integer, primary_key=True, index=True)
+    item_id = Column(String, nullable=False, unique=True, index=True)
+    attr_count = Column(Integer, nullable=False, default=0)
+    mapped_count = Column(Integer, nullable=False, default=0)
+    combo_item_count = Column(Integer, nullable=False, default=1)
+    shared_vl_count = Column(Integer, nullable=False, default=0)
+    attribute_footprint = Column(String, nullable=True)
 
 
 class ValuelistStrategyJob(Base):
@@ -512,3 +538,25 @@ class TargetAttributeProfile(Base):
     job_id = Column(Integer, nullable=True, index=True)
     created_at = Column(Float, nullable=True)
     updated_at = Column(Float, nullable=True)
+
+
+class MergeJob(Base):
+    """Tracks async merge batch job state.
+
+    The merge batch job copies included workspace_mappings to
+    merged_workspace_mappings, sets feasibility, and computes
+    attribute_footprint and value_footprint per item.
+    """
+
+    __tablename__ = "merge_jobs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    status = Column(String, index=True, nullable=False)  # queued|running|completed|failed
+    triggered_by_username = Column(String, nullable=True)
+    total_items = Column(Integer, nullable=False, default=0)
+    processed_items = Column(Integer, nullable=False, default=0)
+    generated_rows = Column(Integer, nullable=False, default=0)
+    started_at = Column(Float, nullable=True)
+    finished_at = Column(Float, nullable=True)
+    updated_at = Column(Float, nullable=False, default=0)
+    error_message = Column(String, nullable=True)

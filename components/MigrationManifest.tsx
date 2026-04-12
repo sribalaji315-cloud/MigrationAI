@@ -1,6 +1,8 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
+  MergedWorkspaceMappingDetail,
   MergedWorkspaceMappingRow,
+  MergeJob,
   MigrationManifestAttributeGroup,
   MigrationManifestFilters,
   MigrationManifestItemSummary,
@@ -22,6 +24,100 @@ interface MigrationManifestProps {
 const PAGE_SIZE = 20;
 const MIN_LEFT_W = 360;
 const MIN_RIGHT_W = 340;
+
+const DONUT_COLORS = [
+  '#3b82f6', '#8b5cf6', '#f97316', '#22c55e', '#06b6d4',
+  '#ec4899', '#eab308', '#14b8a6', '#ef4444', '#6366f1',
+  '#84cc16', '#f59e0b',
+];
+
+interface SegmentedDonutSlice {
+  label: string;
+  value: number;
+  color: string;
+  extra?: string;
+}
+
+const SegmentedDonut: React.FC<{
+  title: string;
+  slices: SegmentedDonutSlice[];
+  centerLabel?: string;
+  centerValue?: string;
+}> = ({ title, slices, centerLabel, centerValue }) => {
+  const size = 160;
+  const strokeWidth = 20;
+  const radius = (size - strokeWidth) / 2;
+  const circumference = 2 * Math.PI * radius;
+  const total = slices.reduce((s, sl) => s + sl.value, 0);
+  const [hovered, setHovered] = React.useState<number | null>(null);
+
+  let cumulative = 0;
+  const arcs = slices.map((sl) => {
+    const frac = total > 0 ? sl.value / total : 0;
+    const dash = circumference * frac;
+    const gap = circumference - dash;
+    const offset = -circumference * cumulative;
+    cumulative += frac;
+    return { ...sl, dash, gap, offset, frac };
+  });
+
+  return (
+    <div className="flex flex-col items-center p-3 rounded-xl border border-slate-100 shadow-sm bg-white">
+      <div className="text-[9px] font-black uppercase tracking-widest text-slate-400 mb-2">{title}</div>
+      <div className="relative" style={{ width: size, height: size }}>
+        <svg width={size} height={size}>
+          <g transform={`rotate(-90 ${size / 2} ${size / 2})`}>
+            <circle cx={size / 2} cy={size / 2} r={radius} stroke="#f1f5f9" strokeWidth={strokeWidth} fill="none" />
+            {arcs.map((a, i) => (
+              <circle
+                key={i}
+                cx={size / 2}
+                cy={size / 2}
+                r={radius}
+                stroke={a.color}
+                strokeWidth={hovered === i ? strokeWidth + 4 : strokeWidth}
+                fill="none"
+                strokeDasharray={`${a.dash} ${a.gap}`}
+                strokeDashoffset={a.offset}
+                style={{ transition: 'stroke-width 0.15s', cursor: 'pointer' }}
+                onMouseEnter={() => setHovered(i)}
+                onMouseLeave={() => setHovered(null)}
+              />
+            ))}
+          </g>
+        </svg>
+        <div className="absolute inset-0 flex flex-col items-center justify-center pointer-events-none">
+          {hovered !== null ? (
+            <>
+              <span className="text-lg font-black text-slate-900">{Math.round(arcs[hovered].frac * 100)}%</span>
+              <span className="text-[8px] font-bold text-slate-500 uppercase tracking-wider text-center px-2 leading-tight max-w-[90px] truncate">{arcs[hovered].label}</span>
+            </>
+          ) : (
+            <>
+              <span className="text-lg font-black text-slate-900">{centerValue ?? total.toLocaleString()}</span>
+              <span className="text-[8px] font-bold text-slate-400 uppercase tracking-wider">{centerLabel ?? 'items'}</span>
+            </>
+          )}
+        </div>
+      </div>
+      <div className="mt-2 flex flex-wrap justify-center gap-x-3 gap-y-0.5 max-w-[260px]">
+        {arcs.map((a, i) => (
+          <div
+            key={i}
+            className={`flex items-center gap-1 text-[9px] cursor-default transition-opacity ${hovered !== null && hovered !== i ? 'opacity-40' : ''}`}
+            onMouseEnter={() => setHovered(i)}
+            onMouseLeave={() => setHovered(null)}
+          >
+            <span className="w-2 h-2 rounded-full shrink-0" style={{ backgroundColor: a.color }} />
+            <span className="text-slate-600 font-medium truncate max-w-[80px]" title={a.label}>{a.label}</span>
+            <span className="text-slate-400">{a.value}</span>
+            {a.extra ? <span className="text-slate-300">({a.extra})</span> : null}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+};
 
 const sourceTone: Record<string, string> = {
   original: 'bg-slate-100 text-slate-700 border-slate-200',
@@ -66,8 +162,7 @@ const MigrationManifest: React.FC<MigrationManifestProps> = ({ currentUser, onCl
   const [category, setCategory] = useState('');
   const [productType, setProductType] = useState('');
   const [priority, setPriority] = useState('');
-  const [source, setSource] = useState('');
-  const [hasNoise, setHasNoise] = useState('');
+  const [attributeType, setAttributeType] = useState('');
   const [hasMapping, setHasMapping] = useState('');
   const [sortBy, setSortBy] = useState('itemPriority');
   const [sortDir, setSortDir] = useState<'asc' | 'desc'>('desc');
@@ -87,9 +182,14 @@ const MigrationManifest: React.FC<MigrationManifestProps> = ({ currentUser, onCl
   const [statusMessage, setStatusMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
 
   const [showMergedView, setShowMergedView] = useState(false);
-  const [mergedMappings, setMergedMappings] = useState<MergedWorkspaceMappingRow[]>([]);
+  const [mergedDetail, setMergedDetail] = useState<MergedWorkspaceMappingDetail | null>(null);
   const [isLoadingMerged, setIsLoadingMerged] = useState(false);
-  const [mergedSummary, setMergedSummary] = useState<{ totalRows: number; distinctItems: number }>({ totalRows: 0, distinctItems: 0 });
+  const [mergedSummary, setMergedSummary] = useState<{ totalRows: number; distinctItems: number; metrics?: { emptyAttributeFootprints: number; uniqueAttributeFootprints: number; itemsWithCombo: number; maxComboSize: number; uniqueValueFootprints: number; emptyValueFootprintAttrs: number; itemsWithSharedVL: number; totalSharedVLAttrs: number }; footprintItems?: { category: string; productType: string; priority: string; hasAttrFp: boolean; attrFp: string; count: number }[]; filterOptions?: { categories: string[]; productTypes: string[]; priorities: string[] } }>({ totalRows: 0, distinctItems: 0 });
+  const [fpFilterCategory, setFpFilterCategory] = useState('__all__');
+  const [fpFilterProductType, setFpFilterProductType] = useState('__all__');
+  const [fpFilterPriority, setFpFilterPriority] = useState('__all__');
+  const [showFpDashboard, setShowFpDashboard] = useState(false);
+  const [rightTab, setRightTab] = useState<'mappings' | 'combo' | 'sharedvl'>('mappings');
 
   // Valuelist Strategy state
   const [showVlStrategy, setShowVlStrategy] = useState(false);
@@ -106,9 +206,15 @@ const MigrationManifest: React.FC<MigrationManifestProps> = ({ currentUser, onCl
   const [vlStatusMessage, setVlStatusMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
   const vlPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
+  // Merge Batch Job state
+  const [mergeJob, setMergeJob] = useState<MergeJob | null>(null);
+  const [isMergeJobRunning, setIsMergeJobRunning] = useState(false);
+  const mergeJobPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
   const containerRef = useRef<HTMLDivElement>(null);
   const draggingRef = useRef(false);
-  const [rightPanelWidth, setRightPanelWidth] = useState(420);
+  const [rightPanelWidth, setRightPanelWidth] = useState(480);
+  const [rightPanelOpen, setRightPanelOpen] = useState(false);
 
   const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
 
@@ -160,8 +266,7 @@ const MigrationManifest: React.FC<MigrationManifestProps> = ({ currentUser, onCl
         category: category || undefined,
         productType: productType || undefined,
         priority: priority ? Number(priority) : undefined,
-        source: source || undefined,
-        hasNoise: hasNoise === '' ? undefined : hasNoise === 'true',
+        attributeType: attributeType || undefined,
         hasMapping: hasMapping === '' ? undefined : hasMapping === 'true',
         sortBy,
         sortDir,
@@ -181,7 +286,7 @@ const MigrationManifest: React.FC<MigrationManifestProps> = ({ currentUser, onCl
     } finally {
       setIsLoadingItems(false);
     }
-  }, [page, search, category, productType, priority, source, hasNoise, hasMapping, sortBy, sortDir, resetSelection]);
+  }, [page, search, category, productType, priority, attributeType, hasMapping, sortBy, sortDir, resetSelection]);
 
   const loadAttributes = useCallback(async (itemId: string) => {
     setIsLoadingAttributes(true);
@@ -221,10 +326,10 @@ const MigrationManifest: React.FC<MigrationManifestProps> = ({ currentUser, onCl
   const loadMergedMappings = useCallback(async (itemId: string) => {
     setIsLoadingMerged(true);
     try {
-      const response = await dbService.fetchMergedWorkspaceMappings(itemId);
-      setMergedMappings(response.items);
+      const response = await dbService.fetchMergedWorkspaceMappingsDetail(itemId);
+      setMergedDetail(response);
     } catch {
-      setMergedMappings([]);
+      setMergedDetail(null);
     } finally {
       setIsLoadingMerged(false);
     }
@@ -250,7 +355,7 @@ const MigrationManifest: React.FC<MigrationManifestProps> = ({ currentUser, onCl
 
   useEffect(() => {
     loadItemSummaries(page, search);
-  }, [page, search, category, productType, priority, source, hasNoise, hasMapping, sortBy, sortDir, loadItemSummaries]);
+  }, [page, search, category, productType, priority, attributeType, hasMapping, sortBy, sortDir, loadItemSummaries]);
 
   useEffect(() => {
     if (selectedItem?.itemId) {
@@ -259,12 +364,12 @@ const MigrationManifest: React.FC<MigrationManifestProps> = ({ currentUser, onCl
   }, [selectedItem?.itemId, loadAttributes]);
 
   useEffect(() => {
-    if (selectedItem?.itemId && showMergedView) {
+    if (selectedItem?.itemId) {
       loadMergedMappings(selectedItem.itemId);
     } else {
-      setMergedMappings([]);
+      setMergedDetail(null);
     }
-  }, [selectedItem?.itemId, showMergedView, loadMergedMappings]);
+  }, [selectedItem?.itemId, loadMergedMappings]);
 
   useEffect(() => {
     if (selectedItem?.itemId && selectedAttribute?.targetAttributeId) {
@@ -292,13 +397,73 @@ const MigrationManifest: React.FC<MigrationManifestProps> = ({ currentUser, onCl
       const result = await dbService.saveManifestToWorkspace(selectedItem.itemId, selectedAttribute.targetAttributeId, ['value_merge']);
       await refreshCurrentSelection();
       await loadMergedSummary();
-      setStatusMessage({ type: 'success', text: `Saved ${result.mergedMappingsCreated + result.mergedMappingsUpdated} merged mapping(s) to workspace.` });
+      const itemsNote = (result as any).itemsUpdated > 1 ? ` across ${(result as any).itemsUpdated} shared items` : '';
+      setStatusMessage({ type: 'success', text: `Saved ${result.mergedMappingsCreated + result.mergedMappingsUpdated} merged mapping(s)${itemsNote}.` });
     } catch (error: any) {
       setStatusMessage({ type: 'error', text: error?.message || 'Failed to save value merge selection.' });
     } finally {
       setIsSavingValue(false);
     }
   }, [refreshCurrentSelection, loadMergedSummary, selectedAttribute?.targetAttributeId, selectedItem?.itemId]);
+
+  // ---------------------------------------------------------------------------
+  // Merge Batch Job handlers
+  // ---------------------------------------------------------------------------
+
+  const loadMergeJobProgress = useCallback(async () => {
+    try {
+      const progress = await dbService.fetchMergeJobProgress();
+      setMergeJob(progress);
+      if (progress.hasJob && (progress.status === 'queued' || progress.status === 'running')) {
+        setIsMergeJobRunning(true);
+      } else {
+        setIsMergeJobRunning(false);
+      }
+      return progress;
+    } catch {
+      return null;
+    }
+  }, []);
+
+  const handleTriggerMergeJob = useCallback(async () => {
+    setIsMergeJobRunning(true);
+    try {
+      const result = await dbService.triggerMergeJob();
+      if (!result.ok) {
+        setStatusMessage({ type: 'error', text: result.error || 'Failed to trigger merge job.' });
+        setIsMergeJobRunning(false);
+        return;
+      }
+      setStatusMessage({ type: 'success', text: 'Merge batch job started...' });
+      // Start polling
+      if (mergeJobPollRef.current) clearInterval(mergeJobPollRef.current);
+      mergeJobPollRef.current = setInterval(async () => {
+        const progress = await loadMergeJobProgress();
+        if (progress && progress.hasJob && progress.status !== 'queued' && progress.status !== 'running') {
+          if (mergeJobPollRef.current) clearInterval(mergeJobPollRef.current);
+          mergeJobPollRef.current = null;
+          if (progress.status === 'completed') {
+            setStatusMessage({ type: 'success', text: `Merge job complete — ${progress.generatedRows ?? 0} rows, ${progress.processedItems ?? 0} items.` });
+          } else {
+            setStatusMessage({ type: 'error', text: `Merge job failed: ${progress.errorMessage || 'Unknown error'}` });
+          }
+          await loadMergedSummary();
+          await loadItemSummaries(page, search);
+        }
+      }, 1500);
+    } catch (error: any) {
+      setStatusMessage({ type: 'error', text: error?.message || 'Failed to trigger merge job.' });
+      setIsMergeJobRunning(false);
+    }
+  }, [loadMergeJobProgress, loadMergedSummary, loadItemSummaries, page, search]);
+
+  // Load merge job progress on mount
+  useEffect(() => {
+    loadMergeJobProgress();
+    return () => {
+      if (mergeJobPollRef.current) clearInterval(mergeJobPollRef.current);
+    };
+  }, [loadMergeJobProgress]);
 
   // ---------------------------------------------------------------------------
   // Valuelist Strategy handlers
@@ -429,6 +594,22 @@ const MigrationManifest: React.FC<MigrationManifestProps> = ({ currentUser, onCl
     valueDetail ? valueDetail.entries.some((row) => row.source === 'value_merge' && row.isAccepted) : false
   ), [valueDetail]);
 
+  // Filtered footprint donut data
+  const fpDonutData = useMemo(() => {
+    const items = mergedSummary.footprintItems;
+    if (!items || items.length === 0) return null;
+    const filtered = items.filter(r =>
+      (fpFilterCategory === '__all__' || r.category === fpFilterCategory) &&
+      (fpFilterProductType === '__all__' || r.productType === fpFilterProductType) &&
+      (fpFilterPriority === '__all__' || r.priority === fpFilterPriority)
+    );
+    const totalItems = filtered.reduce((s, r) => s + r.count, 0);
+    const withAttrFp = filtered.filter(r => r.hasAttrFp).reduce((s, r) => s + r.count, 0);
+    const withoutAttrFp = totalItems - withAttrFp;
+    const uniqueAttrFps = new Set(filtered.filter(r => r.hasAttrFp).map(r => r.attrFp)).size;
+    return { totalItems, withAttrFp, withoutAttrFp, uniqueAttrFps };
+  }, [mergedSummary.footprintItems, fpFilterCategory, fpFilterProductType, fpFilterPriority]);
+
   return (
     <div className="fixed inset-0 z-50 bg-slate-50 flex flex-col overflow-hidden">
       <div className="flex items-center justify-between px-5 py-3 bg-white border-b border-slate-200 shrink-0">
@@ -446,23 +627,26 @@ const MigrationManifest: React.FC<MigrationManifestProps> = ({ currentUser, onCl
               {mergedSummary.totalRows} merged mapping{mergedSummary.totalRows !== 1 ? 's' : ''} · {mergedSummary.distinctItems} item{mergedSummary.distinctItems !== 1 ? 's' : ''}
             </span>
           ) : null}
+          {mergedSummary.footprintItems && mergedSummary.footprintItems.length > 0 ? (
+            <button
+              onClick={() => setShowFpDashboard(v => !v)}
+              className={`flex items-center gap-1.5 px-3 py-1.5 rounded-md text-[9px] font-black uppercase tracking-wider transition-all ${showFpDashboard ? 'bg-blue-600 text-white' : 'bg-blue-50 text-blue-700 hover:bg-blue-100'}`}
+            >
+              <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" />
+              </svg>
+              Dashboard
+            </button>
+          ) : null}
           <button
-            onClick={() => setShowVlStrategy((prev) => !prev)}
-            className={`flex items-center gap-1.5 px-3 py-1.5 rounded-md text-[9px] font-black uppercase tracking-wider transition-all ${showVlStrategy ? 'bg-teal-600 text-white hover:bg-teal-700' : 'bg-teal-100 text-teal-700 hover:bg-teal-200'}`}
+            onClick={handleTriggerMergeJob}
+            disabled={isMergeJobRunning}
+            className={`flex items-center gap-1.5 px-3 py-1.5 rounded-md text-[9px] font-black uppercase tracking-wider transition-all ${isMergeJobRunning ? 'bg-indigo-200 text-indigo-500 cursor-not-allowed' : 'bg-indigo-600 text-white hover:bg-indigo-700'}`}
           >
             <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2" />
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
             </svg>
-            {showVlStrategy ? 'Hide VL Strategy' : 'VL Strategy'}
-          </button>
-          <button
-            onClick={() => setShowMergedView((prev) => !prev)}
-            className={`flex items-center gap-1.5 px-3 py-1.5 rounded-md text-[9px] font-black uppercase tracking-wider transition-all ${showMergedView ? 'bg-violet-600 text-white hover:bg-violet-700' : 'bg-violet-100 text-violet-700 hover:bg-violet-200'}`}
-          >
-            <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 7h12m0 0l-4-4m4 4l-4 4m0 6H4m0 0l4 4m-4-4l4-4" />
-            </svg>
-            {showMergedView ? 'Showing Merged' : 'Show Merged'}
+            {isMergeJobRunning ? 'Running...' : 'Run Batch Job'}
           </button>
           <button
             onClick={onClose}
@@ -488,12 +672,162 @@ const MigrationManifest: React.FC<MigrationManifestProps> = ({ currentUser, onCl
         </div>
       ) : null}
 
+      {mergedSummary.metrics && mergedSummary.totalRows > 0 ? (
+        <div className="px-5 py-3 bg-slate-50/60 border-b border-slate-200 shrink-0">
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+            <div className="rounded-xl bg-white border border-slate-100 shadow-sm p-3">
+              <div className="text-[9px] font-black uppercase tracking-widest text-slate-400 mb-2">Attribute Footprints</div>
+              <div className="flex items-baseline gap-1.5">
+                <span className="text-xl font-black text-blue-700">{mergedSummary.metrics.uniqueAttributeFootprints.toLocaleString()}</span>
+                <span className="text-[10px] text-slate-400 font-medium">unique</span>
+              </div>
+              <div className="mt-1.5 flex items-center gap-2 text-[10px]">
+                {mergedSummary.metrics.emptyAttributeFootprints > 0 ? (
+                  <span className="inline-flex items-center gap-1">
+                    <span className="w-1.5 h-1.5 rounded-full bg-amber-400" />
+                    <span className="text-amber-700 font-bold">{mergedSummary.metrics.emptyAttributeFootprints.toLocaleString()}</span>
+                    <span className="text-slate-400">empty</span>
+                  </span>
+                ) : (
+                  <span className="inline-flex items-center gap-1">
+                    <span className="w-1.5 h-1.5 rounded-full bg-green-400" />
+                    <span className="text-green-600 font-bold">0 empty</span>
+                  </span>
+                )}
+                <span className="text-slate-300">·</span>
+                <span className="text-slate-500">{mergedSummary.distinctItems.toLocaleString()} items</span>
+              </div>
+            </div>
+
+            <div className="rounded-xl bg-white border border-slate-100 shadow-sm p-3">
+              <div className="text-[9px] font-black uppercase tracking-widest text-slate-400 mb-2">Combo Items</div>
+              <div className="flex items-baseline gap-1.5">
+                <span className="text-xl font-black text-sky-700">{mergedSummary.metrics.itemsWithCombo.toLocaleString()}</span>
+                <span className="text-[10px] text-slate-400 font-medium">items share footprints</span>
+              </div>
+              <div className="mt-1.5 flex items-center gap-2 text-[10px]">
+                <span className="inline-flex items-center gap-1">
+                  <span className="w-1.5 h-1.5 rounded-full bg-sky-400" />
+                  <span className="text-sky-700 font-bold">{mergedSummary.metrics.maxComboSize.toLocaleString()}</span>
+                  <span className="text-slate-400">largest group</span>
+                </span>
+                <span className="text-slate-300">·</span>
+                <span className="text-slate-500">{Math.round((mergedSummary.metrics.itemsWithCombo / Math.max(mergedSummary.distinctItems, 1)) * 100)}% of items</span>
+              </div>
+            </div>
+
+            <div className="rounded-xl bg-white border border-slate-100 shadow-sm p-3">
+              <div className="text-[9px] font-black uppercase tracking-widest text-slate-400 mb-2">Value Footprints</div>
+              <div className="flex items-baseline gap-1.5">
+                <span className="text-xl font-black text-teal-700">{mergedSummary.metrics.uniqueValueFootprints.toLocaleString()}</span>
+                <span className="text-[10px] text-slate-400 font-medium">unique</span>
+              </div>
+              <div className="mt-1.5 flex items-center gap-2 text-[10px]">
+                {mergedSummary.metrics.emptyValueFootprintAttrs > 0 ? (
+                  <span className="inline-flex items-center gap-1">
+                    <span className="w-1.5 h-1.5 rounded-full bg-amber-400" />
+                    <span className="text-amber-700 font-bold">{mergedSummary.metrics.emptyValueFootprintAttrs.toLocaleString()}</span>
+                    <span className="text-slate-400">empty attr slots</span>
+                  </span>
+                ) : (
+                  <span className="inline-flex items-center gap-1">
+                    <span className="w-1.5 h-1.5 rounded-full bg-green-400" />
+                    <span className="text-green-600 font-bold">All covered</span>
+                  </span>
+                )}
+              </div>
+            </div>
+
+            <div className="rounded-xl bg-white border border-slate-100 shadow-sm p-3">
+              <div className="text-[9px] font-black uppercase tracking-widest text-slate-400 mb-2">Shared Value Lists</div>
+              <div className="flex items-baseline gap-1.5">
+                <span className="text-xl font-black text-emerald-700">{mergedSummary.metrics.itemsWithSharedVL.toLocaleString()}</span>
+                <span className="text-[10px] text-slate-400 font-medium">items</span>
+              </div>
+              <div className="mt-1.5 flex items-center gap-2 text-[10px]">
+                <span className="inline-flex items-center gap-1">
+                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-400" />
+                  <span className="text-emerald-700 font-bold">{mergedSummary.metrics.totalSharedVLAttrs.toLocaleString()}</span>
+                  <span className="text-slate-400">shared attr slots</span>
+                </span>
+                <span className="text-slate-300">·</span>
+                <span className="text-slate-500">{Math.round((mergedSummary.metrics.itemsWithSharedVL / Math.max(mergedSummary.distinctItems, 1)) * 100)}% of items</span>
+              </div>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {showFpDashboard && fpDonutData && mergedSummary.filterOptions && mergedSummary.totalRows > 0 ? (
+        <div className="px-5 py-3 bg-white border-b border-slate-200 shrink-0 animate-[slideDown_0.2s_ease-out]">
+          <div className="flex items-center gap-3 mb-3 flex-wrap">
+            <span className="text-[9px] font-black uppercase tracking-widest text-slate-400">Filter</span>
+            <select value={fpFilterCategory} onChange={e => setFpFilterCategory(e.target.value)} className="px-2 py-1 border border-slate-200 rounded text-[10px] bg-white focus:outline-none focus:ring-1 focus:ring-blue-400">
+              <option value="__all__">All Categories</option>
+              {mergedSummary.filterOptions.categories.map(c => <option key={c} value={c}>{c}</option>)}
+            </select>
+            <select value={fpFilterPriority} onChange={e => setFpFilterPriority(e.target.value)} className="px-2 py-1 border border-slate-200 rounded text-[10px] bg-white focus:outline-none focus:ring-1 focus:ring-blue-400">
+              <option value="__all__">All Priorities</option>
+              {mergedSummary.filterOptions.priorities.map(p => <option key={p} value={p}>Priority {p}</option>)}
+            </select>
+            <select value={fpFilterProductType} onChange={e => setFpFilterProductType(e.target.value)} className="px-2 py-1 border border-slate-200 rounded text-[10px] bg-white focus:outline-none focus:ring-1 focus:ring-blue-400">
+              <option value="__all__">All Product Types</option>
+              {mergedSummary.filterOptions.productTypes.map(t => <option key={t} value={t}>{t}</option>)}
+            </select>
+            {(fpFilterCategory !== '__all__' || fpFilterPriority !== '__all__' || fpFilterProductType !== '__all__') ? (
+              <button onClick={() => { setFpFilterCategory('__all__'); setFpFilterPriority('__all__'); setFpFilterProductType('__all__'); }} className="text-[9px] text-blue-600 hover:text-blue-800 font-bold uppercase">Clear</button>
+            ) : null}
+          </div>
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <SegmentedDonut
+              title="Attribute Footprints"
+              centerValue={fpDonutData.totalItems.toLocaleString()}
+              centerLabel="items"
+              slices={[
+                { label: 'With Footprint', value: fpDonutData.withAttrFp, color: '#22c55e', extra: `${fpDonutData.uniqueAttrFps} unique` },
+                { label: 'Empty', value: fpDonutData.withoutAttrFp, color: '#f59e0b' },
+              ]}
+            />
+            <SegmentedDonut
+              title="Unique Attribute Footprints"
+              centerValue={fpDonutData.uniqueAttrFps.toLocaleString()}
+              centerLabel="unique"
+              slices={(() => {
+                const items = mergedSummary.footprintItems!;
+                const filtered = items.filter(r =>
+                  (fpFilterCategory === '__all__' || r.category === fpFilterCategory) &&
+                  (fpFilterProductType === '__all__' || r.productType === fpFilterProductType) &&
+                  (fpFilterPriority === '__all__' || r.priority === fpFilterPriority) &&
+                  r.hasAttrFp
+                );
+                const byFp = new Map<string, number>();
+                for (const r of filtered) {
+                  byFp.set(r.attrFp, (byFp.get(r.attrFp) || 0) + r.count);
+                }
+                const sorted = [...byFp.entries()].sort((a, b) => b[1] - a[1]);
+                const TOP = 8;
+                const top = sorted.slice(0, TOP).map(([fp, count], i) => ({
+                  label: fp.length > 20 ? fp.slice(0, 20) + '…' : fp,
+                  value: count,
+                  color: DONUT_COLORS[i % DONUT_COLORS.length],
+                }));
+                if (sorted.length > TOP) {
+                  const restCount = sorted.slice(TOP).reduce((s, [, c]) => s + c, 0);
+                  top.push({ label: `+${sorted.length - TOP} others`, value: restCount, color: '#94a3b8' });
+                }
+                return top;
+              })()}
+            />
+          </div>
+        </div>
+      ) : null}
+
       {showVlStrategy ? (
         <div className="border-b border-teal-200 bg-teal-50/30 shrink-0 overflow-auto" style={{ maxHeight: '50vh' }}>
           <div className="px-5 py-3">
             <div className="flex items-center justify-between gap-3 mb-3">
               <div>
-                <div className="text-[9px] font-black uppercase tracking-wider text-teal-700">Valuelist Strategy</div>
+                <div className="text-[9px] font-black uppercase tracking-wider text-teal-700">Value List Setup</div>
                 <div className="text-[11px] text-slate-500">Classify target attributes, deduplicate value sets, and optionally merge near-identical lists.</div>
               </div>
               <div className="flex items-center gap-2">
@@ -502,8 +836,8 @@ const MigrationManifest: React.FC<MigrationManifestProps> = ({ currentUser, onCl
                   onChange={(e) => setVlStrategy(e.target.value as 'conservative' | 'aggressive')}
                   className="px-2 py-1 border border-teal-300 rounded text-[10px] bg-white focus:outline-none focus:ring-1 focus:ring-teal-400"
                 >
-                  <option value="conservative">Conservative (subsets only)</option>
-                  <option value="aggressive">Aggressive (overlap merge)</option>
+                  <option value="conservative">Safe — no extra values added</option>
+                  <option value="aggressive">Merge similar lists</option>
                 </select>
                 <button
                   onClick={handleVlAnalyze}
@@ -526,8 +860,8 @@ const MigrationManifest: React.FC<MigrationManifestProps> = ({ currentUser, onCl
               <div className="mb-3 flex items-center gap-4 text-[11px]">
                 <span className={`px-2 py-0.5 rounded-full font-bold text-[9px] uppercase ${vlJob.status === 'completed' ? 'bg-emerald-100 text-emerald-700' : vlJob.status === 'running' ? 'bg-blue-100 text-blue-700' : vlJob.status === 'failed' ? 'bg-rose-100 text-rose-700' : 'bg-slate-100 text-slate-700'}`}>{vlJob.status}</span>
                 <span className="text-slate-600"><span className="font-bold">{vlJob.totalAttributes}</span> attributes</span>
-                <span className="text-green-700"><span className="font-bold">{vlJob.fixedOnlyCount}</span> fixed-only</span>
-                <span className="text-blue-700"><span className="font-bold">{vlJob.valuelistCount}</span> valuelist</span>
+                <span className="text-green-700"><span className="font-bold">{vlJob.fixedOnlyCount}</span> fixed</span>
+                <span className="text-blue-700"><span className="font-bold">{vlJob.valuelistCount}</span> multi-value</span>
                 <span className="text-teal-700"><span className="font-bold">{vlJob.uniqueValuelists}</span> unique after dedup</span>
                 {vlJob.mergedValuelists != null ? <span className="text-purple-700"><span className="font-bold">{vlJob.mergedValuelists}</span> after merge</span> : null}
               </div>
@@ -560,7 +894,7 @@ const MigrationManifest: React.FC<MigrationManifestProps> = ({ currentUser, onCl
                     <thead className="bg-teal-50/70">
                       <tr>
                         <th className="text-left px-3 py-1.5 text-[9px] font-black uppercase tracking-wider text-teal-600 border-b border-teal-200">Target Attribute</th>
-                        <th className="text-left px-3 py-1.5 text-[9px] font-black uppercase tracking-wider text-teal-600 border-b border-teal-200">Class</th>
+                        <th className="text-left px-3 py-1.5 text-[9px] font-black uppercase tracking-wider text-teal-600 border-b border-teal-200">Type</th>
                         <th className="text-right px-3 py-1.5 text-[9px] font-black uppercase tracking-wider text-teal-600 border-b border-teal-200">Items</th>
                         <th className="text-right px-3 py-1.5 text-[9px] font-black uppercase tracking-wider text-teal-600 border-b border-teal-200">Fixed</th>
                         <th className="text-right px-3 py-1.5 text-[9px] font-black uppercase tracking-wider text-teal-600 border-b border-teal-200">Multi</th>
@@ -573,7 +907,7 @@ const MigrationManifest: React.FC<MigrationManifestProps> = ({ currentUser, onCl
                         <tr key={p.id} className="hover:bg-teal-50/50">
                           <td className="px-3 py-1.5 text-slate-800 font-medium">{p.targetAttributeId}</td>
                           <td className="px-3 py-1.5">
-                            <span className={`px-1.5 py-0.5 rounded text-[9px] font-bold uppercase ${p.classification === 'fixed_only' ? 'bg-green-100 text-green-700' : 'bg-blue-100 text-blue-700'}`}>{p.classification === 'fixed_only' ? 'Fixed' : 'VList'}</span>
+                            <span className={`px-1.5 py-0.5 rounded text-[9px] font-bold uppercase ${p.classification === 'fixed_only' ? 'bg-green-100 text-green-700' : 'bg-blue-100 text-blue-700'}`}>{p.classification === 'fixed_only' ? 'Single' : 'Multi'}</span>
                           </td>
                           <td className="px-3 py-1.5 text-right text-slate-600">{p.totalItems}</td>
                           <td className="px-3 py-1.5 text-right text-green-700 font-bold">{p.fixedValueItems}</td>
@@ -588,7 +922,7 @@ const MigrationManifest: React.FC<MigrationManifestProps> = ({ currentUser, onCl
 
                 {vlDedupGroups.length > 0 ? (
                   <div className="mt-3">
-                    <div className="text-[9px] font-black uppercase tracking-wider text-teal-700 mb-2">Dedup Groups — {vlDedupGroups.length} shared valuelists</div>
+                    <div className="text-[9px] font-black uppercase tracking-wider text-teal-700 mb-2">Shared Value Lists — {vlDedupGroups.length} groups</div>
                     <div className="space-y-2">
                       {vlDedupGroups.map((g) => (
                         <div key={g.dedupGroupKey} className="rounded-lg border border-teal-200 bg-white p-3">
@@ -627,7 +961,7 @@ const MigrationManifest: React.FC<MigrationManifestProps> = ({ currentUser, onCl
                             </div>
                           </div>
                           <div className="mt-1 text-[10px] text-slate-500">
-                            Noise added: {p.noiseAddedToA} values to {p.affectedItemsA} items, {p.noiseAddedToB} values to {p.affectedItemsB} items
+                            Adding this merge would inject {p.noiseAddedToA} extra value{p.noiseAddedToA !== 1 ? 's' : ''} into {p.affectedItemsA} item{p.affectedItemsA !== 1 ? 's' : ''}, and {p.noiseAddedToB} extra value{p.noiseAddedToB !== 1 ? 's' : ''} into {p.affectedItemsB} item{p.affectedItemsB !== 1 ? 's' : ''}.
                           </div>
                           <div className="mt-1 flex flex-wrap gap-1">
                             {p.mergedValues.slice(0, 8).map((v) => (
@@ -684,19 +1018,9 @@ const MigrationManifest: React.FC<MigrationManifestProps> = ({ currentUser, onCl
           <option value="">All Priorities</option>
           {filters.priorities.map((option) => <option key={option} value={String(option)}>{option}</option>)}
         </select>
-        <select value={source} onChange={(event) => handleFilterChange(setSource)(event.target.value)} className="px-3 py-1.5 border border-slate-200 rounded-md text-xs bg-white focus:outline-none focus:ring-1 focus:ring-blue-400">
-          <option value="">All Sources</option>
-          {filters.sources.map((option) => <option key={option} value={option}>{option}</option>)}
-        </select>
-        <select value={hasNoise} onChange={(event) => handleFilterChange(setHasNoise)(event.target.value)} className="px-3 py-1.5 border border-slate-200 rounded-md text-xs bg-white focus:outline-none focus:ring-1 focus:ring-blue-400">
-          <option value="">Noise or Clean</option>
-          <option value="true">Noise only</option>
-          <option value="false">Clean only</option>
-        </select>
-        <select value={hasMapping} onChange={(event) => handleFilterChange(setHasMapping)(event.target.value)} className="px-3 py-1.5 border border-slate-200 rounded-md text-xs bg-white focus:outline-none focus:ring-1 focus:ring-blue-400">
-          <option value="">Mapped or Unmapped</option>
-          <option value="true">Mapped only</option>
-          <option value="false">Unmapped only</option>
+        <select value={attributeType} onChange={(event) => handleFilterChange(setAttributeType)(event.target.value)} className="px-3 py-1.5 border border-slate-200 rounded-md text-xs bg-white focus:outline-none focus:ring-1 focus:ring-blue-400">
+          <option value="">All Attribute Types</option>
+          {filters.attributeTypes.map((option) => <option key={option} value={option}>{option}</option>)}
         </select>
         <button
           onClick={() => {
@@ -705,8 +1029,7 @@ const MigrationManifest: React.FC<MigrationManifestProps> = ({ currentUser, onCl
             setCategory('');
             setProductType('');
             setPriority('');
-            setSource('');
-            setHasNoise('');
+            setAttributeType('');
             setHasMapping('');
             setSortBy('itemPriority');
             setSortDir('desc');
@@ -720,8 +1043,8 @@ const MigrationManifest: React.FC<MigrationManifestProps> = ({ currentUser, onCl
         <span className="text-[9px] text-slate-400 font-medium ml-auto">{total.toLocaleString()} items · {PAGE_SIZE} per page</span>
       </div>
 
-      <div ref={containerRef} className="flex flex-1 overflow-hidden">
-        <div className="flex flex-col overflow-hidden" style={{ width: `calc(100% - ${rightPanelWidth}px)`, minWidth: MIN_LEFT_W }}>
+      <div ref={containerRef} className="flex flex-row flex-1 overflow-hidden">
+        <div className="flex flex-col flex-1 overflow-hidden">
           <div className="flex-1 overflow-auto">
             <table className="w-full text-xs">
               <thead className="bg-slate-50 sticky top-0 z-10">
@@ -729,9 +1052,9 @@ const MigrationManifest: React.FC<MigrationManifestProps> = ({ currentUser, onCl
                   <th className="text-left px-3 py-2 text-[9px] font-black uppercase tracking-wider text-slate-500 border-b border-slate-200">Item</th>
                   <th className="text-left px-3 py-2 text-[9px] font-black uppercase tracking-wider text-slate-500 border-b border-slate-200">Category / Product</th>
                   <th className="text-right px-3 py-2 text-[9px] font-black uppercase tracking-wider text-slate-500 border-b border-slate-200 cursor-pointer select-none hover:text-blue-600" onClick={() => handleSort('itemPriority')}>Priority{sortArrow('itemPriority')}</th>
-                  <th className="text-right px-3 py-2 text-[9px] font-black uppercase tracking-wider text-slate-500 border-b border-slate-200 cursor-pointer select-none hover:text-blue-600" onClick={() => handleSort('totalRows')}>Rows{sortArrow('totalRows')}</th>
-                  <th className="text-right px-3 py-2 text-[9px] font-black uppercase tracking-wider text-slate-500 border-b border-slate-200 cursor-pointer select-none hover:text-blue-600" onClick={() => handleSort('comboItemCount')}>Combo Items{sortArrow('comboItemCount')}</th>
-                  <th className="text-right px-3 py-2 text-[9px] font-black uppercase tracking-wider text-slate-500 border-b border-slate-200 cursor-pointer select-none hover:text-blue-600" onClick={() => handleSort('valueMergeCount')}>Value Merge{sortArrow('valueMergeCount')}</th>
+                  <th className="text-right px-3 py-2 text-[9px] font-black uppercase tracking-wider text-slate-500 border-b border-slate-200 cursor-pointer select-none hover:text-blue-600" onClick={() => handleSort('totalRows')}>Attrs{sortArrow('totalRows')}</th>
+                  <th className="text-right px-3 py-2 text-[9px] font-black uppercase tracking-wider text-slate-500 border-b border-slate-200 cursor-pointer select-none hover:text-blue-600" onClick={() => handleSort('comboItemCount')}>Shared Items{sortArrow('comboItemCount')}</th>
+                  <th className="text-right px-3 py-2 text-[9px] font-black uppercase tracking-wider text-slate-500 border-b border-slate-200 cursor-pointer select-none hover:text-blue-600" onClick={() => handleSort('sharedValuelistCount')}>Shared VL{sortArrow('sharedValuelistCount')}</th>
                   <th className="text-right px-3 py-2 text-[9px] font-black uppercase tracking-wider text-slate-500 border-b border-slate-200">Mapped</th>
                 </tr>
               </thead>
@@ -754,7 +1077,7 @@ const MigrationManifest: React.FC<MigrationManifestProps> = ({ currentUser, onCl
                 ) : items.map((item) => (
                   <tr
                     key={item.itemId}
-                    onClick={() => setSelectedItem(item)}
+                    onClick={() => { setSelectedItem(item); setRightPanelOpen(true); }}
                     className={`cursor-pointer border-b border-slate-100 transition-colors ${selectedItem?.itemId === item.itemId ? 'bg-blue-50 hover:bg-blue-100' : 'hover:bg-slate-50'}`}
                   >
                     <td className="px-3 py-2">
@@ -768,7 +1091,7 @@ const MigrationManifest: React.FC<MigrationManifestProps> = ({ currentUser, onCl
                     <td className="px-3 py-2 text-right"><span className="inline-flex items-center justify-center min-w-[26px] px-1.5 py-0.5 rounded-full bg-amber-50 text-amber-700 text-[10px] font-bold">{item.itemPriority ?? '—'}</span></td>
                     <td className="px-3 py-2 text-right"><span className="inline-flex items-center justify-center min-w-[30px] px-2 py-0.5 rounded-full bg-slate-100 text-slate-700 text-[10px] font-bold">{item.totalRows}</span></td>
                     <td className="px-3 py-2 text-right"><span className="inline-flex items-center justify-center min-w-[30px] px-2 py-0.5 rounded-full bg-sky-50 text-sky-700 text-[10px] font-bold">{item.comboItemCount}</span></td>
-                    <td className="px-3 py-2 text-right"><span className="inline-flex items-center justify-center min-w-[30px] px-2 py-0.5 rounded-full bg-amber-50 text-amber-700 text-[10px] font-bold">{item.valueMergeCount}</span></td>
+                    <td className="px-3 py-2 text-right"><span className="inline-flex items-center justify-center min-w-[30px] px-2 py-0.5 rounded-full bg-teal-50 text-teal-700 text-[10px] font-bold">{item.sharedValuelistCount}</span></td>
                     <td className="px-3 py-2 text-right"><span className="inline-flex items-center justify-center min-w-[30px] px-2 py-0.5 rounded-full bg-emerald-50 text-emerald-700 text-[10px] font-bold">{item.mappedCount}</span></td>
                   </tr>
                 ))}
@@ -797,222 +1120,152 @@ const MigrationManifest: React.FC<MigrationManifestProps> = ({ currentUser, onCl
           ) : null}
         </div>
 
-        <div onMouseDown={handleMouseDown} className="w-1.5 cursor-col-resize bg-slate-200 hover:bg-blue-400 active:bg-blue-500 transition-colors shrink-0" />
+        <div onMouseDown={handleMouseDown} className={`w-1.5 cursor-col-resize bg-slate-200 hover:bg-blue-400 active:bg-blue-500 transition-colors shrink-0 ${rightPanelOpen ? '' : 'hidden'}`} />
 
-        <div style={{ width: rightPanelWidth, minWidth: MIN_RIGHT_W }} className="flex flex-col overflow-hidden bg-white shrink-0">
-          <div className="border-b border-slate-200 bg-slate-50 px-4 py-3 shrink-0">
-            <div className="text-[9px] font-black uppercase tracking-wider text-slate-500">Selected Item</div>
-            {selectedItem ? (
-              <>
-                <div className="mt-1 text-sm font-black text-slate-800">{selectedItem.itemId}</div>
-                <div className="text-[10px] text-slate-400">{selectedItem.itemDescription || 'No description'}</div>
-                <div className="mt-2 flex flex-wrap gap-1.5">
-                  <span className="inline-flex items-center px-2 py-0.5 rounded-full bg-slate-100 text-slate-700 text-[10px] font-bold">{selectedItem.itemCategory || 'No category'}</span>
-                  <span className="inline-flex items-center px-2 py-0.5 rounded-full bg-slate-100 text-slate-700 text-[10px] font-bold">{selectedItem.itemProductType || 'No product type'}</span>
-                  <span className="inline-flex items-center px-2 py-0.5 rounded-full bg-amber-50 text-amber-700 text-[10px] font-bold">P{selectedItem.itemPriority ?? '—'}</span>
-                  <span className="inline-flex items-center px-2 py-0.5 rounded-full bg-sky-50 text-sky-700 text-[10px] font-bold">{selectedItem.comboItemCount} item{selectedItem.comboItemCount !== 1 ? 's' : ''} in combo</span>
-                </div>
-              </>
-            ) : (
-              <div className="mt-1 text-[11px] text-slate-400">Select an item to inspect merge suggestions.</div>
-            )}
-          </div>
-
-          <div className="flex-1 overflow-auto">
-            <div className="px-4 py-3 border-b border-slate-100">
+        {rightPanelOpen ? (
+          <div style={{ width: rightPanelWidth, minWidth: MIN_RIGHT_W }} className="flex flex-col overflow-hidden bg-white border-l border-slate-200 shrink-0">
+            <div className="border-b border-slate-200 bg-slate-50 px-4 py-3 shrink-0">
               <div className="flex items-center justify-between gap-2">
-                <div>
-                  <div className="text-[9px] font-black uppercase tracking-wider text-slate-500">Attribute Merge Suggestions</div>
-                  <div className="text-[11px] text-slate-400">Select an attribute, then review value merge suggestions.</div>
-                </div>
-                <div className="text-[10px] text-slate-400">{attributeGroups.length} attributes</div>
-              </div>
-            </div>
-
-            <div className="px-3 py-3 space-y-2 border-b border-slate-100">
-              {isLoadingAttributes ? (
-                <div className="px-2 py-6 text-sm text-slate-400">Loading attributes...</div>
-              ) : attributeGroups.length === 0 ? (
-                <div className="px-2 py-6 text-sm text-slate-400">No attribute suggestions available.</div>
-              ) : attributeGroups.map((group) => (
+                <div className="text-[9px] font-black uppercase tracking-wider text-slate-500">Merged Workspace Mappings</div>
                 <button
-                  key={group.targetAttributeId || `attr-${group.features[0]?.legacyFeatureId || 'unknown'}`}
-                  type="button"
-                  onClick={() => setSelectedAttribute(group)}
-                  className={`w-full text-left rounded-lg border p-3 transition-all ${selectedAttribute?.targetAttributeId === group.targetAttributeId ? 'border-blue-300 bg-blue-50' : 'border-slate-200 bg-white hover:border-slate-300'}`}
+                  onClick={() => setRightPanelOpen(false)}
+                  className="p-1 rounded hover:bg-slate-200 text-slate-400 hover:text-slate-600 transition-colors"
+                  title="Close panel"
                 >
-                  <div className="flex items-start justify-between gap-2">
-                    <div>
-                      <div className="font-semibold text-slate-800 break-words">{group.targetAttributeId || '(unmapped attribute)'}</div>
-                      <div className="text-[10px] text-slate-400">{group.attributeType || 'No type'} · {group.features.length} feature rows</div>
-                    </div>
-                    <div className="flex gap-1">
-                      {group.hasValueMerge ? <span className="inline-flex items-center px-1.5 py-0.5 rounded bg-amber-50 text-amber-700 text-[9px] font-bold uppercase">Value Merge</span> : null}
-                    </div>
-                  </div>
-                  <div className="mt-2 text-[10px] text-slate-500 break-words">Features: {group.features.map((row) => row.legacyFeatureId).join(', ') || '—'}</div>
+                  <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                  </svg>
                 </button>
-              ))}
-            </div>
-
-            <div className="px-4 py-3 border-b border-slate-100 bg-slate-50/70">
-              <div className="text-[9px] font-black uppercase tracking-wider text-slate-500">Selected Attribute</div>
-              {selectedAttribute ? (
-                <div className="mt-2 grid grid-cols-1 gap-2 text-[11px]">
-                  <div className="flex items-start justify-between gap-3">
-                    <div>
-                    <div className="text-sm font-black text-slate-800 break-words">{selectedAttribute.targetAttributeId || '(unmapped attribute)'}</div>
-                    <div className="text-[10px] text-slate-400">{selectedAttribute.attributeType || 'No type'}</div>
-                    </div>
+              </div>
+              {selectedItem ? (
+                <>
+                  <div className="mt-1 text-sm font-black text-slate-800">{selectedItem.itemId}</div>
+                  <div className="text-[10px] text-slate-400">{selectedItem.itemDescription || 'No description'}</div>
+                  <div className="mt-2 flex flex-wrap gap-1.5">
+                    <span className="inline-flex items-center px-2 py-0.5 rounded-full bg-slate-100 text-slate-700 text-[10px] font-bold">{selectedItem.itemCategory || 'No category'}</span>
+                    <span className="inline-flex items-center px-2 py-0.5 rounded-full bg-slate-100 text-slate-700 text-[10px] font-bold">{selectedItem.itemProductType || 'No product type'}</span>
+                    <span className="inline-flex items-center px-2 py-0.5 rounded-full bg-amber-50 text-amber-700 text-[10px] font-bold">P{selectedItem.itemPriority ?? '—'}</span>
                   </div>
-                  <div>
-                    <div className="text-[9px] font-black uppercase tracking-wider text-slate-400">Original Values</div>
-                    <div className="mt-1 text-slate-700 break-words">{joinValues(selectedOriginalValues)}</div>
-                  </div>
-                  <div>
-                    <div className="text-[9px] font-black uppercase tracking-wider text-slate-400">Mapped Target Values</div>
-                    <div className="mt-1 text-slate-700 break-words">{joinValues(selectedTargetValues)}</div>
-                  </div>
-                  <div>
-                    <div className="text-[9px] font-black uppercase tracking-wider text-slate-400">Noise Values</div>
-                    <div className="mt-1 text-slate-700 break-words">{joinValues(selectedNoiseValues)}</div>
-                  </div>
-                </div>
+                </>
               ) : (
-                <div className="mt-1 text-[11px] text-slate-400">Select an attribute to inspect values.</div>
+                <div className="mt-1 text-[11px] text-slate-400">Select an item to view its mappings.</div>
               )}
             </div>
 
-            <div className="px-4 py-3">
-              <div className="flex items-center justify-between gap-2">
-                <div>
-                  <div className="text-[9px] font-black uppercase tracking-wider text-slate-500">Value Merge Suggestions</div>
-                  <div className="text-[11px] text-slate-400">Original, target, and added values for the selected attribute.</div>
-                </div>
-                <div className="flex items-center gap-2">
-                  {isValueMergeSaved ? <span className="inline-flex items-center px-2 py-0.5 rounded bg-emerald-50 text-emerald-700 text-[9px] font-bold uppercase">Saved</span> : null}
-                  {valueDetail ? <div className="text-[10px] text-slate-400">{valueDetail.entries.length} rows</div> : null}
+            {/* Tabs */}
+            {selectedItem ? (
+              <div className="flex border-b border-slate-200 bg-white shrink-0">
+                {([['mappings', 'Mappings'], ['combo', 'Combo Items'], ['sharedvl', 'Shared VL']] as const).map(([key, label]) => (
                   <button
-                    type="button"
-                    onClick={handleSaveValueMerge}
-                    disabled={!selectedAttribute?.targetAttributeId || !valueDetail?.noiseValues.length || isSavingValue || isValueMergeSaved}
-                    className="px-2.5 py-1 rounded-md bg-amber-600 text-white text-[9px] font-black uppercase tracking-wider hover:bg-amber-700 disabled:opacity-40 disabled:cursor-not-allowed"
+                    key={key}
+                    onClick={() => setRightTab(key)}
+                    className={`flex-1 px-3 py-2 text-[9px] font-black uppercase tracking-wider transition-colors ${rightTab === key ? 'text-blue-600 border-b-2 border-blue-600 bg-blue-50/50' : 'text-slate-400 hover:text-slate-600 hover:bg-slate-50'}`}
                   >
-                    {isSavingValue ? 'Saving...' : isValueMergeSaved ? 'Saved' : 'Save Value Merge'}
+                    {label}
+                    {key === 'combo' && mergedDetail ? ` (${mergedDetail.totalComboItems})` : ''}
+                    {key === 'sharedvl' && mergedDetail ? ` (${mergedDetail.sharedVL.length})` : ''}
                   </button>
-                </div>
+                ))}
               </div>
+            ) : null}
 
-              {isLoadingValues ? (
-                <div className="px-1 py-6 text-sm text-slate-400">Loading values...</div>
-              ) : !valueDetail ? (
-                <div className="px-1 py-6 text-sm text-slate-400">Select an attribute with a mapped target attribute to inspect value merges.</div>
-              ) : (
-                <div className="mt-3 space-y-3">
-                  <div className="rounded-lg border border-slate-200 bg-slate-50/70 p-3">
-                    <div className="text-[9px] font-black uppercase tracking-wider text-slate-400">Suggested Value Merge</div>
-                    <div className="mt-1 text-[11px] text-slate-700">{valueDetail.noiseValues.length > 0 ? 'Value merge suggested for missing canonical values.' : 'No additional value merge suggested.'}</div>
+            <div className="flex-1 overflow-auto">
+              {isLoadingMerged ? (
+                <div className="flex items-center justify-center gap-2 py-12 text-sm text-slate-400">
+                  <div className="w-4 h-4 border-2 border-blue-500 border-t-transparent rounded-full animate-spin" />
+                  Loading...
+                </div>
+              ) : !selectedItem ? (
+                <div className="py-12 text-sm text-slate-400 text-center">Select an item from the table.</div>
+              ) : !mergedDetail || mergedDetail.totalMappings === 0 ? (
+                <div className="py-12 text-sm text-slate-400 text-center">No merged mappings for this item.</div>
+              ) : rightTab === 'mappings' ? (
+                <table className="w-full text-[11px]">
+                  <thead className="bg-slate-50 sticky top-0 z-10">
+                    <tr>
+                      <th className="text-left px-3 py-2 text-[9px] font-black uppercase tracking-wider text-slate-500 border-b border-slate-200">Legacy Feature</th>
+                      <th className="text-left px-3 py-2 text-[9px] font-black uppercase tracking-wider text-slate-500 border-b border-slate-200">Legacy Value</th>
+                      <th className="text-left px-3 py-2 text-[9px] font-black uppercase tracking-wider text-slate-500 border-b border-slate-200">New Attribute</th>
+                      <th className="text-left px-3 py-2 text-[9px] font-black uppercase tracking-wider text-slate-500 border-b border-slate-200">New Value</th>
+                      <th className="text-left px-3 py-2 text-[9px] font-black uppercase tracking-wider text-slate-500 border-b border-slate-200">Type</th>
+                      <th className="text-left px-3 py-2 text-[9px] font-black uppercase tracking-wider text-slate-500 border-b border-slate-200">Feasibility</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-100">
+                    {mergedDetail.mappings.map((row) => (
+                      <tr key={row.id} className="hover:bg-slate-50">
+                        <td className="px-3 py-1.5 text-slate-700 font-medium">{row.legacyFeatureId}</td>
+                        <td className="px-3 py-1.5 text-slate-600">{row.legacyValue || '—'}</td>
+                        <td className="px-3 py-1.5 text-slate-700">{row.newAttributeId || '—'}</td>
+                        <td className="px-3 py-1.5 text-slate-600">{row.newValue || '—'}</td>
+                        <td className="px-3 py-1.5"><span className="px-1.5 py-0.5 rounded bg-slate-100 text-slate-600 text-[9px] font-bold">{row.attributeType || '—'}</span></td>
+                        <td className="px-3 py-1.5">
+                          <span className={`px-1.5 py-0.5 rounded text-[9px] font-bold ${row.feasibility === 'Yes' ? 'bg-emerald-50 text-emerald-700' : row.feasibility === 'No' ? 'bg-rose-50 text-rose-600' : 'bg-slate-100 text-slate-500'}`}>
+                            {row.feasibility || '—'}
+                          </span>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              ) : rightTab === 'combo' ? (
+                <div className="p-4 space-y-3">
+                  <div className="text-[10px] text-slate-500">
+                    Items that share the same set of attributes (attribute footprint).
                   </div>
-
-                  <div>
-                    <div className="text-[9px] font-black uppercase tracking-wider text-slate-400">Original Values</div>
-                    <div className="mt-1 flex flex-wrap gap-1">
-                      {valueDetail.originalValues.length > 0 ? valueDetail.originalValues.map((value) => (
-                        <span key={`orig-${value}`} className="inline-flex items-center px-2 py-0.5 rounded bg-slate-100 text-slate-700 text-[10px] font-medium">{value}</span>
-                      )) : <span className="text-[11px] text-slate-400">—</span>}
+                  {mergedDetail.comboItems.length === 0 ? (
+                    <div className="py-8 text-sm text-slate-400 text-center">No combo items found.</div>
+                  ) : (
+                    <div className="space-y-1">
+                      {mergedDetail.comboItems.map((ci) => (
+                        <div key={ci.itemId} className="flex items-center gap-2 px-3 py-2 rounded-lg bg-sky-50 border border-sky-100">
+                          <span className="text-[11px] font-bold text-sky-800">{ci.itemId}</span>
+                          <span className="text-[10px] text-slate-500 truncate">{ci.description || '—'}</span>
+                        </div>
+                      ))}
                     </div>
+                  )}
+                </div>
+              ) : rightTab === 'sharedvl' ? (
+                <div className="p-4 space-y-3">
+                  <div className="text-[10px] text-slate-500">
+                    Attributes where other items share the same value list.
                   </div>
-                  <div>
-                    <div className="text-[9px] font-black uppercase tracking-wider text-slate-400">Mapped Target Values</div>
-                    <div className="mt-1 flex flex-wrap gap-1">
-                      {valueDetail.targetValues.length > 0 ? valueDetail.targetValues.map((value) => (
-                        <span key={`target-${value}`} className="inline-flex items-center px-2 py-0.5 rounded bg-emerald-50 text-emerald-700 text-[10px] font-medium">{value}</span>
-                      )) : <span className="text-[11px] text-slate-400">—</span>}
-                    </div>
-                  </div>
-                  <div>
-                    <div className="text-[9px] font-black uppercase tracking-wider text-slate-400">Added / Noise Values</div>
-                    <div className="mt-1 flex flex-wrap gap-1">
-                      {valueDetail.noiseValues.length > 0 ? valueDetail.noiseValues.map((value) => (
-                        <span key={`noise-${value}`} className="inline-flex items-center px-2 py-0.5 rounded bg-amber-50 text-amber-700 text-[10px] font-medium">{value}</span>
-                      )) : <span className="text-[11px] text-slate-400">—</span>}
-                    </div>
-                  </div>
-
-                  <div className="rounded-xl border border-slate-200 overflow-hidden">
-                    <div className="px-3 py-2 border-b border-slate-200 bg-slate-50 text-[9px] font-black uppercase tracking-wider text-slate-500">Source Rows</div>
-                    <div className="divide-y divide-slate-100">
-                      {valueDetail.entries.map((row) => (
-                        <div key={row.id} className="px-3 py-3">
-                          <div className="flex items-center justify-between gap-2">
-                            <div className="font-semibold text-[11px] text-slate-800">{row.legacyFeatureId}</div>
-                            <span className={`px-2 py-0.5 rounded-full border text-[9px] font-black uppercase tracking-[0.15em] ${sourceTone[row.source] || sourceTone.original}`}>
-                              {row.source.replace('_', ' ')}
-                            </span>
+                  {mergedDetail.sharedVL.length === 0 ? (
+                    <div className="py-8 text-sm text-slate-400 text-center">No shared value lists found.</div>
+                  ) : (
+                    <div className="space-y-3">
+                      {mergedDetail.sharedVL.map((sv) => (
+                        <div key={sv.attribute} className="rounded-lg border border-teal-200 bg-teal-50/30 p-3">
+                          <div className="flex items-center justify-between gap-2 mb-2">
+                            <span className="text-[11px] font-black text-teal-800">{sv.attribute}</span>
+                            <span className="text-[9px] text-slate-400 font-bold">{sv.totalShared} item{sv.totalShared !== 1 ? 's' : ''}</span>
                           </div>
-                          <div className="mt-2 grid grid-cols-1 gap-1 text-[11px] text-slate-600">
-                            <div><span className="font-bold text-slate-700">Original:</span> {joinValues(row.originalValues)}</div>
-                            <div><span className="font-bold text-slate-700">Target:</span> {joinValues(row.targetValues)}</div>
-                            <div><span className="font-bold text-slate-700">Noise:</span> {joinValues(row.noiseValues)}</div>
+                          <div className="flex flex-wrap gap-1 mb-2">
+                            {sv.values.slice(0, 10).map((v) => (
+                              <span key={v} className="px-1.5 py-0.5 rounded bg-teal-100 text-teal-700 text-[9px] font-medium">{v}</span>
+                            ))}
+                            {sv.values.length > 10 ? <span className="text-[9px] text-slate-400">+{sv.values.length - 10} more</span> : null}
+                          </div>
+                          <div className="flex flex-wrap gap-1">
+                            {sv.sharedItems.slice(0, 8).map((si) => (
+                              <span key={si} className="px-1.5 py-0.5 rounded bg-white border border-teal-200 text-slate-700 text-[9px] font-medium">{si}</span>
+                            ))}
+                            {sv.sharedItems.length > 8 ? <span className="text-[9px] text-slate-400">+{sv.sharedItems.length - 8} more</span> : null}
                           </div>
                         </div>
                       ))}
                     </div>
-                  </div>
+                  )}
                 </div>
-              )}
+              ) : null}
             </div>
 
-            {showMergedView && selectedItem ? (
-              <div className="px-4 py-3 border-t border-violet-200 bg-violet-50/30">
-                <div className="flex items-center justify-between gap-2 mb-3">
-                  <div>
-                    <div className="text-[9px] font-black uppercase tracking-wider text-violet-600">Merged Workspace Mappings</div>
-                    <div className="text-[11px] text-slate-400">Saved merge results for {selectedItem.itemId} — separate from original workspace mappings.</div>
-                  </div>
-                  <span className="text-[10px] text-violet-500 font-bold">{mergedMappings.length} row{mergedMappings.length !== 1 ? 's' : ''}</span>
-                </div>
-                {isLoadingMerged ? (
-                  <div className="flex items-center justify-center gap-2 py-6 text-sm text-slate-400">
-                    <div className="w-4 h-4 border-2 border-violet-500 border-t-transparent rounded-full animate-spin" />
-                    Loading merged mappings...
-                  </div>
-                ) : mergedMappings.length === 0 ? (
-                  <div className="py-6 text-sm text-slate-400 text-center">No merged mappings saved yet for this item.</div>
-                ) : (
-                  <div className="rounded-xl border border-violet-200 overflow-hidden">
-                    <table className="w-full text-[11px]">
-                      <thead className="bg-violet-50">
-                        <tr>
-                          <th className="text-left px-3 py-1.5 text-[9px] font-black uppercase tracking-wider text-violet-500 border-b border-violet-200">Legacy Feature</th>
-                          <th className="text-left px-3 py-1.5 text-[9px] font-black uppercase tracking-wider text-violet-500 border-b border-violet-200">New Attribute</th>
-                          <th className="text-left px-3 py-1.5 text-[9px] font-black uppercase tracking-wider text-violet-500 border-b border-violet-200">Value</th>
-                          <th className="text-left px-3 py-1.5 text-[9px] font-black uppercase tracking-wider text-violet-500 border-b border-violet-200">Type</th>
-                          <th className="text-left px-3 py-1.5 text-[9px] font-black uppercase tracking-wider text-violet-500 border-b border-violet-200">Saved By</th>
-                        </tr>
-                      </thead>
-                      <tbody className="divide-y divide-violet-100">
-                        {mergedMappings.map((row) => (
-                          <tr key={row.id} className="hover:bg-violet-50/50">
-                            <td className="px-3 py-1.5 text-slate-700 font-medium">{row.legacyFeatureId}</td>
-                            <td className="px-3 py-1.5 text-slate-700">{row.newAttributeId}</td>
-                            <td className="px-3 py-1.5 text-slate-600">{row.newValue || '—'}</td>
-                            <td className="px-3 py-1.5"><span className="px-1.5 py-0.5 rounded bg-violet-100 text-violet-700 text-[9px] font-bold">{row.attributeType || '—'}</span></td>
-                            <td className="px-3 py-1.5 text-slate-400">{row.signedOnByUsername || row.createdBy || '—'}</td>
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
-                  </div>
-                )}
-              </div>
-            ) : null}
+            <div className="px-4 py-2 border-t border-slate-200 bg-slate-50 text-[10px] text-slate-500 shrink-0">
+              {mergedDetail ? `${mergedDetail.totalMappings} mapping${mergedDetail.totalMappings !== 1 ? 's' : ''}` : '0 mappings'}
+            </div>
           </div>
-
-          <div className="px-4 py-2 border-t border-slate-200 bg-slate-50 text-[10px] text-slate-500 shrink-0">
-            {total.toLocaleString()} items loaded
-          </div>
-        </div>
+        ) : null}
       </div>
     </div>
   );

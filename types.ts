@@ -396,6 +396,7 @@ export interface MigrationManifestRow {
   acceptedBy?: string | null;
   comboItemCount: number;
   builtAt?: number | null;
+  valueMappings?: Record<string, string>;
 }
 
 export interface MigrationManifestFilters {
@@ -419,6 +420,7 @@ export interface MigrationManifestItemSummary {
   valueMergeCount: number;
   mappedCount: number;
   noiseCount: number;
+  sharedValuelistCount: number;
 }
 
 export interface MigrationManifestAttributeGroup {
@@ -450,6 +452,7 @@ export interface MergedWorkspaceMappingRow {
   formula?: string | null;
   mappedFrom: string;
   valueStatus?: string | null;
+  feasibility?: string | null;
   manifestEntryId?: number | null;
   signedOnByUsername?: string | null;
   signedOnAt?: number | null;
@@ -460,6 +463,29 @@ export interface MergedWorkspaceMappingRow {
   modifiedAt?: number | null;
   valuelistId?: string | null;
   isEffectiveFixed?: boolean;
+  attributeFootprint?: string | null;
+  valueFootprint?: string | null;
+}
+
+export interface MergedWorkspaceMappingDetail {
+  mappings: MergedWorkspaceMappingRow[];
+  totalMappings: number;
+  comboItems: { itemId: string; description: string }[];
+  totalComboItems: number;
+  sharedVL: { attribute: string; values: string[]; sharedItems: string[]; totalShared: number }[];
+  attributeFootprint?: string | null;
+}
+
+export interface MergeJob {
+  hasJob: boolean;
+  jobId?: number;
+  status?: string;
+  totalItems?: number;
+  processedItems?: number;
+  generatedRows?: number;
+  startedAt?: number | null;
+  finishedAt?: number | null;
+  errorMessage?: string | null;
 }
 
 // ---------------------------------------------------------------------------

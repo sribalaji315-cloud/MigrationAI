@@ -1,5 +1,5 @@
 
-import { GlobalMapping, DatabaseState, User, ConnectionMode, NewAttribute, WorkspaceMappingRow, MappingGenerationProgress, ValueListGroup, ValueListRow, NewClassification, BomHierarchyItem, MLPrediction, MLSettings, FeatureCombinationJobProgress, FeatureCombinationRow, FeatureCombinationItem, ConsolidationAnalysis, SubsetMergeDetail, AttributeCombinationJobProgress, AttributeCombinationRow, AttributeCombinationItem, AttrComboConsolidationAnalysis, MigrationManifestRow, MigrationManifestFilters, MigrationManifestItemSummary, MigrationManifestAttributeGroup, MigrationManifestValueDetail, MergedWorkspaceMappingRow, ValuelistStrategyJob, TargetAttributeProfile, ValuelistDedupGroup, ValuelistMergeProposal, ValuelistApplyResult } from '../types';
+import { GlobalMapping, DatabaseState, User, ConnectionMode, NewAttribute, WorkspaceMappingRow, MappingGenerationProgress, ValueListGroup, ValueListRow, NewClassification, BomHierarchyItem, MLPrediction, MLSettings, FeatureCombinationJobProgress, FeatureCombinationRow, FeatureCombinationItem, ConsolidationAnalysis, SubsetMergeDetail, AttributeCombinationJobProgress, AttributeCombinationRow, AttributeCombinationItem, AttrComboConsolidationAnalysis, MigrationManifestRow, MigrationManifestFilters, MigrationManifestItemSummary, MigrationManifestAttributeGroup, MigrationManifestValueDetail, MergedWorkspaceMappingRow, MergeJob, ValuelistStrategyJob, TargetAttributeProfile, ValuelistDedupGroup, ValuelistMergeProposal, ValuelistApplyResult } from '../types';
 
 export interface SaveAllResult {
   mode: ConnectionMode;
@@ -1351,13 +1351,14 @@ export const dbService = {
     });
   },
 
-  async fetchMigrationManifestItemSummaries(options?: { search?: string; category?: string; productType?: string; priority?: number; source?: string; hasNoise?: boolean; hasMapping?: boolean; sortBy?: string; sortDir?: string; limit?: number; offset?: number }): Promise<{ items: MigrationManifestItemSummary[]; total: number }> {
+  async fetchMigrationManifestItemSummaries(options?: { search?: string; category?: string; productType?: string; priority?: number; attributeType?: string; source?: string; hasNoise?: boolean; hasMapping?: boolean; sortBy?: string; sortDir?: string; limit?: number; offset?: number }): Promise<{ items: MigrationManifestItemSummary[]; total: number }> {
     if (!SQL_ENDPOINT) throw new Error('Database connection not available.');
     const params = new URLSearchParams();
     if (options?.search) params.set('search', options.search);
     if (options?.category) params.set('category', options.category);
     if (options?.productType) params.set('productType', options.productType);
     if (options?.priority !== undefined) params.set('priority', String(options.priority));
+    if (options?.attributeType) params.set('attributeType', options.attributeType);
     if (options?.source) params.set('source', options.source);
     if (options?.hasNoise !== undefined) params.set('hasNoise', String(options.hasNoise));
     if (options?.hasMapping !== undefined) params.set('hasMapping', String(options.hasMapping));
@@ -1411,11 +1412,40 @@ export const dbService = {
     });
   },
 
-  async fetchMergedWorkspaceMappingsSummary(): Promise<{ totalRows: number; distinctItems: number }> {
+  async fetchMergedWorkspaceMappingsDetail(itemId: string): Promise<import('../types').MergedWorkspaceMappingDetail> {
+    if (!SQL_ENDPOINT) throw new Error('Database connection not available.');
+    return this._cachedFetch(`${SQL_ENDPOINT}/merged-workspace-mappings/${encodeURIComponent(itemId)}/detail`, {
+      headers: this._authHeaders(),
+      _ttlMs: 5000,
+    });
+  },
+
+  async fetchMergedWorkspaceMappingsSummary(): Promise<{ totalRows: number; distinctItems: number; metrics?: { emptyAttributeFootprints: number; uniqueAttributeFootprints: number; itemsWithCombo: number; maxComboSize: number; uniqueValueFootprints: number; emptyValueFootprintAttrs: number; itemsWithSharedVL: number; totalSharedVLAttrs: number }; footprintItems?: { category: string; productType: string; priority: string; hasAttrFp: boolean; attrFp: string; count: number }[]; filterOptions?: { categories: string[]; productTypes: string[]; priorities: string[] } }> {
     if (!SQL_ENDPOINT) throw new Error('Database connection not available.');
     return this._cachedFetch(`${SQL_ENDPOINT}/merged-workspace-mappings-summary`, {
       headers: this._authHeaders(),
       _ttlMs: 10000,
+    });
+  },
+
+  // ---------------------------------------------------------------------------
+  // Merge Batch Job
+  // ---------------------------------------------------------------------------
+
+  async triggerMergeJob(): Promise<{ ok: boolean; jobId?: number; error?: string }> {
+    if (!SQL_ENDPOINT) throw new Error('Database connection not available.');
+    const resp = await this._fetchWithRefresh(`${SQL_ENDPOINT}/merge-job/trigger`, {
+      method: 'POST',
+      headers: { ...this._authHeaders(), 'Content-Type': 'application/json' },
+    });
+    return resp.json();
+  },
+
+  async fetchMergeJobProgress(): Promise<MergeJob> {
+    if (!SQL_ENDPOINT) throw new Error('Database connection not available.');
+    return this._cachedFetch(`${SQL_ENDPOINT}/merge-job/progress`, {
+      headers: this._authHeaders(),
+      _ttlMs: 2000,
     });
   },
 
