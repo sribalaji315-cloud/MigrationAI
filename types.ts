@@ -458,4 +458,75 @@ export interface MergedWorkspaceMappingRow {
   createdBy?: string | null;
   modifiedBy?: string | null;
   modifiedAt?: number | null;
+  valuelistId?: string | null;
+  isEffectiveFixed?: boolean;
+}
+
+// ---------------------------------------------------------------------------
+// Valuelist Strategy types
+// ---------------------------------------------------------------------------
+
+export interface ValuelistStrategyJob {
+  jobId: number;
+  status: 'queued' | 'running' | 'completed' | 'failed';
+  strategy: 'conservative' | 'aggressive';
+  totalAttributes: number;
+  fixedOnlyCount: number;
+  valuelistCount: number;
+  uniqueValuelists: number;
+  mergedValuelists?: number | null;
+  errorMessage?: string | null;
+  createdAt?: number | null;
+  completedAt?: number | null;
+}
+
+export interface TargetAttributeProfile {
+  id: number;
+  targetAttributeId: string;
+  classification: 'fixed_only' | 'valuelist';
+  valuelistId?: string | null;
+  totalItems: number;
+  fixedValueItems: number;
+  multiValueItems: number;
+  canonicalValues: string[];
+  noiseValues: string[];
+  dedupGroupKey?: string | null;
+  dedupSiblings?: string[];
+  jobId?: number | null;
+  createdAt?: number | null;
+  updatedAt?: number | null;
+}
+
+export interface ValuelistDedupGroup {
+  dedupGroupKey: string;
+  valuelistId: string;
+  canonicalValues: string[];
+  attributes: {
+    targetAttributeId: string;
+    totalItems: number;
+    fixedValueItems: number;
+    multiValueItems: number;
+  }[];
+}
+
+export interface ValuelistMergeProposal {
+  listA: string;
+  listB: string;
+  attributesA: string[];
+  attributesB: string[];
+  mergedValues: string[];
+  overlapPercent: number;
+  isSubset: boolean;
+  noiseAddedToA: number;
+  noiseAddedToB: number;
+  affectedItemsA: number;
+  affectedItemsB: number;
+}
+
+export interface ValuelistApplyResult {
+  ok: boolean;
+  valuelistsCreated: number;
+  valuelistRowsCreated: number;
+  profilesUpdated: number;
+  mappingsUpdated: number;
 }

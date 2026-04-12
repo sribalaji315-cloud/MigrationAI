@@ -467,3 +467,48 @@ class MergedWorkspaceMapping(Base):
     created_by = Column(String, nullable=True)
     modified_by = Column(String, nullable=True)
     modified_at = Column(Float, nullable=True)
+    # Valuelist strategy columns
+    valuelist_id = Column(String, nullable=True, index=True)
+    is_effective_fixed = Column(Integer, nullable=False, default=0)
+
+
+class ValuelistStrategyJob(Base):
+    """Tracks async valuelist-strategy analysis job state."""
+
+    __tablename__ = "valuelist_strategy_jobs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    status = Column(String, index=True, nullable=False)  # queued|running|completed|failed
+    strategy = Column(String, nullable=False, default="conservative")  # conservative|aggressive
+    total_attributes = Column(Integer, nullable=False, default=0)
+    fixed_only_count = Column(Integer, nullable=False, default=0)
+    valuelist_count = Column(Integer, nullable=False, default=0)
+    unique_valuelists = Column(Integer, nullable=False, default=0)
+    merged_valuelists = Column(Integer, nullable=True)
+    error_message = Column(String, nullable=True)
+    created_at = Column(Float, nullable=True)
+    completed_at = Column(Float, nullable=True)
+
+
+class TargetAttributeProfile(Base):
+    """Per-target-attribute analysis produced by the valuelist strategy pipeline.
+
+    Classifies each target attribute as fixed_only or valuelist, stores
+    canonical values, and groups deduplicated lists via dedup_group_key.
+    """
+
+    __tablename__ = "target_attribute_profiles"
+
+    id = Column(Integer, primary_key=True, index=True)
+    target_attribute_id = Column(String, unique=True, index=True, nullable=False)
+    classification = Column(String, nullable=False)  # fixed_only|valuelist
+    valuelist_id = Column(String, nullable=True, index=True)
+    total_items = Column(Integer, nullable=False, default=0)
+    fixed_value_items = Column(Integer, nullable=False, default=0)
+    multi_value_items = Column(Integer, nullable=False, default=0)
+    canonical_values_json = Column(JSON, nullable=True)
+    noise_values_json = Column(JSON, nullable=True)
+    dedup_group_key = Column(String, nullable=True, index=True)
+    job_id = Column(Integer, nullable=True, index=True)
+    created_at = Column(Float, nullable=True)
+    updated_at = Column(Float, nullable=True)

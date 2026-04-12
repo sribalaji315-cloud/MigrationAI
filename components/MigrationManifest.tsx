@@ -6,7 +6,11 @@ import {
   MigrationManifestItemSummary,
   MigrationManifestRow,
   MigrationManifestValueDetail,
+  TargetAttributeProfile,
   User,
+  ValuelistDedupGroup,
+  ValuelistMergeProposal,
+  ValuelistStrategyJob,
 } from '../types';
 import { dbService } from '../services/dbService';
 
@@ -86,6 +90,21 @@ const MigrationManifest: React.FC<MigrationManifestProps> = ({ currentUser, onCl
   const [mergedMappings, setMergedMappings] = useState<MergedWorkspaceMappingRow[]>([]);
   const [isLoadingMerged, setIsLoadingMerged] = useState(false);
   const [mergedSummary, setMergedSummary] = useState<{ totalRows: number; distinctItems: number }>({ totalRows: 0, distinctItems: 0 });
+
+  // Valuelist Strategy state
+  const [showVlStrategy, setShowVlStrategy] = useState(false);
+  const [vlJob, setVlJob] = useState<ValuelistStrategyJob | null>(null);
+  const [vlProfiles, setVlProfiles] = useState<TargetAttributeProfile[]>([]);
+  const [vlProfilesTotal, setVlProfilesTotal] = useState(0);
+  const [vlDedupGroups, setVlDedupGroups] = useState<ValuelistDedupGroup[]>([]);
+  const [vlMergeProposals, setVlMergeProposals] = useState<ValuelistMergeProposal[]>([]);
+  const [vlStrategy, setVlStrategy] = useState<'conservative' | 'aggressive'>('conservative');
+  const [isVlAnalyzing, setIsVlAnalyzing] = useState(false);
+  const [isVlApplying, setIsVlApplying] = useState(false);
+  const [vlClassFilter, setVlClassFilter] = useState('');
+  const [vlSearchInput, setVlSearchInput] = useState('');
+  const [vlStatusMessage, setVlStatusMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
+  const vlPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const containerRef = useRef<HTMLDivElement>(null);
   const draggingRef = useRef(false);
@@ -281,6 +300,98 @@ const MigrationManifest: React.FC<MigrationManifestProps> = ({ currentUser, onCl
     }
   }, [refreshCurrentSelection, loadMergedSummary, selectedAttribute?.targetAttributeId, selectedItem?.itemId]);
 
+  // ---------------------------------------------------------------------------
+  // Valuelist Strategy handlers
+  // ---------------------------------------------------------------------------
+
+  const loadVlProfiles = useCallback(async () => {
+    try {
+      const res = await dbService.fetchValuelistStrategyProfiles({
+        classification: vlClassFilter || undefined,
+        search: vlSearchInput || undefined,
+        limit: 200,
+      });
+      setVlProfiles(res.items);
+      setVlProfilesTotal(res.total);
+    } catch { /* ignore */ }
+  }, [vlClassFilter, vlSearchInput]);
+
+  const loadVlDedupGroups = useCallback(async () => {
+    try {
+      const res = await dbService.fetchValuelistStrategyDedupGroups();
+      setVlDedupGroups(res.groups);
+    } catch { /* ignore */ }
+  }, []);
+
+  const loadVlMergePreview = useCallback(async () => {
+    try {
+      const res = await dbService.fetchValuelistStrategyMergePreview(vlStrategy);
+      setVlMergeProposals(res.proposals);
+    } catch { /* ignore */ }
+  }, [vlStrategy]);
+
+  const handleVlAnalyze = useCallback(async () => {
+    setIsVlAnalyzing(true);
+    setVlStatusMessage(null);
+    try {
+      const { jobId } = await dbService.triggerValuelistStrategyAnalysis(vlStrategy);
+      // Poll job status
+      const poll = setInterval(async () => {
+        try {
+          const job = await dbService.fetchValuelistStrategyJobStatus(jobId);
+          setVlJob(job);
+          if (job.status === 'completed' || job.status === 'failed') {
+            clearInterval(poll);
+            vlPollRef.current = null;
+            setIsVlAnalyzing(false);
+            if (job.status === 'completed') {
+              setVlStatusMessage({ type: 'success', text: `Analysis complete: ${job.totalAttributes} attributes — ${job.fixedOnlyCount} fixed-only, ${job.valuelistCount} valuelist (${job.uniqueValuelists} unique after dedup)` });
+              loadVlProfiles();
+              loadVlDedupGroups();
+              loadVlMergePreview();
+            } else {
+              setVlStatusMessage({ type: 'error', text: job.errorMessage || 'Analysis failed' });
+            }
+          }
+        } catch {
+          clearInterval(poll);
+          vlPollRef.current = null;
+          setIsVlAnalyzing(false);
+        }
+      }, 1500);
+      vlPollRef.current = poll;
+    } catch (error: any) {
+      setIsVlAnalyzing(false);
+      setVlStatusMessage({ type: 'error', text: error?.message || 'Failed to start analysis' });
+    }
+  }, [vlStrategy, loadVlProfiles, loadVlDedupGroups, loadVlMergePreview]);
+
+  const handleVlApply = useCallback(async () => {
+    setIsVlApplying(true);
+    setVlStatusMessage(null);
+    try {
+      const result = await dbService.applyValuelistStrategy();
+      setVlStatusMessage({ type: 'success', text: `Applied: ${result.valuelistsCreated} valuelists created, ${result.profilesUpdated} profiles updated, ${result.mappingsUpdated} mappings updated` });
+      loadVlProfiles();
+    } catch (error: any) {
+      setVlStatusMessage({ type: 'error', text: error?.message || 'Failed to apply strategy' });
+    } finally {
+      setIsVlApplying(false);
+    }
+  }, [loadVlProfiles]);
+
+  // Cleanup poll on unmount
+  useEffect(() => {
+    return () => {
+      if (vlPollRef.current) clearInterval(vlPollRef.current);
+    };
+  }, []);
+
+  // Reload profiles when filters change
+  useEffect(() => {
+    if (showVlStrategy) loadVlProfiles();
+  }, [showVlStrategy, loadVlProfiles]);
+
   const handleSearch = useCallback(() => {
     setPage(0);
     setSearch(searchInput.trim());
@@ -336,6 +447,15 @@ const MigrationManifest: React.FC<MigrationManifestProps> = ({ currentUser, onCl
             </span>
           ) : null}
           <button
+            onClick={() => setShowVlStrategy((prev) => !prev)}
+            className={`flex items-center gap-1.5 px-3 py-1.5 rounded-md text-[9px] font-black uppercase tracking-wider transition-all ${showVlStrategy ? 'bg-teal-600 text-white hover:bg-teal-700' : 'bg-teal-100 text-teal-700 hover:bg-teal-200'}`}
+          >
+            <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2" />
+            </svg>
+            {showVlStrategy ? 'Hide VL Strategy' : 'VL Strategy'}
+          </button>
+          <button
             onClick={() => setShowMergedView((prev) => !prev)}
             className={`flex items-center gap-1.5 px-3 py-1.5 rounded-md text-[9px] font-black uppercase tracking-wider transition-all ${showMergedView ? 'bg-violet-600 text-white hover:bg-violet-700' : 'bg-violet-100 text-violet-700 hover:bg-violet-200'}`}
           >
@@ -359,6 +479,170 @@ const MigrationManifest: React.FC<MigrationManifestProps> = ({ currentUser, onCl
       {statusMessage ? (
         <div className={`px-5 py-2 text-[11px] border-b shrink-0 ${statusMessage.type === 'success' ? 'bg-emerald-50 text-emerald-700 border-emerald-100' : 'bg-rose-50 text-rose-700 border-rose-100'}`}>
           {statusMessage.text}
+        </div>
+      ) : null}
+
+      {vlStatusMessage ? (
+        <div className={`px-5 py-2 text-[11px] border-b shrink-0 ${vlStatusMessage.type === 'success' ? 'bg-emerald-50 text-emerald-700 border-emerald-100' : 'bg-rose-50 text-rose-700 border-rose-100'}`}>
+          {vlStatusMessage.text}
+        </div>
+      ) : null}
+
+      {showVlStrategy ? (
+        <div className="border-b border-teal-200 bg-teal-50/30 shrink-0 overflow-auto" style={{ maxHeight: '50vh' }}>
+          <div className="px-5 py-3">
+            <div className="flex items-center justify-between gap-3 mb-3">
+              <div>
+                <div className="text-[9px] font-black uppercase tracking-wider text-teal-700">Valuelist Strategy</div>
+                <div className="text-[11px] text-slate-500">Classify target attributes, deduplicate value sets, and optionally merge near-identical lists.</div>
+              </div>
+              <div className="flex items-center gap-2">
+                <select
+                  value={vlStrategy}
+                  onChange={(e) => setVlStrategy(e.target.value as 'conservative' | 'aggressive')}
+                  className="px-2 py-1 border border-teal-300 rounded text-[10px] bg-white focus:outline-none focus:ring-1 focus:ring-teal-400"
+                >
+                  <option value="conservative">Conservative (subsets only)</option>
+                  <option value="aggressive">Aggressive (overlap merge)</option>
+                </select>
+                <button
+                  onClick={handleVlAnalyze}
+                  disabled={isVlAnalyzing}
+                  className="px-3 py-1.5 rounded-md bg-teal-600 text-white text-[9px] font-black uppercase tracking-wider hover:bg-teal-700 disabled:opacity-40 disabled:cursor-not-allowed"
+                >
+                  {isVlAnalyzing ? 'Analyzing...' : 'Analyze'}
+                </button>
+                <button
+                  onClick={handleVlApply}
+                  disabled={isVlApplying || !vlJob || vlJob.status !== 'completed'}
+                  className="px-3 py-1.5 rounded-md bg-emerald-600 text-white text-[9px] font-black uppercase tracking-wider hover:bg-emerald-700 disabled:opacity-40 disabled:cursor-not-allowed"
+                >
+                  {isVlApplying ? 'Applying...' : 'Apply Strategy'}
+                </button>
+              </div>
+            </div>
+
+            {vlJob ? (
+              <div className="mb-3 flex items-center gap-4 text-[11px]">
+                <span className={`px-2 py-0.5 rounded-full font-bold text-[9px] uppercase ${vlJob.status === 'completed' ? 'bg-emerald-100 text-emerald-700' : vlJob.status === 'running' ? 'bg-blue-100 text-blue-700' : vlJob.status === 'failed' ? 'bg-rose-100 text-rose-700' : 'bg-slate-100 text-slate-700'}`}>{vlJob.status}</span>
+                <span className="text-slate-600"><span className="font-bold">{vlJob.totalAttributes}</span> attributes</span>
+                <span className="text-green-700"><span className="font-bold">{vlJob.fixedOnlyCount}</span> fixed-only</span>
+                <span className="text-blue-700"><span className="font-bold">{vlJob.valuelistCount}</span> valuelist</span>
+                <span className="text-teal-700"><span className="font-bold">{vlJob.uniqueValuelists}</span> unique after dedup</span>
+                {vlJob.mergedValuelists != null ? <span className="text-purple-700"><span className="font-bold">{vlJob.mergedValuelists}</span> after merge</span> : null}
+              </div>
+            ) : null}
+
+            {vlProfiles.length > 0 ? (
+              <div className="space-y-3">
+                <div className="flex items-center gap-2">
+                  <input
+                    type="text"
+                    placeholder="Search attributes..."
+                    value={vlSearchInput}
+                    onChange={(e) => setVlSearchInput(e.target.value)}
+                    className="px-2 py-1 border border-teal-200 rounded text-[10px] bg-white focus:outline-none focus:ring-1 focus:ring-teal-400 w-48"
+                  />
+                  <select
+                    value={vlClassFilter}
+                    onChange={(e) => setVlClassFilter(e.target.value)}
+                    className="px-2 py-1 border border-teal-200 rounded text-[10px] bg-white focus:outline-none focus:ring-1 focus:ring-teal-400"
+                  >
+                    <option value="">All Classifications</option>
+                    <option value="fixed_only">Fixed Only</option>
+                    <option value="valuelist">Valuelist</option>
+                  </select>
+                  <span className="ml-auto text-[10px] text-slate-400">{vlProfilesTotal} profiles</span>
+                </div>
+
+                <div className="rounded-xl border border-teal-200 overflow-hidden">
+                  <table className="w-full text-[11px]">
+                    <thead className="bg-teal-50/70">
+                      <tr>
+                        <th className="text-left px-3 py-1.5 text-[9px] font-black uppercase tracking-wider text-teal-600 border-b border-teal-200">Target Attribute</th>
+                        <th className="text-left px-3 py-1.5 text-[9px] font-black uppercase tracking-wider text-teal-600 border-b border-teal-200">Class</th>
+                        <th className="text-right px-3 py-1.5 text-[9px] font-black uppercase tracking-wider text-teal-600 border-b border-teal-200">Items</th>
+                        <th className="text-right px-3 py-1.5 text-[9px] font-black uppercase tracking-wider text-teal-600 border-b border-teal-200">Fixed</th>
+                        <th className="text-right px-3 py-1.5 text-[9px] font-black uppercase tracking-wider text-teal-600 border-b border-teal-200">Multi</th>
+                        <th className="text-left px-3 py-1.5 text-[9px] font-black uppercase tracking-wider text-teal-600 border-b border-teal-200">Valuelist</th>
+                        <th className="text-right px-3 py-1.5 text-[9px] font-black uppercase tracking-wider text-teal-600 border-b border-teal-200">Values</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-teal-100">
+                      {vlProfiles.map((p) => (
+                        <tr key={p.id} className="hover:bg-teal-50/50">
+                          <td className="px-3 py-1.5 text-slate-800 font-medium">{p.targetAttributeId}</td>
+                          <td className="px-3 py-1.5">
+                            <span className={`px-1.5 py-0.5 rounded text-[9px] font-bold uppercase ${p.classification === 'fixed_only' ? 'bg-green-100 text-green-700' : 'bg-blue-100 text-blue-700'}`}>{p.classification === 'fixed_only' ? 'Fixed' : 'VList'}</span>
+                          </td>
+                          <td className="px-3 py-1.5 text-right text-slate-600">{p.totalItems}</td>
+                          <td className="px-3 py-1.5 text-right text-green-700 font-bold">{p.fixedValueItems}</td>
+                          <td className="px-3 py-1.5 text-right text-blue-700 font-bold">{p.multiValueItems}</td>
+                          <td className="px-3 py-1.5 text-slate-500">{p.valuelistId || '—'}</td>
+                          <td className="px-3 py-1.5 text-right text-slate-600">{p.canonicalValues?.length ?? 0}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+
+                {vlDedupGroups.length > 0 ? (
+                  <div className="mt-3">
+                    <div className="text-[9px] font-black uppercase tracking-wider text-teal-700 mb-2">Dedup Groups — {vlDedupGroups.length} shared valuelists</div>
+                    <div className="space-y-2">
+                      {vlDedupGroups.map((g) => (
+                        <div key={g.dedupGroupKey} className="rounded-lg border border-teal-200 bg-white p-3">
+                          <div className="flex items-center justify-between gap-2 mb-1">
+                            <span className="text-[10px] font-bold text-teal-700">{g.valuelistId}</span>
+                            <span className="text-[10px] text-slate-400">{g.attributes.length} attributes share this list</span>
+                          </div>
+                          <div className="flex flex-wrap gap-1 mb-2">
+                            {g.canonicalValues.slice(0, 12).map((v) => (
+                              <span key={v} className="px-1.5 py-0.5 rounded bg-teal-50 text-teal-700 text-[9px] font-medium">{v}</span>
+                            ))}
+                            {g.canonicalValues.length > 12 ? <span className="px-1.5 py-0.5 text-[9px] text-slate-400">+{g.canonicalValues.length - 12} more</span> : null}
+                          </div>
+                          <div className="text-[10px] text-slate-500">{g.attributes.map((a) => a.targetAttributeId).join(', ')}</div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                ) : null}
+
+                {vlMergeProposals.length > 0 ? (
+                  <div className="mt-3">
+                    <div className="text-[9px] font-black uppercase tracking-wider text-purple-700 mb-2">Merge Suggestions — {vlMergeProposals.length} proposals</div>
+                    <div className="space-y-2">
+                      {vlMergeProposals.map((p, i) => (
+                        <div key={i} className="rounded-lg border border-purple-200 bg-white p-3">
+                          <div className="flex items-center justify-between gap-2">
+                            <div className="text-[10px]">
+                              <span className="font-bold text-purple-700">{p.listA}</span>
+                              <span className="text-slate-400"> + </span>
+                              <span className="font-bold text-purple-700">{p.listB}</span>
+                            </div>
+                            <div className="flex items-center gap-2">
+                              <span className="text-[9px] text-slate-500">{p.overlapPercent}% overlap</span>
+                              {p.isSubset ? <span className="px-1.5 py-0.5 rounded bg-green-100 text-green-700 text-[9px] font-bold">Subset</span> : null}
+                            </div>
+                          </div>
+                          <div className="mt-1 text-[10px] text-slate-500">
+                            Noise added: {p.noiseAddedToA} values to {p.affectedItemsA} items, {p.noiseAddedToB} values to {p.affectedItemsB} items
+                          </div>
+                          <div className="mt-1 flex flex-wrap gap-1">
+                            {p.mergedValues.slice(0, 8).map((v) => (
+                              <span key={v} className="px-1.5 py-0.5 rounded bg-purple-50 text-purple-700 text-[9px] font-medium">{v}</span>
+                            ))}
+                            {p.mergedValues.length > 8 ? <span className="px-1.5 py-0.5 text-[9px] text-slate-400">+{p.mergedValues.length - 8} more</span> : null}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                ) : null}
+              </div>
+            ) : null}
+          </div>
         </div>
       ) : null}
 

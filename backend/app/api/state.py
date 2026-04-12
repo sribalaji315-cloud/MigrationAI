@@ -6238,3 +6238,502 @@ def get_merged_workspace_mappings_summary(
         "totalRows": int(total_rows),
         "distinctItems": int(distinct_items),
     }
+
+
+# ---------------------------------------------------------------------------
+# Valuelist Strategy endpoints
+# ---------------------------------------------------------------------------
+
+_EXCLUDED_NEW_VALUES = {"NOT REQUIRED", ""}
+_EXCLUDED_VALUE_STATUSES = {"ignored", "deprecated", "discontinued"}
+
+
+def _run_valuelist_strategy_analysis(job_id: int, strategy: str):
+    """Background task: census, classification, dedup for valuelist strategy."""
+    db = SessionLocal()
+    try:
+        job = db.query(models.ValuelistStrategyJob).get(job_id)
+        if not job:
+            return
+        job.status = "running"
+        db.commit()
+
+        # ------------------------------------------------------------------
+        # Phase A-1: Target Attribute Census
+        # ------------------------------------------------------------------
+        merged_rows = (
+            db.query(models.MergedWorkspaceMapping)
+            .all()
+        )
+
+        # Build: { new_attribute_id -> { legacy_item_id -> [new_value] } }
+        attr_items: Dict[str, Dict[str, List[str]]] = {}
+        for r in merged_rows:
+            nv = (r.new_value or "").strip()
+            vs = (r.value_status or "").strip().lower()
+            # Pre-filter: exclude NOT REQUIRED and excluded statuses
+            if nv.upper() in _EXCLUDED_NEW_VALUES:
+                continue
+            if vs in _EXCLUDED_VALUE_STATUSES:
+                continue
+            attr_items.setdefault(r.new_attribute_id, {}).setdefault(r.legacy_item_id, []).append(nv)
+
+        # ------------------------------------------------------------------
+        # Phase A-2: Attribute Classification
+        # ------------------------------------------------------------------
+        now = time.time()
+        profiles: List[models.TargetAttributeProfile] = []
+        fixed_count = 0
+        vl_count = 0
+
+        for attr_id, item_values in attr_items.items():
+            max_vals = max((len(vals) for vals in item_values.values()), default=0)
+            classification = "fixed_only" if max_vals <= 1 else "valuelist"
+
+            all_values = sorted({v for vals in item_values.values() for v in vals})
+            fixed_items = sum(1 for vals in item_values.values() if len(vals) == 1)
+            multi_items = sum(1 for vals in item_values.values() if len(vals) > 1)
+
+            if classification == "fixed_only":
+                fixed_count += 1
+            else:
+                vl_count += 1
+
+            profiles.append(models.TargetAttributeProfile(
+                target_attribute_id=attr_id,
+                classification=classification,
+                total_items=len(item_values),
+                fixed_value_items=fixed_items,
+                multi_value_items=multi_items,
+                canonical_values_json=all_values if classification == "valuelist" else None,
+                noise_values_json=None,
+                dedup_group_key=None,
+                job_id=job_id,
+                created_at=now,
+                updated_at=now,
+            ))
+
+        # Clear previous profiles for this job (or all)
+        db.query(models.TargetAttributeProfile).delete()
+        db.bulk_save_objects(profiles)
+        db.flush()
+
+        # ------------------------------------------------------------------
+        # Phase A-3: Valuelist Deduplication
+        # ------------------------------------------------------------------
+        # Re-query to get IDs assigned
+        all_profiles = db.query(models.TargetAttributeProfile).all()
+        hash_groups: Dict[str, List[models.TargetAttributeProfile]] = {}
+        for p in all_profiles:
+            if p.classification != "valuelist" or not p.canonical_values_json:
+                continue
+            sorted_vals = sorted(p.canonical_values_json)
+            key = hashlib.sha256("|".join(sorted_vals).encode()).hexdigest()[:16]
+            p.dedup_group_key = key
+            hash_groups.setdefault(key, []).append(p)
+
+        unique_vl_count = 0
+        vl_counter = 0
+        for key, group in hash_groups.items():
+            vl_counter += 1
+            unique_vl_count += 1
+            vl_id = f"VL-STRATEGY-{vl_counter:04d}"
+            for p in group:
+                p.valuelist_id = vl_id
+
+        db.flush()
+
+        # Update job
+        job.total_attributes = len(attr_items)
+        job.fixed_only_count = fixed_count
+        job.valuelist_count = vl_count
+        job.unique_valuelists = unique_vl_count
+        job.status = "completed"
+        job.completed_at = time.time()
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        try:
+            job = db.query(models.ValuelistStrategyJob).get(job_id)
+            if job:
+                job.status = "failed"
+                job.error_message = str(exc)[:500]
+                job.completed_at = time.time()
+                db.commit()
+        except Exception:
+            pass
+        logger.exception("Valuelist strategy analysis failed for job %s", job_id)
+    finally:
+        db.close()
+
+
+@router.post("/valuelist-strategy/analyze")
+def valuelist_strategy_analyze(
+    background_tasks: BackgroundTasks,
+    body: dict = Body(default={}),
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """Trigger census + classification + dedup background job."""
+    strategy = body.get("strategy", "conservative")
+    if strategy not in ("conservative", "aggressive"):
+        raise HTTPException(status_code=400, detail="strategy must be 'conservative' or 'aggressive'")
+
+    job = models.ValuelistStrategyJob(
+        status="queued",
+        strategy=strategy,
+        created_at=time.time(),
+    )
+    db.add(job)
+    db.commit()
+    db.refresh(job)
+
+    background_tasks.add_task(_run_valuelist_strategy_analysis, job.id, strategy)
+    return {"jobId": job.id, "status": job.status}
+
+
+@router.get("/valuelist-strategy/job/{job_id}")
+def valuelist_strategy_job_status(
+    job_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """Poll job status + summary stats."""
+    job = db.query(models.ValuelistStrategyJob).get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return {
+        "jobId": job.id,
+        "status": job.status,
+        "strategy": job.strategy,
+        "totalAttributes": job.total_attributes,
+        "fixedOnlyCount": job.fixed_only_count,
+        "valuelistCount": job.valuelist_count,
+        "uniqueValuelists": job.unique_valuelists,
+        "mergedValuelists": job.merged_valuelists,
+        "errorMessage": job.error_message,
+        "createdAt": job.created_at,
+        "completedAt": job.completed_at,
+    }
+
+
+@router.get("/valuelist-strategy/profiles")
+def valuelist_strategy_profiles(
+    classification: Optional[str] = Query(None),
+    search: Optional[str] = Query(None),
+    limit: int = Query(100, ge=1, le=5000),
+    offset: int = Query(0, ge=0),
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """Paginated list of TargetAttributeProfile rows."""
+    q = db.query(models.TargetAttributeProfile)
+    if classification:
+        q = q.filter(models.TargetAttributeProfile.classification == classification)
+    if search:
+        q = q.filter(models.TargetAttributeProfile.target_attribute_id.ilike(f"%{search}%"))
+    total = q.count()
+    rows = q.order_by(models.TargetAttributeProfile.target_attribute_id.asc()).offset(offset).limit(limit).all()
+    return {
+        "items": [
+            {
+                "id": r.id,
+                "targetAttributeId": r.target_attribute_id,
+                "classification": r.classification,
+                "valuelistId": r.valuelist_id,
+                "totalItems": r.total_items,
+                "fixedValueItems": r.fixed_value_items,
+                "multiValueItems": r.multi_value_items,
+                "canonicalValues": r.canonical_values_json or [],
+                "noiseValues": r.noise_values_json or [],
+                "dedupGroupKey": r.dedup_group_key,
+                "jobId": r.job_id,
+                "createdAt": r.created_at,
+                "updatedAt": r.updated_at,
+            }
+            for r in rows
+        ],
+        "total": total,
+    }
+
+
+@router.get("/valuelist-strategy/profiles/{attribute_id}")
+def valuelist_strategy_profile_detail(
+    attribute_id: str,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """Single attribute profile detail."""
+    profile = (
+        db.query(models.TargetAttributeProfile)
+        .filter(models.TargetAttributeProfile.target_attribute_id == attribute_id)
+        .first()
+    )
+    if not profile:
+        raise HTTPException(status_code=404, detail="Profile not found")
+
+    # Also find sibling profiles sharing the same dedup group
+    siblings = []
+    if profile.dedup_group_key:
+        sibling_rows = (
+            db.query(models.TargetAttributeProfile)
+            .filter(
+                models.TargetAttributeProfile.dedup_group_key == profile.dedup_group_key,
+                models.TargetAttributeProfile.id != profile.id,
+            )
+            .all()
+        )
+        siblings = [s.target_attribute_id for s in sibling_rows]
+
+    return {
+        "id": profile.id,
+        "targetAttributeId": profile.target_attribute_id,
+        "classification": profile.classification,
+        "valuelistId": profile.valuelist_id,
+        "totalItems": profile.total_items,
+        "fixedValueItems": profile.fixed_value_items,
+        "multiValueItems": profile.multi_value_items,
+        "canonicalValues": profile.canonical_values_json or [],
+        "noiseValues": profile.noise_values_json or [],
+        "dedupGroupKey": profile.dedup_group_key,
+        "dedupSiblings": siblings,
+        "jobId": profile.job_id,
+        "createdAt": profile.created_at,
+        "updatedAt": profile.updated_at,
+    }
+
+
+@router.get("/valuelist-strategy/dedup-groups")
+def valuelist_strategy_dedup_groups(
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """Grouped view: which attributes share identical value sets."""
+    profiles = (
+        db.query(models.TargetAttributeProfile)
+        .filter(models.TargetAttributeProfile.dedup_group_key.isnot(None))
+        .order_by(models.TargetAttributeProfile.dedup_group_key.asc())
+        .all()
+    )
+
+    groups: Dict[str, Any] = {}
+    for p in profiles:
+        key = p.dedup_group_key
+        if key not in groups:
+            groups[key] = {
+                "dedupGroupKey": key,
+                "valuelistId": p.valuelist_id,
+                "canonicalValues": p.canonical_values_json or [],
+                "attributes": [],
+            }
+        groups[key]["attributes"].append({
+            "targetAttributeId": p.target_attribute_id,
+            "totalItems": p.total_items,
+            "fixedValueItems": p.fixed_value_items,
+            "multiValueItems": p.multi_value_items,
+        })
+
+    return {"groups": list(groups.values()), "totalGroups": len(groups)}
+
+
+@router.post("/valuelist-strategy/merge-preview")
+def valuelist_strategy_merge_preview(
+    body: dict = Body(default={}),
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """Preview superset merge with overlap threshold.
+
+    Returns proposed merges plus noise cost for each.
+    """
+    threshold = body.get("threshold", 0.8)
+    strategy = body.get("strategy", "conservative")
+
+    # Get all dedup groups
+    profiles = (
+        db.query(models.TargetAttributeProfile)
+        .filter(
+            models.TargetAttributeProfile.classification == "valuelist",
+            models.TargetAttributeProfile.valuelist_id.isnot(None),
+        )
+        .all()
+    )
+
+    # Group by valuelist_id to get unique lists
+    vl_map: Dict[str, Any] = {}
+    for p in profiles:
+        vl_id = p.valuelist_id
+        if vl_id not in vl_map:
+            vl_map[vl_id] = {
+                "valuelistId": vl_id,
+                "values": set(p.canonical_values_json or []),
+                "attributes": [],
+                "totalItems": 0,
+            }
+        vl_map[vl_id]["attributes"].append(p.target_attribute_id)
+        vl_map[vl_id]["totalItems"] += p.total_items
+
+    vl_list = list(vl_map.values())
+    proposals = []
+
+    for i, a in enumerate(vl_list):
+        for j, b in enumerate(vl_list):
+            if j <= i:
+                continue
+            set_a = a["values"]
+            set_b = b["values"]
+            if not set_a or not set_b:
+                continue
+
+            intersection = set_a & set_b
+            union = set_a | set_b
+            overlap = len(intersection) / len(union) if union else 0
+
+            is_subset = set_a <= set_b or set_b <= set_a
+            should_merge = False
+
+            if strategy == "conservative":
+                should_merge = is_subset
+            else:  # aggressive
+                should_merge = overlap >= threshold
+
+            if should_merge:
+                noise_for_a = len(union - set_a)
+                noise_for_b = len(union - set_b)
+                proposals.append({
+                    "listA": a["valuelistId"],
+                    "listB": b["valuelistId"],
+                    "attributesA": a["attributes"],
+                    "attributesB": b["attributes"],
+                    "mergedValues": sorted(union),
+                    "overlapPercent": round(overlap * 100, 1),
+                    "isSubset": is_subset,
+                    "noiseAddedToA": noise_for_a,
+                    "noiseAddedToB": noise_for_b,
+                    "affectedItemsA": a["totalItems"],
+                    "affectedItemsB": b["totalItems"],
+                })
+
+    return {
+        "proposals": proposals,
+        "totalProposals": len(proposals),
+        "strategy": strategy,
+        "threshold": threshold,
+    }
+
+
+@router.post("/valuelist-strategy/apply")
+def valuelist_strategy_apply(
+    body: dict = Body(default={}),
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """Commit: create ValueList rows, update profiles and merged workspace mappings.
+
+    Accepts optional merge overrides from the merge-preview step.
+    """
+    merge_overrides = body.get("mergeOverrides", [])  # [{ listA, listB, mergedValuelistId }]
+
+    # Build merge map: old valuelist_id -> new valuelist_id
+    merge_map: Dict[str, str] = {}
+    for override in merge_overrides:
+        merged_id = override.get("mergedValuelistId") or override.get("listA")
+        for key in ("listA", "listB"):
+            old_id = override.get(key)
+            if old_id and old_id != merged_id:
+                merge_map[old_id] = merged_id
+
+    profiles = (
+        db.query(models.TargetAttributeProfile)
+        .filter(models.TargetAttributeProfile.classification == "valuelist")
+        .all()
+    )
+
+    now = time.time()
+    created_vl_ids = set()
+    vl_rows_created = 0
+    profiles_updated = 0
+    mappings_updated = 0
+
+    for p in profiles:
+        raw_vl_id = p.valuelist_id
+        if not raw_vl_id:
+            continue
+
+        # Apply merge override
+        effective_vl_id = merge_map.get(raw_vl_id, raw_vl_id)
+        p.valuelist_id = effective_vl_id
+        p.updated_at = now
+        profiles_updated += 1
+
+        # Create ValueList rows if not yet created
+        if effective_vl_id not in created_vl_ids:
+            # Delete existing rows for this valuelist_id
+            db.query(models.ValueList).filter(models.ValueList.valuelist_id == effective_vl_id).delete()
+            canonical = p.canonical_values_json or []
+            # If merged, union with other canonical sets
+            if raw_vl_id in merge_map:
+                for other_p in profiles:
+                    if other_p.valuelist_id == effective_vl_id and other_p.canonical_values_json:
+                        canonical = sorted(set(canonical) | set(other_p.canonical_values_json))
+            for val in canonical:
+                db.add(models.ValueList(
+                    valuelist_id=effective_vl_id,
+                    value=val,
+                ))
+                vl_rows_created += 1
+            created_vl_ids.add(effective_vl_id)
+
+        # Update merged workspace mappings for this attribute
+        mapping_rows = (
+            db.query(models.MergedWorkspaceMapping)
+            .filter(models.MergedWorkspaceMapping.new_attribute_id == p.target_attribute_id)
+            .all()
+        )
+        for m in mapping_rows:
+            m.valuelist_id = effective_vl_id
+            # Mark single-value items as effective fixed
+            nv = (m.new_value or "").strip()
+            vs = (m.value_status or "").strip().lower()
+            if nv.upper() in _EXCLUDED_NEW_VALUES or vs in _EXCLUDED_VALUE_STATUSES:
+                m.is_effective_fixed = 0
+            elif p.fixed_value_items > 0 and p.multi_value_items > 0:
+                # Only mark as effective_fixed if the item has exactly 1 value
+                item_vals = [
+                    r.new_value
+                    for r in db.query(models.MergedWorkspaceMapping)
+                    .filter(
+                        models.MergedWorkspaceMapping.legacy_item_id == m.legacy_item_id,
+                        models.MergedWorkspaceMapping.new_attribute_id == p.target_attribute_id,
+                    )
+                    .all()
+                    if (r.new_value or "").strip().upper() not in _EXCLUDED_NEW_VALUES
+                    and (r.value_status or "").strip().lower() not in _EXCLUDED_VALUE_STATUSES
+                ]
+                m.is_effective_fixed = 1 if len(item_vals) == 1 else 0
+            else:
+                m.is_effective_fixed = 0
+            mappings_updated += 1
+
+    # Update job merged_valuelists count if merges happened
+    if merge_overrides:
+        latest_job = (
+            db.query(models.ValuelistStrategyJob)
+            .filter(models.ValuelistStrategyJob.status == "completed")
+            .order_by(models.ValuelistStrategyJob.id.desc())
+            .first()
+        )
+        if latest_job:
+            latest_job.merged_valuelists = len(created_vl_ids)
+
+    db.commit()
+
+    _audit(db, current_user, "valuelist_strategy_apply", f"Created {len(created_vl_ids)} valuelists with {vl_rows_created} value rows, updated {profiles_updated} profiles and {mappings_updated} mappings")
+
+    return {
+        "ok": True,
+        "valuelistsCreated": len(created_vl_ids),
+        "valuelistRowsCreated": vl_rows_created,
+        "profilesUpdated": profiles_updated,
+        "mappingsUpdated": mappings_updated,
+    }

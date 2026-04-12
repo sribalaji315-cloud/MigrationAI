@@ -1,5 +1,5 @@
 
-import { GlobalMapping, DatabaseState, User, ConnectionMode, NewAttribute, WorkspaceMappingRow, MappingGenerationProgress, ValueListGroup, ValueListRow, NewClassification, BomHierarchyItem, MLPrediction, MLSettings, FeatureCombinationJobProgress, FeatureCombinationRow, FeatureCombinationItem, ConsolidationAnalysis, SubsetMergeDetail, AttributeCombinationJobProgress, AttributeCombinationRow, AttributeCombinationItem, AttrComboConsolidationAnalysis, MigrationManifestRow, MigrationManifestFilters, MigrationManifestItemSummary, MigrationManifestAttributeGroup, MigrationManifestValueDetail, MergedWorkspaceMappingRow } from '../types';
+import { GlobalMapping, DatabaseState, User, ConnectionMode, NewAttribute, WorkspaceMappingRow, MappingGenerationProgress, ValueListGroup, ValueListRow, NewClassification, BomHierarchyItem, MLPrediction, MLSettings, FeatureCombinationJobProgress, FeatureCombinationRow, FeatureCombinationItem, ConsolidationAnalysis, SubsetMergeDetail, AttributeCombinationJobProgress, AttributeCombinationRow, AttributeCombinationItem, AttrComboConsolidationAnalysis, MigrationManifestRow, MigrationManifestFilters, MigrationManifestItemSummary, MigrationManifestAttributeGroup, MigrationManifestValueDetail, MergedWorkspaceMappingRow, ValuelistStrategyJob, TargetAttributeProfile, ValuelistDedupGroup, ValuelistMergeProposal, ValuelistApplyResult } from '../types';
 
 export interface SaveAllResult {
   mode: ConnectionMode;
@@ -1417,5 +1417,91 @@ export const dbService = {
       headers: this._authHeaders(),
       _ttlMs: 10000,
     });
+  },
+
+  // ---------------------------------------------------------------------------
+  // Valuelist Strategy
+  // ---------------------------------------------------------------------------
+
+  async triggerValuelistStrategyAnalysis(strategy: 'conservative' | 'aggressive' = 'conservative'): Promise<{ jobId: number; status: string }> {
+    if (!SQL_ENDPOINT) throw new Error('Database connection not available.');
+    const resp = await this._fetchWithRefresh(`${SQL_ENDPOINT}/valuelist-strategy/analyze`, {
+      method: 'POST',
+      headers: { ...this._authHeaders(), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ strategy }),
+    });
+    if (!resp.ok) {
+      const errText = await resp.text();
+      throw new Error(`Failed to trigger valuelist analysis: ${resp.status} ${errText}`);
+    }
+    this._invalidateCache();
+    return resp.json();
+  },
+
+  async fetchValuelistStrategyJobStatus(jobId: number): Promise<ValuelistStrategyJob> {
+    if (!SQL_ENDPOINT) throw new Error('Database connection not available.');
+    return this._cachedFetch(`${SQL_ENDPOINT}/valuelist-strategy/job/${jobId}`, {
+      headers: this._authHeaders(),
+      _ttlMs: 2000,
+    });
+  },
+
+  async fetchValuelistStrategyProfiles(options?: { classification?: string; search?: string; limit?: number; offset?: number }): Promise<{ items: TargetAttributeProfile[]; total: number }> {
+    if (!SQL_ENDPOINT) throw new Error('Database connection not available.');
+    const params = new URLSearchParams();
+    if (options?.classification) params.set('classification', options.classification);
+    if (options?.search) params.set('search', options.search);
+    if (options?.limit !== undefined) params.set('limit', String(options.limit));
+    if (options?.offset !== undefined) params.set('offset', String(options.offset));
+    const query = params.toString();
+    return this._cachedFetch(`${SQL_ENDPOINT}/valuelist-strategy/profiles${query ? `?${query}` : ''}`, {
+      headers: this._authHeaders(),
+      _ttlMs: 5000,
+    });
+  },
+
+  async fetchValuelistStrategyProfileDetail(attributeId: string): Promise<TargetAttributeProfile> {
+    if (!SQL_ENDPOINT) throw new Error('Database connection not available.');
+    return this._cachedFetch(`${SQL_ENDPOINT}/valuelist-strategy/profiles/${encodeURIComponent(attributeId)}`, {
+      headers: this._authHeaders(),
+      _ttlMs: 5000,
+    });
+  },
+
+  async fetchValuelistStrategyDedupGroups(): Promise<{ groups: ValuelistDedupGroup[]; totalGroups: number }> {
+    if (!SQL_ENDPOINT) throw new Error('Database connection not available.');
+    return this._cachedFetch(`${SQL_ENDPOINT}/valuelist-strategy/dedup-groups`, {
+      headers: this._authHeaders(),
+      _ttlMs: 10000,
+    });
+  },
+
+  async fetchValuelistStrategyMergePreview(strategy: 'conservative' | 'aggressive' = 'conservative', threshold?: number): Promise<{ proposals: ValuelistMergeProposal[]; totalProposals: number; strategy: string; threshold: number }> {
+    if (!SQL_ENDPOINT) throw new Error('Database connection not available.');
+    const resp = await this._fetchWithRefresh(`${SQL_ENDPOINT}/valuelist-strategy/merge-preview`, {
+      method: 'POST',
+      headers: { ...this._authHeaders(), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ strategy, threshold: threshold ?? 0.8 }),
+    });
+    if (!resp.ok) {
+      const errText = await resp.text();
+      throw new Error(`Failed to fetch merge preview: ${resp.status} ${errText}`);
+    }
+    return resp.json();
+  },
+
+  async applyValuelistStrategy(mergeOverrides?: Array<{ listA: string; listB: string; mergedValuelistId: string }>): Promise<ValuelistApplyResult> {
+    if (!SQL_ENDPOINT) throw new Error('Database connection not available.');
+    const resp = await this._fetchWithRefresh(`${SQL_ENDPOINT}/valuelist-strategy/apply`, {
+      method: 'POST',
+      headers: { ...this._authHeaders(), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ mergeOverrides: mergeOverrides || [] }),
+    });
+    if (!resp.ok) {
+      const errText = await resp.text();
+      throw new Error(`Failed to apply valuelist strategy: ${resp.status} ${errText}`);
+    }
+    this._invalidateCache();
+    return resp.json();
   },
 };
