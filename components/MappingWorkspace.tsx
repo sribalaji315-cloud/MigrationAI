@@ -3,7 +3,7 @@ import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { LegacyItem, NewClassification, GlobalMapping, LocalItemMappings, NewAttribute, ItemLock, User, FeatureFlags, MappingTypeConfig, MLPrediction } from '../types';
 import { dbService } from '../services/dbService';
 
-type Tone = 'mapped' | 'unmapped' | 'notRequired' | 'partial';
+type Tone = 'mapped' | 'unmapped' | 'notRequired' | 'partial' | 'multiple';
 
 const toneTheme: Record<Tone, {
   trigger: string;
@@ -69,6 +69,19 @@ const toneTheme: Record<Tone, {
     valueReadonly: 'bg-orange-500 text-white',
     valueInput: 'bg-orange-50 border-orange-300 text-orange-800 focus:ring-orange-300 focus:border-orange-300',
     valueButton: 'border-orange-200 text-orange-700',
+  },
+  multiple: {
+    trigger: 'bg-violet-50 border-violet-300 text-violet-800 focus:ring-violet-400 focus:border-violet-400',
+    dropdownBorder: 'border-violet-200',
+    optionActive: 'bg-violet-100 text-violet-800',
+    optionHover: 'hover:bg-violet-100',
+    card: 'bg-violet-50/60 border-violet-200',
+    accent: 'bg-violet-500',
+    attrReadonly: 'border-violet-200 bg-violet-50 text-violet-800',
+    valueWrapper: 'bg-violet-50 border border-violet-100',
+    valueReadonly: 'bg-violet-500 text-white',
+    valueInput: 'bg-violet-50 border-violet-300 text-violet-800 focus:ring-violet-300 focus:border-violet-300',
+    valueButton: 'border-violet-200 text-violet-700',
   },
 };
 
@@ -1176,6 +1189,7 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
     const featureValues = feature?.values || [];
 
     setStagedLocalMappings(prev => {
+      const existingLocal = prev.find(m => m.legacyFeatureIds.includes(featureId));
       const filtered = prev.filter(m => !m.legacyFeatureIds.includes(featureId));
       const globalRef = engineeringGlobalMappings.find(m => m.legacyFeatureIds.includes(featureId));
 
@@ -1183,22 +1197,57 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
         return filtered;
       }
 
+      // Current effective mapping = what the user was looking at before this change.
+      // This is the source of truth for NOT REQUIRED values that must be preserved.
+      const currentEffective = existingLocal || globalRef;
+      const currentValueMappings = currentEffective?.valueMappings || {};
+
+      // New attribute's global mapping = source for eligible value mappings
+      // when switching to a different target attribute.
+      const globalMappingsForFeature = globalByFeatureMap[featureId] || [];
+      const newAttrGlobal = globalMappingsForFeature.find(gm => {
+        const parts = (gm.newAttributeId || '').replace(/\s+/g, '').split(';').map(a => a.trim());
+        return parts.some(p => normalizeAttrId(p) === normalizeAttrId(attrId));
+      });
+      const newAttrValueMappings = newAttrGlobal?.valueMappings || {};
+
       let nextValueMappings: Record<string, string> = {};
 
       if (attrId === 'NOT REQUIRED') {
         featureValues.forEach(v => {
           nextValueMappings[v] = 'NOT REQUIRED';
         });
+      } else {
+        // 1. NOT REQUIRED values from current mapping are ALWAYS preserved
+        //    regardless of which target attribute is selected.
+        // 2. For other values, use the new attribute's global mapping if available,
+        //    otherwise leave empty (backend auto-populates on save).
+        featureValues.forEach(v => {
+          const currentVal = resolveValueMapping(currentValueMappings, v);
+          if (currentVal === 'NOT REQUIRED') {
+            nextValueMappings[v] = 'NOT REQUIRED';
+          } else {
+            const newVal = resolveValueMapping(newAttrValueMappings, v);
+            if (newVal !== undefined && newVal !== '') {
+              nextValueMappings[v] = newVal;
+            }
+          }
+        });
       }
-      // Value mappings are auto-populated by the backend from global
-      // mappings on save — no need to load them on the frontend.
+
+      // Preserve attribute type: prefer existing local, then any global for this feature, then globalRef
+      const preservedAttrType = existingLocal?.attributeType
+        || newAttrGlobal?.attributeType
+        || globalRef?.attributeType
+        || (globalMappingsForFeature[0]?.attributeType)
+        || '';
 
       return [
         ...filtered,
         {
           legacyFeatureIds: [featureId],
           newAttributeId: attrId,
-          attributeType: globalRef?.attributeType || '',
+          attributeType: preservedAttrType,
           valueMappings: nextValueMappings,
           mappedFrom: 'local' as const,
         },
@@ -1555,7 +1604,7 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
             }
 
             // Always show the dropdown when the item is locked (server handles search)
-            const hasMultipleOptions = true;
+            const hasMultipleOptions = globalCandidates.length > 1;
 
             // The currently selected attribute is the local override, OR the default global attribute
             let selectedAttribute = localOverride?.newAttributeId || defaultGlobalAttribute;
@@ -1614,10 +1663,15 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
             if (!candidateValuesForAttribute.includes('NOT REQUIRED')) {
               candidateValuesForAttribute = [...candidateValuesForAttribute, 'NOT REQUIRED'];
             }
+            // Multiple tone only when global-generated with multiple candidates
+            // and user hasn't confirmed via local override yet.
+            const isUserConfirmed = localOverride?.mappedFrom === 'local';
             const attributeTone: Tone = selectedAttribute === 'UNMAPPED'
               ? 'unmapped'
               : selectedAttribute === 'NOT REQUIRED'
               ? 'notRequired'
+              : hasMultipleOptions && !isUserConfirmed
+              ? 'multiple'
               : featureHasUnmappedValues
               ? 'partial'
               : 'mapped';
@@ -1656,7 +1710,7 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
                         </svg>
                       </button>
                       <div>
-                        <p className={`text-sm font-black leading-tight ${attributeTone === 'mapped' ? 'text-emerald-900' : attributeTone === 'partial' ? 'text-orange-900' : attributeTone === 'notRequired' ? 'text-amber-900' : 'text-rose-900'}`}>{f.featureId}</p>
+                        <p className={`text-sm font-black leading-tight ${attributeTone === 'mapped' ? 'text-emerald-900' : attributeTone === 'partial' ? 'text-orange-900' : attributeTone === 'notRequired' ? 'text-amber-900' : attributeTone === 'multiple' ? 'text-violet-900' : 'text-rose-900'}`}>{f.featureId}</p>
                         <p className="text-[9px] text-slate-400 font-bold uppercase tracking-wider mt-0.5">{f.description}</p>
                         {f.condition && (
                           <p className="text-[8px] text-indigo-500 font-bold mt-0.5" title="Condition">{f.condition}</p>
@@ -1682,16 +1736,16 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
                             Global
                           </span>
                         )}
-                        {hasMultipleOptions && !isLockedByMe && (
-                          <span className="px-2 py-0.5 bg-amber-100 text-amber-700 text-[7px] font-black rounded-full uppercase tracking-wider">
-                            Multiple Options
+                        {hasMultipleOptions && (
+                          <span className="px-2 py-0.5 bg-violet-100 text-violet-700 text-[7px] font-black rounded-full uppercase tracking-wider">
+                            Multiple
                           </span>
                         )}
                       </div>
 
                       {/* Target Attribute Selector/Display */}
                       <div className="w-full max-w-xs">
-                        {isLockedByMe && (hasMultipleOptions || usingClassScope) ? (
+                        {isLockedByMe ? (
                           <SearchableSelect
                             tone={attributeTone}
                             value={selectedAttribute}

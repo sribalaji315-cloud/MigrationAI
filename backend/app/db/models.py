@@ -136,6 +136,7 @@ class WorkspaceMapping(Base):
     created_by = Column(String, nullable=True)
     modified_by = Column(String, nullable=True)
     modified_at = Column(Float, nullable=True)
+    candidate_attribute_ids_json = Column(JSON, nullable=True)
 
 
 class ValueList(Base):
@@ -476,9 +477,12 @@ class MergedWorkspaceMapping(Base):
     # Valuelist strategy columns
     valuelist_id = Column(String, nullable=True, index=True)
     is_effective_fixed = Column(Integer, nullable=False, default=0)
+    candidate_attribute_ids_json = Column(JSON, nullable=True)
     # Batch job footprint columns
     attribute_footprint = Column(String, nullable=True, index=True)
     value_footprint = Column(String, nullable=True, index=True)
+    legacy_feature_footprint = Column(String, nullable=True, index=True)
+    legacy_value_footprint = Column(String, nullable=True, index=True)
 
 
 class ManifestItemStats(Base):
@@ -496,6 +500,14 @@ class ManifestItemStats(Base):
     combo_item_count = Column(Integer, nullable=False, default=1)
     shared_vl_count = Column(Integer, nullable=False, default=0)
     attribute_footprint = Column(String, nullable=True)
+    legacy_feature_footprint = Column(String, nullable=True)
+    legacy_value_footprint = Column(String, nullable=True)
+    legacy_combo_item_count = Column(Integer, nullable=False, default=1)
+    legacy_shared_vl_count = Column(Integer, nullable=False, default=0)
+    footprint_attr_list = Column(String, nullable=True)
+    footprint_legacy_feature_list = Column(String, nullable=True)
+    footprint_value_list = Column(String, nullable=True)
+    footprint_legacy_value_list = Column(String, nullable=True)
 
 
 class ValuelistStrategyJob(Base):

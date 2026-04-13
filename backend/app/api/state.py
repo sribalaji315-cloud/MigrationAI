@@ -230,6 +230,29 @@ def _build_latest_mapping_by_feature(mapping_rows: List[models.GlobalMapping]) -
     return mapping_by_feature
 
 
+def _build_all_candidates_by_feature(mapping_rows: List[models.GlobalMapping]) -> Dict[str, List[str]]:
+    """Return *all* distinct target attribute IDs per feature, ordered by rank (best first).
+
+    When a feature maps to multiple global mappings the caller should leave
+    ``new_attribute_id`` blank and store the full list in
+    ``candidate_attribute_ids_json``.
+    """
+    candidates_by_feature: Dict[str, List[str]] = {}
+    for mapping in sorted(mapping_rows, key=_global_mapping_model_rank, reverse=True):
+        target = (getattr(mapping, "new_attribute_id", "") or "").strip()
+        if not target:
+            continue
+        for feature_id in (getattr(mapping, "legacy_feature_ids", []) or []):
+            normalized = str(feature_id or "").strip()
+            if not normalized:
+                continue
+            if normalized not in candidates_by_feature:
+                candidates_by_feature[normalized] = []
+            if target not in candidates_by_feature[normalized]:
+                candidates_by_feature[normalized].append(target)
+    return candidates_by_feature
+
+
 def _deduplicate_global_mappings_in_db(db_session) -> int:
     """Consolidate duplicate global mappings sharing the same natural key.
 
@@ -392,6 +415,7 @@ def _run_mapping_generation_job(job_id: int):
         _dedup_removed = _deduplicate_global_mappings_in_db(db)
 
         mapping_by_feature = _build_latest_mapping_by_feature(scan_db.query(models.GlobalMapping).all())
+        candidates_by_feature = _build_all_candidates_by_feature(scan_db.query(models.GlobalMapping).all())
 
         # Build exclusion indexes from global mappings
         _gm_status_by_feature: Dict[str, str] = {}  # feature_id -> mapping status
@@ -464,7 +488,17 @@ def _run_mapping_generation_job(job_id: int):
                 continue
 
             mapping = mapping_by_feature.get(feat_feature_id)
-            target_attr = (getattr(mapping, "new_attribute_id", "") or "").strip() or "UNMAPPED"
+            candidates = candidates_by_feature.get(feat_feature_id, [])
+            if len(candidates) > 1:
+                # Multiple global targets — leave confirmed blank, store candidates
+                target_attr = ""
+                candidates_json = candidates
+            elif len(candidates) == 1:
+                target_attr = candidates[0]
+                candidates_json = candidates
+            else:
+                target_attr = ""
+                candidates_json = None
             attr_type = (getattr(mapping, "attribute_type", "") or "").strip() if mapping else ""
             feat_condition = (getattr(feat, "condition", "") or "").strip() or None
             feat_formula = (getattr(feat, "formula", "") or "").strip() or None
@@ -502,6 +536,7 @@ def _run_mapping_generation_job(job_id: int):
                         "signed_on_by_username": job.triggered_by_username,
                         "signed_on_at": signed_ts,
                         "updated_at": time.time(),
+                        "candidate_attribute_ids_json": candidates_json,
                     }
                 )
                 generated_rows += 1
@@ -537,6 +572,7 @@ def _run_mapping_generation_job(job_id: int):
                                 "signed_on_by_username": job.triggered_by_username,
                                 "signed_on_at": signed_ts,
                                 "updated_at": time.time(),
+                                "candidate_attribute_ids_json": candidates_json,
                             }
                         )
                     else:
@@ -557,6 +593,7 @@ def _run_mapping_generation_job(job_id: int):
                                 "signed_on_by_username": job.triggered_by_username,
                                 "signed_on_at": signed_ts,
                                 "updated_at": time.time(),
+                                "candidate_attribute_ids_json": candidates_json,
                             }
                         )
                     generated_rows += 1
@@ -1994,6 +2031,7 @@ def get_workspace_mappings_for_item(
             "signedOnAt": row.signed_on_at,
             "updatedAt": row.updated_at,
             "allGlobalTargets": targets,
+            "candidateAttributeIds": row.candidate_attribute_ids_json,
         })
     return result
 
@@ -2013,6 +2051,7 @@ def _regenerate_item_from_global(item_id: str, user_id: str, username: str, db: 
         return {"ok": True, "rowsDeleted": deleted, "rowsGenerated": 0}
 
     mapping_by_feature = _build_latest_mapping_by_feature(db.query(models.GlobalMapping).all())
+    candidates_by_feature = _build_all_candidates_by_feature(db.query(models.GlobalMapping).all())
 
     # Build exclusion indexes
     _gm_status_by_feature: Dict[str, str] = {}
@@ -2036,7 +2075,16 @@ def _regenerate_item_from_global(item_id: str, user_id: str, username: str, db: 
     for feat in features:
         feat_feature_id = str(getattr(feat, "feature_id", "") or "").strip()
         mapping = mapping_by_feature.get(feat_feature_id)
-        target_attr = (getattr(mapping, "new_attribute_id", "") or "").strip() or "UNMAPPED"
+        candidates = candidates_by_feature.get(feat_feature_id, [])
+        if len(candidates) > 1:
+            target_attr = ""
+            candidates_json = candidates
+        elif len(candidates) == 1:
+            target_attr = candidates[0]
+            candidates_json = candidates
+        else:
+            target_attr = ""
+            candidates_json = None
         attr_type = (getattr(mapping, "attribute_type", "") or "").strip() if mapping else ""
         feat_condition = (getattr(feat, "condition", "") or "").strip() or None
         feat_formula = (getattr(feat, "formula", "") or "").strip() or None
@@ -2075,6 +2123,7 @@ def _regenerate_item_from_global(item_id: str, user_id: str, username: str, db: 
                 created_by=user_id,
                 modified_by=user_id,
                 modified_at=time.time(),
+                candidate_attribute_ids_json=candidates_json,
             ))
             generated += 1
         else:
@@ -2109,6 +2158,7 @@ def _regenerate_item_from_global(item_id: str, user_id: str, username: str, db: 
                         created_by=user_id,
                         modified_by=user_id,
                         modified_at=time.time(),
+                        candidate_attribute_ids_json=candidates_json,
                     ))
                 else:
                     resolved = _resolve_value_mapping(value_mappings, legacy_value)
@@ -2131,6 +2181,7 @@ def _regenerate_item_from_global(item_id: str, user_id: str, username: str, db: 
                         created_by=user_id,
                         modified_by=user_id,
                         modified_at=time.time(),
+                        candidate_attribute_ids_json=candidates_json,
                     ))
                 generated += 1
 
@@ -2233,7 +2284,7 @@ def put_workspace_mappings_for_item(
             continue
 
         legacy_value = str(row.get("legacyValue") or row.get("legacy_value") or "")
-        new_attribute_id = str(row.get("newAttributeId") or row.get("new_attribute_id") or "UNMAPPED")
+        new_attribute_id = str(row.get("newAttributeId") or row.get("new_attribute_id") or "")
         new_value = str(row.get("newValue") or row.get("new_value") or "")
         attribute_type = str(row.get("attributeType") or row.get("attribute_type") or "")
         condition = str(row.get("condition") or "") or None
@@ -2252,7 +2303,8 @@ def put_workspace_mappings_for_item(
         if existing:
             existing.new_attribute_id = new_attribute_id
             existing.new_value = new_value
-            existing.attribute_type = attribute_type
+            # attribute_type is tied to the legacy feature and set during
+            # generation — never overwrite it on user edits.
             existing.condition = condition
             existing.formula = formula
             existing.mapped_from = mapped_from
@@ -2593,11 +2645,26 @@ def get_bom_count(
     search: Optional[str] = None,
     priority: Optional[int] = None,
     unmappedOnly: bool = False,
+    excludeOtherLocks: bool = False,
     db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
 ):
     """Return only the total count of BOM items matching the filter — no feature data."""
     search = _validate_search(search)
     query = db.query(func.count(models.BomItem.id))
+
+    # For non-admin users, exclude items locked by other users
+    if excludeOtherLocks:
+        current_user_id = f"USR-{current_user.id}"
+        other_locked_ids = [
+            row[0]
+            for row in db.query(models.ItemLock.item_id)
+            .filter(models.ItemLock.user_id != current_user_id)
+            .all()
+        ]
+        if other_locked_ids:
+            query = query.filter(~models.BomItem.item_id.in_(other_locked_ids))
+
     query = _apply_bom_category_filter(query, category)
     query = _apply_bom_product_type_filter(query, productType)
     query = _apply_bom_priority_filter(query, priority)
@@ -2714,63 +2781,65 @@ def get_bom_signed_on(
         }
 
     # ------------------------------------------------------------------
-    # Non-admin (or admin with specific userId) — signed-on items first
+    # Non-admin (or admin with specific userId) —
+    # Show items signed-on by this user + items not locked by anyone
+    # (i.e. hide items locked by OTHER users)
     # ------------------------------------------------------------------
     target_user_id = userId if (is_admin and userId) else current_user_id
 
-    # Get locked item_ids for target user
-    lock_query = db.query(models.ItemLock.item_id).filter(
-        models.ItemLock.user_id == target_user_id
+    # IDs locked by OTHER users (not the target user)
+    other_locked_ids = [
+        row[0]
+        for row in db.query(models.ItemLock.item_id)
+        .filter(models.ItemLock.user_id != target_user_id)
+        .all()
+    ]
+
+    # Signed-on count for the target user (before filters)
+    signed_on_count = (
+        db.query(func.count(models.ItemLock.item_id))
+        .filter(models.ItemLock.user_id == target_user_id)
+        .scalar()
+        or 0
     )
-    locked_item_ids = [row[0] for row in lock_query.all()]
-    signed_on_count = 0
-    total_count = 0
-    bom_items = []
 
-    if locked_item_ids:
-        # Build query for locked items
-        query = (
-            db.query(models.BomItem)
-            .options(selectinload(models.BomItem.features))
-            .filter(models.BomItem.item_id.in_(locked_item_ids))
+    # Base query: all items EXCEPT those locked by other users
+    query = db.query(models.BomItem).options(selectinload(models.BomItem.features))
+    if other_locked_ids:
+        query = query.filter(~models.BomItem.item_id.in_(other_locked_ids))
+
+    query = _apply_bom_category_filter(query, category)
+    query = _apply_bom_product_type_filter(query, productType)
+    query = _apply_bom_priority_filter(query, priority)
+    query = _apply_unmapped_only_filter(query, unmappedOnly, db)
+    if search:
+        like = f"%{search}%"
+        query = query.filter(
+            or_(
+                models.BomItem.item_id.ilike(like),
+                models.BomItem.description.ilike(like),
+            )
         )
-        query = _apply_bom_category_filter(query, category)
-        query = _apply_bom_product_type_filter(query, productType)
-        query = _apply_bom_priority_filter(query, priority)
-        if search:
-            like = f"%{search}%"
-            query = query.filter(
-                or_(
-                    models.BomItem.item_id.ilike(like),
-                    models.BomItem.description.ilike(like),
-                )
-            )
-        signed_on_count = query.count()
-        if signed_on_count > 0:
-            total_count = signed_on_count
-            query = query.order_by(models.BomItem.item_id).offset(offset).limit(limit)
-            bom_items = query.all()
 
-    # Fallback: if no signed-on items (after filter), load unlocked items
-    if signed_on_count == 0:
-        all_locked_ids = [row[0] for row in db.query(models.ItemLock.item_id).all()]
-        fallback_query = db.query(models.BomItem).options(selectinload(models.BomItem.features))
-        if all_locked_ids:
-            fallback_query = fallback_query.filter(~models.BomItem.item_id.in_(all_locked_ids))
-        fallback_query = _apply_bom_category_filter(fallback_query, category)
-        fallback_query = _apply_bom_product_type_filter(fallback_query, productType)
-        fallback_query = _apply_bom_priority_filter(fallback_query, priority)
-        if search:
-            like = f"%{search}%"
-            fallback_query = fallback_query.filter(
-                or_(
-                    models.BomItem.item_id.ilike(like),
-                    models.BomItem.description.ilike(like),
-                )
-            )
-        total_count = fallback_query.count()
-        fallback_query = fallback_query.order_by(models.BomItem.item_id).offset(offset).limit(limit)
-        bom_items = fallback_query.all()
+    total_count = query.count()
+
+    # Sort: signed-on items first, then alphabetical
+    my_locked_ids = [
+        row[0]
+        for row in db.query(models.ItemLock.item_id)
+        .filter(models.ItemLock.user_id == target_user_id)
+        .all()
+    ]
+    if my_locked_ids:
+        query = query.order_by(
+            # 0 for signed-on items (sort first), 1 for others
+            case((models.BomItem.item_id.in_(my_locked_ids), 0), else_=1),
+            models.BomItem.item_id,
+        )
+    else:
+        query = query.order_by(models.BomItem.item_id)
+
+    bom_items = query.offset(offset).limit(limit).all()
 
     return {
         "items": _build_bom_payload(bom_items),
@@ -3395,7 +3464,7 @@ async def handle_lock(
             user_lock_count = db.query(func.count(models.ItemLock.id)).filter(
                 models.ItemLock.user_id == current_user_id
             ).scalar() or 0
-            if user_lock_count >= 2:
+            if user_lock_count >= 20:
                 return {"acquired": False, "reason": "limit"}
             try:
                 new_lock = models.ItemLock(
@@ -3662,7 +3731,10 @@ def get_dashboard_metrics(
 
 
 @router.get("/item-statuses")
-def get_item_statuses(db: Session = Depends(get_db)):
+def get_item_statuses(
+        item_ids: Optional[str] = Query(None, alias="itemIds", description="Comma-separated item IDs to compute statuses for (omit for all)"),
+        db: Session = Depends(get_db),
+):
         # Use the workspace_mappings table which already holds resolved per-item
         # per-feature per-value rows.  A feature is "mapped" only when every
         # value row has a non-blank new_value.
@@ -3670,12 +3742,22 @@ def get_item_statuses(db: Session = Depends(get_db)):
         # Build included-type filter so we can skip ignored attribute types.
         included_type_set = _get_included_type_set(db)
 
-        # Initialise every BOM item so items without any workspace rows still
-        # appear in the output.
-        all_item_ids = [row[0] for row in db.query(models.BomItem.item_id).all()]
+        # Parse optional item_ids filter
+        target_item_ids: Optional[List[str]] = None
+        if item_ids:
+            target_item_ids = [iid.strip() for iid in item_ids.split(",") if iid.strip()]
+
+        # Initialise BOM items — scoped to requested items if provided
+        if target_item_ids:
+            item_id_rows = db.query(models.BomItem.item_id).filter(
+                models.BomItem.item_id.in_(target_item_ids)
+            ).all()
+        else:
+            item_id_rows = db.query(models.BomItem.item_id).all()
+        all_item_ids_list = [row[0] for row in item_id_rows]
         item_stats: Dict[str, Dict[str, int]] = {
                 item_id: {"mapped": 0, "not_required": 0, "total": 0}
-                for item_id in all_item_ids
+                for item_id in all_item_ids_list
         }
 
         # Use a SQL aggregate query on workspace_mappings to compute per-feature
@@ -3695,17 +3777,18 @@ def get_item_statuses(db: Session = Depends(get_db)):
                 )
         ).label("empty_count")
 
-        feature_q = (
-                db.query(
-                        WM.legacy_item_id,
-                        WM.legacy_feature_id,
-                        func.max(WM.new_attribute_id).label("new_attribute_id"),
-                        func.max(WM.attribute_type).label("attribute_type"),
-                        has_empty_val,
-                )
-                .group_by(WM.legacy_item_id, WM.legacy_feature_id)
-                .all()
+        base_q = db.query(
+                WM.legacy_item_id,
+                WM.legacy_feature_id,
+                func.max(WM.new_attribute_id).label("new_attribute_id"),
+                func.max(WM.attribute_type).label("attribute_type"),
+                has_empty_val,
         )
+        # When item_ids are specified, filter the heavy query to just those items
+        if target_item_ids:
+            base_q = base_q.filter(WM.legacy_item_id.in_(target_item_ids))
+
+        feature_q = base_q.group_by(WM.legacy_item_id, WM.legacy_feature_id).all()
 
         for row in feature_q:
                 item_id = row.legacy_item_id
@@ -5767,6 +5850,7 @@ def list_migration_manifest_item_summaries(
     source: Optional[str] = Query(None),
     has_noise: Optional[bool] = Query(None, alias="hasNoise"),
     has_mapping: Optional[bool] = Query(None, alias="hasMapping"),
+    item_ids: Optional[str] = Query(None, alias="itemIds"),
     sort_by: str = Query("itemPriority", alias="sortBy"),
     sort_dir: str = Query("desc", alias="sortDir"),
     limit: int = Query(20, ge=1, le=100),
@@ -5801,6 +5885,17 @@ def list_migration_manifest_item_summaries(
             WHERE LOWER(TRIM(attribute_type)) = LOWER(TRIM(:attr_type_filter))
         )""")
         params["attr_type_filter"] = attribute_type
+    if item_ids:
+        import re as _re
+        ids = [x.strip() for x in item_ids.split(",") if x.strip()]
+        ids = [x for x in ids if _re.fullmatch(r"[A-Za-z0-9_.\-]+", x)]
+        if ids:
+            placeholders = ", ".join(f":_iid{i}" for i in range(len(ids)))
+            wheres.append(f"b.item_id IN ({placeholders})")
+            for i, v in enumerate(ids):
+                params[f"_iid{i}"] = v
+        else:
+            wheres.append("1=0")
 
     where_sql = (" AND " + " AND ".join(wheres)) if wheres else ""
 
@@ -5811,7 +5906,13 @@ def list_migration_manifest_item_summaries(
             COALESCE(s.attr_count, 0),
             COALESCE(s.mapped_count, 0),
             COALESCE(s.combo_item_count, 1),
-            COALESCE(s.shared_vl_count, 0)
+            COALESCE(s.shared_vl_count, 0),
+            COALESCE(s.legacy_combo_item_count, 1),
+            COALESCE(s.legacy_shared_vl_count, 0),
+            COALESCE(s.footprint_attr_list, ''),
+            COALESCE(s.footprint_legacy_feature_list, ''),
+            COALESCE(s.footprint_value_list, ''),
+            COALESCE(s.footprint_legacy_value_list, '')
         FROM bom_items b
         LEFT JOIN manifest_item_stats s ON s.item_id = b.item_id
         WHERE 1=1 {where_sql}
@@ -5825,6 +5926,8 @@ def list_migration_manifest_item_summaries(
         "comboItemCount": "COALESCE(s.combo_item_count, 1)",
         "mappedCount": "COALESCE(s.mapped_count, 0)",
         "sharedValuelistCount": "COALESCE(s.shared_vl_count, 0)",
+        "legacyComboItemCount": "COALESCE(s.legacy_combo_item_count, 1)",
+        "legacySharedVlCount": "COALESCE(s.legacy_shared_vl_count, 0)",
     }
     sort_col = sort_map.get(sort_by, "b.priority")
     direction = "ASC" if sort_dir == "asc" else "DESC"
@@ -5839,7 +5942,11 @@ def list_migration_manifest_item_summaries(
 
     result_items = []
     for r in rows:
-        iid, desc, cat, pt, pri, ac, mc, combo, svl = r
+        iid, desc, cat, pt, pri, ac, mc, combo, svl, lcombo, lsvl, fp_al, fp_lfl, fp_vl, fp_lvl = r
+        fp_attr_count = len(fp_al.split('|')) if fp_al else 0
+        fp_legacy_feat_count = len(fp_lfl.split('|')) if fp_lfl else 0
+        fp_value_count = len(fp_vl.split('|')) if fp_vl else 0
+        fp_legacy_value_count = len(fp_lvl.split('|')) if fp_lvl else 0
         result_items.append({
             "itemId": iid,
             "itemDescription": desc or "",
@@ -5852,6 +5959,12 @@ def list_migration_manifest_item_summaries(
             "mappedCount": mc,
             "noiseCount": 0,
             "sharedValuelistCount": svl,
+            "legacyComboItemCount": lcombo,
+            "legacySharedVlCount": lsvl,
+            "fpAttrMapped": fp_attr_count,
+            "fpAttrTotal": fp_legacy_feat_count,
+            "fpValueMapped": fp_value_count,
+            "fpValueTotal": fp_legacy_value_count,
         })
 
     return {"items": result_items, "total": total}
@@ -6229,6 +6342,7 @@ def get_merged_workspace_mappings(
                 "feasibility": r.feasibility,
                 "attributeFootprint": r.attribute_footprint,
                 "valueFootprint": r.value_footprint,
+                "candidateAttributeIds": r.candidate_attribute_ids_json,
             }
             for r in rows
         ],
@@ -6268,16 +6382,29 @@ def get_merged_workspace_mappings_detail(
             "attributeType": r.attribute_type or "",
             "condition": r.condition,
             "feasibility": r.feasibility,
+            "candidateAttributeIds": r.candidate_attribute_ids_json,
         }
         for r in rows
     ]
 
     # 2. Combo items — items sharing the same attribute_footprint
     attr_fp = None
+    legacy_fp = None
     if rows:
         attr_fp = rows[0].attribute_footprint
+        legacy_fp = rows[0].legacy_feature_footprint
     combo_items: list[dict] = []
+    total_combo_items = 0
     if attr_fp:
+        total_combo_items = db.execute(
+            sa_text("""
+                SELECT COUNT(DISTINCT m.legacy_item_id)
+                FROM merged_workspace_mappings m
+                WHERE m.attribute_footprint = :afp
+                  AND m.legacy_item_id != :iid
+            """),
+            {"afp": attr_fp, "iid": item_id},
+        ).scalar() or 0
         combo_rows = (
             db.execute(
                 sa_text("""
@@ -6287,7 +6414,6 @@ def get_merged_workspace_mappings_detail(
                     WHERE m.attribute_footprint = :afp
                       AND m.legacy_item_id != :iid
                     ORDER BY m.legacy_item_id
-                    LIMIT 50
                 """),
                 {"afp": attr_fp, "iid": item_id},
             ).fetchall()
@@ -6322,7 +6448,6 @@ def get_merged_workspace_mappings_detail(
                   AND TRIM(m.new_attribute_id) = :attr
                   AND m.legacy_item_id != :iid
                 ORDER BY m.legacy_item_id
-                LIMIT 20
             """),
             {"vfp": vfp, "attr": attr_id, "iid": item_id},
         ).fetchall()
@@ -6347,13 +6472,106 @@ def get_merged_workspace_mappings_detail(
                 "totalShared": len(shared_rows),
             })
 
+    # 4. Legacy combo items — items sharing the same legacy_feature_footprint
+    legacy_combo_items: list[dict] = []
+    total_legacy_combo_items = 0
+    if legacy_fp:
+        total_legacy_combo_items = db.execute(
+            sa_text("""
+                SELECT COUNT(DISTINCT m.legacy_item_id)
+                FROM merged_workspace_mappings m
+                WHERE m.legacy_feature_footprint = :lfp
+                  AND m.legacy_item_id != :iid
+            """),
+            {"lfp": legacy_fp, "iid": item_id},
+        ).scalar() or 0
+        legacy_combo_rows = db.execute(
+            sa_text("""
+                SELECT DISTINCT m.legacy_item_id, b.description
+                FROM merged_workspace_mappings m
+                LEFT JOIN bom_items b ON b.item_id = m.legacy_item_id
+                WHERE m.legacy_feature_footprint = :lfp
+                  AND m.legacy_item_id != :iid
+                ORDER BY m.legacy_item_id
+            """),
+            {"lfp": legacy_fp, "iid": item_id},
+        ).fetchall()
+        legacy_combo_items = [{"itemId": r[0], "description": r[1] or ""} for r in legacy_combo_rows]
+
+    # 5. Legacy shared VL — per-feature: find items sharing same legacy_value_footprint
+    item_legacy_fps = (
+        db.execute(
+            sa_text("""
+                SELECT DISTINCT TRIM(legacy_feature_id) as feat_id, legacy_value_footprint
+                FROM merged_workspace_mappings
+                WHERE legacy_item_id = :iid
+                  AND legacy_value_footprint IS NOT NULL
+                  AND TRIM(legacy_feature_id) != ''
+            """),
+            {"iid": item_id},
+        ).fetchall()
+    )
+    legacy_shared_vl: list[dict] = []
+    for feat_id, lvfp in item_legacy_fps:
+        if not lvfp:
+            continue
+        shared_rows = db.execute(
+            sa_text("""
+                SELECT DISTINCT m.legacy_item_id
+                FROM merged_workspace_mappings m
+                WHERE m.legacy_value_footprint = :lvfp
+                  AND TRIM(m.legacy_feature_id) = :feat
+                  AND m.legacy_item_id != :iid
+                ORDER BY m.legacy_item_id
+            """),
+            {"lvfp": lvfp, "feat": feat_id, "iid": item_id},
+        ).fetchall()
+        if shared_rows:
+            val_rows = db.execute(
+                sa_text("""
+                    SELECT DISTINCT TRIM(legacy_value) as val
+                    FROM merged_workspace_mappings
+                    WHERE legacy_item_id = :iid
+                      AND TRIM(legacy_feature_id) = :feat
+                      AND TRIM(legacy_value) != ''
+                    ORDER BY val
+                """),
+                {"iid": item_id, "feat": feat_id},
+            ).fetchall()
+            legacy_shared_vl.append({
+                "feature": feat_id,
+                "values": [r[0] for r in val_rows],
+                "sharedItems": [r[0] for r in shared_rows],
+                "totalShared": len(shared_rows),
+            })
+
+    # Read stored footprint component lists from manifest_item_stats
+    fp_lists_row = db.execute(
+        sa_text("""SELECT footprint_attr_list, footprint_legacy_feature_list,
+                       footprint_value_list, footprint_legacy_value_list
+                FROM manifest_item_stats WHERE item_id = :iid"""),
+        {"iid": item_id},
+    ).first()
+    fp_attr_list = fp_lists_row.footprint_attr_list.split("|") if fp_lists_row and fp_lists_row.footprint_attr_list else []
+    fp_legacy_feature_list = fp_lists_row.footprint_legacy_feature_list.split("|") if fp_lists_row and fp_lists_row.footprint_legacy_feature_list else []
+    fp_value_list = fp_lists_row.footprint_value_list.split("|") if fp_lists_row and fp_lists_row.footprint_value_list else []
+    fp_legacy_value_list = fp_lists_row.footprint_legacy_value_list.split("|") if fp_lists_row and fp_lists_row.footprint_legacy_value_list else []
+
     return {
         "mappings": mappings,
         "totalMappings": len(mappings),
         "comboItems": combo_items,
-        "totalComboItems": len(combo_items),
+        "totalComboItems": total_combo_items,
         "sharedVL": shared_vl,
         "attributeFootprint": attr_fp,
+        "legacyComboItems": legacy_combo_items,
+        "totalLegacyComboItems": total_legacy_combo_items,
+        "legacySharedVL": legacy_shared_vl,
+        "legacyFeatureFootprint": legacy_fp,
+        "footprintAttrs": fp_attr_list,
+        "footprintLegacyFeatures": fp_legacy_feature_list,
+        "footprintValues": fp_value_list,
+        "footprintLegacyValues": fp_legacy_value_list,
     }
 
 
@@ -6376,7 +6594,9 @@ def get_merged_workspace_mappings_summary(
                 SUM(CASE WHEN shared_vl_count > 0 THEN 1 ELSE 0 END) as items_with_shared_vl,
                 SUM(shared_vl_count) as total_shared_vl_attrs,
                 SUM(CASE WHEN combo_item_count > 1 THEN 1 ELSE 0 END) as items_with_combo,
-                MAX(combo_item_count) as max_combo
+                MAX(combo_item_count) as max_combo,
+                SUM(CASE WHEN legacy_feature_footprint IS NULL OR legacy_feature_footprint = '' THEN 1 ELSE 0 END) as empty_lfp,
+                COUNT(DISTINCT CASE WHEN legacy_feature_footprint IS NOT NULL AND legacy_feature_footprint != '' THEN legacy_feature_footprint END) as unique_lfp
             FROM manifest_item_stats
         """)).fetchone()
         empty_afp = metrics_row[0] or 0
@@ -6385,16 +6605,26 @@ def get_merged_workspace_mappings_summary(
         total_shared_vl_attrs = metrics_row[3] or 0
         items_with_combo = metrics_row[4] or 0
         max_combo = metrics_row[5] or 0
+        empty_lfp = metrics_row[6] or 0
+        unique_lfp = metrics_row[7] or 0
 
         # Unique value footprints from merged_workspace_mappings
         vfp_row = db.execute(sa_text("""
             SELECT
                 COUNT(DISTINCT CASE WHEN value_footprint IS NOT NULL THEN value_footprint END) as unique_vfp,
-                COUNT(DISTINCT CASE WHEN value_footprint IS NULL AND TRIM(new_attribute_id) != '' THEN legacy_item_id || '|' || TRIM(new_attribute_id) END) as empty_vfp_attrs
+                COUNT(DISTINCT CASE WHEN value_footprint IS NULL AND TRIM(new_attribute_id) != '' THEN legacy_item_id || '|' || TRIM(new_attribute_id) END) as empty_vfp_attrs,
+                COUNT(DISTINCT CASE WHEN legacy_value_footprint IS NOT NULL THEN legacy_value_footprint END) as unique_lvfp,
+                COUNT(DISTINCT CASE WHEN legacy_value_footprint IS NULL AND TRIM(legacy_feature_id) != '' THEN legacy_item_id || '|' || TRIM(legacy_feature_id) END) as empty_lvfp_attrs,
+                COUNT(DISTINCT CASE WHEN legacy_value_footprint IS NOT NULL AND TRIM(legacy_feature_id) != '' THEN legacy_item_id || '|' || TRIM(legacy_feature_id) END) as covered_lvfp_attrs,
+                COUNT(DISTINCT CASE WHEN legacy_value_footprint IS NOT NULL THEN legacy_item_id END) as items_with_any_lvfp
             FROM merged_workspace_mappings
         """)).fetchone()
         unique_vfp = vfp_row[0] or 0
         empty_vfp_attrs = vfp_row[1] or 0
+        unique_lvfp = vfp_row[2] or 0
+        empty_lvfp_attrs = vfp_row[3] or 0
+        covered_lvfp_attrs = vfp_row[4] or 0
+        items_with_any_lvfp = vfp_row[5] or 0
     else:
         empty_afp = 0
         unique_afp = 0
@@ -6404,6 +6634,12 @@ def get_merged_workspace_mappings_summary(
         max_combo = 0
         unique_vfp = 0
         empty_vfp_attrs = 0
+        empty_lfp = 0
+        unique_lfp = 0
+        unique_lvfp = 0
+        empty_lvfp_attrs = 0
+        covered_lvfp_attrs = 0
+        items_with_any_lvfp = 0
 
     # Per-item footprint detail with dimensions for frontend filtering
     footprint_items = []
@@ -6414,13 +6650,15 @@ def get_merged_workspace_mappings_summary(
                 COALESCE(b.product_type, 'Unknown') as product_type,
                 COALESCE(CAST(b.priority AS TEXT), 'Unknown') as priority,
                 m.attribute_footprint,
-                COUNT(*) as item_count
+                COUNT(*) as item_count,
+                COALESCE(b.classification, 'NA') as classification
             FROM manifest_item_stats m
             JOIN bom_items b ON b.item_id = m.item_id
             GROUP BY COALESCE(b.category, 'Unknown'),
                      COALESCE(b.product_type, 'Unknown'),
                      COALESCE(CAST(b.priority AS TEXT), 'Unknown'),
-                     m.attribute_footprint
+                     m.attribute_footprint,
+                     COALESCE(b.classification, 'NA')
         """)).fetchall()
         for r in fp_rows:
             footprint_items.append({
@@ -6430,6 +6668,7 @@ def get_merged_workspace_mappings_summary(
                 "hasAttrFp": bool(r[3] and r[3].strip()),
                 "attrFp": str(r[3] or ""),
                 "count": int(r[4]),
+                "classification": str(r[5]),
             })
 
     # Distinct filter options
@@ -6438,6 +6677,23 @@ def get_merged_workspace_mappings_summary(
         filter_options["categories"] = sorted(set(r["category"] for r in footprint_items))
         filter_options["productTypes"] = sorted(set(r["productType"] for r in footprint_items))
         filter_options["priorities"] = sorted(set(r["priority"] for r in footprint_items))
+        filter_options["classifications"] = sorted(set(r["classification"] for r in footprint_items))
+
+    # Attribute label per footprint hash (sorted attr IDs joined with " · ")
+    fp_attr_labels: dict = {}
+    if stats_count > 0:
+        label_rows = db.execute(sa_text("""
+            SELECT attribute_footprint, GROUP_CONCAT(new_attribute_id, ' · ')
+            FROM (
+                SELECT DISTINCT attribute_footprint, TRIM(new_attribute_id) AS new_attribute_id
+                FROM merged_workspace_mappings
+                WHERE attribute_footprint IS NOT NULL
+                  AND TRIM(new_attribute_id) != ''
+                ORDER BY attribute_footprint, TRIM(new_attribute_id)
+            )
+            GROUP BY attribute_footprint
+        """)).fetchall()
+        fp_attr_labels = {r[0]: r[1] for r in label_rows}
 
     return {
         "totalRows": int(total_rows),
@@ -6451,9 +6707,16 @@ def get_merged_workspace_mappings_summary(
             "emptyValueFootprintAttrs": int(empty_vfp_attrs),
             "itemsWithSharedVL": int(items_with_shared_vl),
             "totalSharedVLAttrs": int(total_shared_vl_attrs),
+            "uniqueLegacyFeatureFootprints": int(unique_lfp),
+            "emptyLegacyFeatureFootprints": int(empty_lfp),
+            "uniqueLegacyValueFootprints": int(unique_lvfp),
+            "emptyLegacyValueFootprintAttrs": int(empty_lvfp_attrs),
+            "coveredLegacyValueFootprintAttrs": int(covered_lvfp_attrs),
+            "itemsWithAnyLegacyValue": int(items_with_any_lvfp),
         },
         "footprintItems": footprint_items,
         "filterOptions": filter_options,
+        "fpAttrLabels": fp_attr_labels,
     }
 
 
@@ -6508,7 +6771,8 @@ def _run_merge_batch_job(job_id: int):
                 feasibility,
                 signed_on_by_user_id, signed_on_by_username, signed_on_at,
                 updated_at, version, created_by, modified_by, modified_at,
-                attribute_footprint, value_footprint
+                attribute_footprint, value_footprint,
+                candidate_attribute_ids_json
             )
             SELECT
                 ws.legacy_item_id, ws.legacy_feature_id, COALESCE(ws.legacy_value, ''),
@@ -6522,7 +6786,8 @@ def _run_merge_batch_job(job_id: int):
                 END,
                 ws.signed_on_by_user_id, ws.signed_on_by_username, ws.signed_on_at,
                 {now_ts}, 1, ws.created_by, NULL, NULL,
-                NULL, NULL
+                NULL, NULL,
+                ws.candidate_attribute_ids_json
             FROM workspace_mappings ws
             WHERE 1=1
         """
@@ -6551,6 +6816,11 @@ def _run_merge_batch_job(job_id: int):
         all_item_ids = [r[0] for r in item_ids_q]
 
         processed = 0
+        # Accumulate footprint component lists across all batches for Step 5
+        all_attr_list_map: Dict[str, str] = {}
+        all_legacy_feat_list_map: Dict[str, str] = {}
+        all_value_list_map: Dict[str, str] = {}
+        all_legacy_value_list_map: Dict[str, str] = {}
         while offset < len(all_item_ids):
             batch_ids = all_item_ids[offset:offset + FOOTPRINT_BATCH]
             placeholders = ",".join(f"'{iid}'" for iid in batch_ids)
@@ -6572,9 +6842,11 @@ def _run_merge_batch_job(job_id: int):
             ).fetchall()
 
             attr_fp_map: Dict[str, str] = {}
+            attr_list_map: Dict[str, str] = {}
             for iid, concat_attrs in attr_rows:
                 sorted_attrs = "|".join(sorted(concat_attrs.split("|"))) if concat_attrs else ""
                 attr_fp_map[iid] = hashlib.md5(sorted_attrs.encode()).hexdigest()
+                attr_list_map[iid] = sorted_attrs
 
             # Value footprint: per (item, attribute) — hash of sorted mapped values
             # for that specific attribute within the item.
@@ -6597,20 +6869,76 @@ def _run_merge_batch_job(job_id: int):
                     GROUP BY legacy_item_id, attr_id""")
             ).fetchall()
 
-            # Build map: (item_id, attr_id) -> hash
+            # Build map: (item_id, attr_id) -> hash, also collect flat value list per item
             val_fp_map: Dict[tuple, str] = {}
+            item_value_set: Dict[str, set] = {}
             for iid, attr_id, concat_vals in val_rows:
                 vals = sorted(set(concat_vals.split("|"))) if concat_vals else []
                 val_key = "|".join(vals)
                 val_fp_map[(iid, attr_id)] = hashlib.md5(val_key.encode()).hexdigest()
+                item_value_set.setdefault(iid, set()).update(vals)
+            value_list_map: Dict[str, str] = {iid: "|".join(sorted(vs)) for iid, vs in item_value_set.items()}
+
+            # Legacy feature footprint: sorted distinct legacy_feature_id per item
+            # Only considers included attribute types from config
+            legacy_feat_rows = db.execute(
+                sa_text(f"""SELECT legacy_item_id,
+                           GROUP_CONCAT(feat_id, '|')
+                    FROM (
+                        SELECT DISTINCT legacy_item_id, TRIM(legacy_feature_id) as feat_id
+                        FROM merged_workspace_mappings
+                        WHERE legacy_item_id IN ({placeholders})
+                          AND TRIM(legacy_feature_id) != ''
+                          {attr_type_filter_sql}
+                        ORDER BY legacy_item_id, feat_id
+                    )
+                    GROUP BY legacy_item_id""")
+            ).fetchall()
+
+            legacy_feat_fp_map: Dict[str, str] = {}
+            legacy_feat_list_map: Dict[str, str] = {}
+            for iid, concat_feats in legacy_feat_rows:
+                sorted_feats = "|".join(sorted(concat_feats.split("|"))) if concat_feats else ""
+                legacy_feat_fp_map[iid] = hashlib.md5(sorted_feats.encode()).hexdigest()
+                legacy_feat_list_map[iid] = sorted_feats
+
+            # Legacy value footprint: per (item, legacy_feature) — hash of sorted legacy values
+            # Only considers included attribute types from config, feasibility = 'Yes'
+            legacy_val_rows = db.execute(
+                sa_text(f"""SELECT legacy_item_id, feat_id,
+                           GROUP_CONCAT(val, '|')
+                    FROM (
+                        SELECT DISTINCT legacy_item_id,
+                               TRIM(legacy_feature_id) as feat_id,
+                               TRIM(legacy_value) as val
+                        FROM merged_workspace_mappings
+                        WHERE legacy_item_id IN ({placeholders})
+                          AND feasibility = 'Yes'
+                          AND TRIM(legacy_value) != ''
+                          AND TRIM(legacy_feature_id) != ''
+                          {attr_type_filter_sql}
+                        ORDER BY legacy_item_id, feat_id, val
+                    )
+                    GROUP BY legacy_item_id, feat_id""")
+            ).fetchall()
+
+            legacy_val_fp_map: Dict[tuple, str] = {}
+            item_legacy_value_set: Dict[str, set] = {}
+            for iid, feat_id, concat_vals in legacy_val_rows:
+                vals = sorted(set(concat_vals.split("|"))) if concat_vals else []
+                val_key = "|".join(vals)
+                legacy_val_fp_map[(iid, feat_id)] = hashlib.md5(val_key.encode()).hexdigest()
+                item_legacy_value_set.setdefault(iid, set()).update(vals)
+            legacy_value_list_map: Dict[str, str] = {iid: "|".join(sorted(vs)) for iid, vs in item_legacy_value_set.items()}
 
             # Batch update footprints
             for iid in batch_ids:
                 afp = attr_fp_map.get(iid, "")
-                # Set attribute_footprint on all rows, clear value_footprint first
+                lfp = legacy_feat_fp_map.get(iid, "")
+                # Set attribute_footprint + legacy_feature_footprint on all rows, clear per-row footprints first
                 db.execute(
-                    sa_text("UPDATE merged_workspace_mappings SET attribute_footprint = :afp, value_footprint = NULL WHERE legacy_item_id = :iid"),
-                    {"afp": afp, "iid": iid},
+                    sa_text("UPDATE merged_workspace_mappings SET attribute_footprint = :afp, value_footprint = NULL, legacy_feature_footprint = :lfp, legacy_value_footprint = NULL WHERE legacy_item_id = :iid"),
+                    {"afp": afp, "lfp": lfp, "iid": iid},
                 )
                 # Set value_footprint per (item, attribute) group
                 for (fp_iid, fp_attr), vfp in val_fp_map.items():
@@ -6619,6 +6947,19 @@ def _run_merge_batch_job(job_id: int):
                             sa_text("UPDATE merged_workspace_mappings SET value_footprint = :vfp WHERE legacy_item_id = :iid AND TRIM(new_attribute_id) = :attr"),
                             {"vfp": vfp, "iid": iid, "attr": fp_attr},
                         )
+                # Set legacy_value_footprint per (item, legacy_feature) group
+                for (fp_iid, fp_feat), lvfp in legacy_val_fp_map.items():
+                    if fp_iid == iid:
+                        db.execute(
+                            sa_text("UPDATE merged_workspace_mappings SET legacy_value_footprint = :lvfp WHERE legacy_item_id = :iid AND TRIM(legacy_feature_id) = :feat"),
+                            {"lvfp": lvfp, "iid": iid, "feat": fp_feat},
+                        )
+
+            # Merge batch maps into accumulators
+            all_attr_list_map.update(attr_list_map)
+            all_legacy_feat_list_map.update(legacy_feat_list_map)
+            all_value_list_map.update(value_list_map)
+            all_legacy_value_list_map.update(legacy_value_list_map)
 
             processed += len(batch_ids)
             job.processed_items = processed
@@ -6632,20 +6973,47 @@ def _run_merge_batch_job(job_id: int):
         db.execute(sa_text("DELETE FROM manifest_item_stats"))
         db.commit()
 
-        # Per-item: attr_count, mapped_count, attribute_footprint
+        # Per-item: attr_count, mapped_count, attribute_footprint, legacy_feature_footprint
         db.execute(sa_text("""
-            INSERT INTO manifest_item_stats (item_id, attr_count, mapped_count, attribute_footprint, combo_item_count, shared_vl_count)
+            INSERT INTO manifest_item_stats (item_id, attr_count, mapped_count, attribute_footprint, legacy_feature_footprint, legacy_value_footprint, combo_item_count, shared_vl_count, legacy_combo_item_count, legacy_shared_vl_count)
             SELECT
                 legacy_item_id,
                 COUNT(DISTINCT CASE WHEN TRIM(new_attribute_id) != '' THEN TRIM(new_attribute_id) END),
                 COUNT(DISTINCT CASE WHEN feasibility = 'Yes' AND TRIM(new_value) != '' AND TRIM(new_attribute_id) != '' THEN TRIM(new_attribute_id) END),
                 MAX(attribute_footprint),
+                MAX(legacy_feature_footprint),
+                MAX(legacy_value_footprint),
+                1,
+                0,
                 1,
                 0
             FROM merged_workspace_mappings
             GROUP BY legacy_item_id
         """))
         db.commit()
+
+        # Populate footprint component lists from accumulated maps
+        FP_LIST_BATCH = 2000
+        fp_items = list(set(list(all_attr_list_map.keys()) + list(all_legacy_feat_list_map.keys()) + list(all_value_list_map.keys()) + list(all_legacy_value_list_map.keys())))
+        for i in range(0, len(fp_items), FP_LIST_BATCH):
+            batch = fp_items[i:i + FP_LIST_BATCH]
+            for iid in batch:
+                db.execute(
+                    sa_text("""UPDATE manifest_item_stats
+                        SET footprint_attr_list = :al,
+                            footprint_legacy_feature_list = :fl,
+                            footprint_value_list = :vl,
+                            footprint_legacy_value_list = :lvl
+                        WHERE item_id = :iid"""),
+                    {
+                        "al": all_attr_list_map.get(iid, ""),
+                        "fl": all_legacy_feat_list_map.get(iid, ""),
+                        "vl": all_value_list_map.get(iid, ""),
+                        "lvl": all_legacy_value_list_map.get(iid, ""),
+                        "iid": iid,
+                    },
+                )
+            db.commit()
 
         # Update combo_item_count from attribute_footprint grouping
         db.execute(sa_text("""
@@ -6682,6 +7050,43 @@ def _run_merge_batch_job(job_id: int):
             ), 0)
         """))
         db.commit()
+
+        # Update legacy_combo_item_count from legacy_feature_footprint grouping
+        db.execute(sa_text("""
+            UPDATE manifest_item_stats
+            SET legacy_combo_item_count = (
+                SELECT COUNT(DISTINCT m.legacy_item_id)
+                FROM merged_workspace_mappings m
+                WHERE m.legacy_feature_footprint = manifest_item_stats.legacy_feature_footprint
+                  AND manifest_item_stats.legacy_feature_footprint IS NOT NULL
+                  AND manifest_item_stats.legacy_feature_footprint != ''
+            )
+            WHERE legacy_feature_footprint IS NOT NULL AND legacy_feature_footprint != ''
+        """))
+        db.commit()
+
+        # Update legacy_shared_vl_count: count of legacy features with shared legacy_value_footprint
+        db.execute(sa_text("""
+            UPDATE manifest_item_stats
+            SET legacy_shared_vl_count = COALESCE((
+                SELECT COUNT(DISTINCT sub.feat)
+                FROM (
+                    SELECT DISTINCT legacy_item_id, TRIM(legacy_feature_id) as feat, legacy_value_footprint
+                    FROM merged_workspace_mappings
+                    WHERE legacy_value_footprint IS NOT NULL AND TRIM(legacy_feature_id) != ''
+                ) sub
+                INNER JOIN (
+                    SELECT TRIM(legacy_feature_id) as feat, legacy_value_footprint
+                    FROM merged_workspace_mappings
+                    WHERE legacy_value_footprint IS NOT NULL AND TRIM(legacy_feature_id) != ''
+                    GROUP BY TRIM(legacy_feature_id), legacy_value_footprint
+                    HAVING COUNT(DISTINCT legacy_item_id) >= 2
+                ) shared ON shared.feat = sub.feat AND shared.legacy_value_footprint = sub.legacy_value_footprint
+                WHERE sub.legacy_item_id = manifest_item_stats.item_id
+            ), 0)
+        """))
+        db.commit()
+
         logger.info("Merge job %s: manifest item stats computed.", job_id)
 
         job.status = "completed"

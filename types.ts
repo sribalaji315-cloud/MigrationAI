@@ -151,6 +151,7 @@ export interface WorkspaceMappingRow {
   signedOnAt?: number | null;
   updatedAt?: number | null;
   allGlobalTargets?: string[];
+  candidateAttributeIds?: string[] | null;
 }
 
 export interface MappingGenerationProgress {
@@ -465,6 +466,7 @@ export interface MergedWorkspaceMappingRow {
   isEffectiveFixed?: boolean;
   attributeFootprint?: string | null;
   valueFootprint?: string | null;
+  candidateAttributeIds?: string[] | null;
 }
 
 export interface MergedWorkspaceMappingDetail {
@@ -474,6 +476,10 @@ export interface MergedWorkspaceMappingDetail {
   totalComboItems: number;
   sharedVL: { attribute: string; values: string[]; sharedItems: string[]; totalShared: number }[];
   attributeFootprint?: string | null;
+  legacyComboItems: { itemId: string; description: string }[];
+  totalLegacyComboItems: number;
+  legacySharedVL: { feature: string; values: string[]; sharedItems: string[]; totalShared: number }[];
+  legacyFeatureFootprint?: string | null;
 }
 
 export interface MergeJob {

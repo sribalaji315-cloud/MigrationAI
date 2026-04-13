@@ -144,7 +144,7 @@ const ItemSidebar: React.FC<ItemSidebarProps> = ({ items, selectedId, onSelect, 
   const [filterCategory, setFilterCategory] = useState('');
   const [filterProductType, setFilterProductType] = useState('');
   const [filterPriority, setFilterPriority] = useState<number | ''>('');
-  const [filterUserId, setFilterUserId] = useState('');
+  const [filterUserId, setFilterUserId] = useState(() => isAdmin ? '' : (currentUserId || ''));
   const [availableCategories, setAvailableCategories] = useState<string[]>(categories || []);
   const [availableProductTypes, setAvailableProductTypes] = useState<string[]>(productTypes || []);
   const [availablePriorities, setAvailablePriorities] = useState<number[]>(priorities || []);
@@ -202,7 +202,7 @@ const ItemSidebar: React.FC<ItemSidebarProps> = ({ items, selectedId, onSelect, 
   }, [statusRequestKey, currentPage, isAdmin]);
 
   useEffect(() => {
-    if (!isAdmin) return;
+    if (!onFilterChange) return;
     let cancelled = false;
 
     const refreshAvailableFilters = async () => {
@@ -236,7 +236,7 @@ const ItemSidebar: React.FC<ItemSidebarProps> = ({ items, selectedId, onSelect, 
     return () => {
       cancelled = true;
     };
-  }, [isAdmin, filterCategory, filterProductType, filterPriority]);
+  }, [onFilterChange, filterCategory, filterProductType, filterPriority]);
 
   const measureList = useCallback((node: HTMLDivElement | null) => {
     listContainerRef.current = node;
@@ -330,7 +330,7 @@ const ItemSidebar: React.FC<ItemSidebarProps> = ({ items, selectedId, onSelect, 
             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
           </svg>
         </div>
-        {isAdmin && onFilterChange && (
+        {onFilterChange && (
           <div className="mt-2 flex flex-col gap-1.5">
             <select
               value={filterCategory}
@@ -356,6 +356,7 @@ const ItemSidebar: React.FC<ItemSidebarProps> = ({ items, selectedId, onSelect, 
               <option value="">All Priorities</option>
               {availablePriorities.map(p => <option key={p} value={p}>{p}</option>)}
             </select>
+            {isAdmin ? (
             <select
               value={filterUserId}
               onChange={(e) => { setFilterUserId(e.target.value); }}
@@ -364,6 +365,11 @@ const ItemSidebar: React.FC<ItemSidebarProps> = ({ items, selectedId, onSelect, 
               <option value="">All Users</option>
               {(allUsers || []).map(u => <option key={u.userId} value={u.userId}>{u.userName}</option>)}
             </select>
+            ) : (
+            <div className="w-full text-[10px] px-2 py-1 bg-slate-100 border border-slate-200 rounded-md text-slate-600 font-bold">
+              {(allUsers || []).find(u => u.userId === currentUserId)?.userName || currentUserId}
+            </div>
+            )}
             <button
               type="button"
               onClick={() => onFilterChange(latestFilterStateRef.current)}

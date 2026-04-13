@@ -104,7 +104,8 @@ const App: React.FC = () => {
   }, [setItemStatuses]);
 
   const loadSidebarItems = useCallback(async (filters: SidebarBomFilters = {}, page = 0, search = '') => {
-    if (!currentUser || currentUser.role !== 'admin') return;
+    if (!currentUser) return;
+    const isAdmin = currentUser.role === 'admin';
     const gen = ++sidebarLoadGenRef.current;
     setIsDataLoading(true);
     setSidebarAdminFilters(filters);
@@ -128,6 +129,7 @@ const App: React.FC = () => {
           search || undefined,
           filters.priority,
           filters.unmappedOnly,
+          !isAdmin,  // excludeOtherLocks for non-admin users
         ),
       ]);
       if (gen !== sidebarLoadGenRef.current) return;
@@ -147,25 +149,9 @@ const App: React.FC = () => {
   }, [BOM_PAGE_SIZE, currentUser, refreshItemStatuses, setBomPage]);
 
   const handleSidebarSearch = useCallback(async (query: string, filters: SidebarBomFilters = sidebarAdminFilters) => {
-    const gen = ++sidebarSearchGenRef.current;
     const mergedFilters = { ...filters, unmappedOnly: showUnmappedOnlyInSidebar || undefined };
-    try {
-      if (currentUser?.role === 'admin') {
-        await loadSidebarItems(mergedFilters, 0, query.trim());
-        return;
-      }
-      const [items, count] = await Promise.all([
-        dbService.fetchBomItems(mergedFilters.category, mergedFilters.productType, { limit: BOM_PAGE_SIZE, search: query, priority: mergedFilters.priority, unmappedOnly: mergedFilters.unmappedOnly }),
-        dbService.fetchBomCount(mergedFilters.category, mergedFilters.productType, query, mergedFilters.priority, mergedFilters.unmappedOnly),
-      ]);
-      if (gen !== sidebarSearchGenRef.current) return;
-      setSidebarSearchResults(items);
-      setSidebarSearchTotal(count);
-    } catch (err) {
-      if (gen !== sidebarSearchGenRef.current) return;
-      console.warn('Sidebar search failed', err);
-    }
-  }, [BOM_PAGE_SIZE, currentUser, loadSidebarItems, sidebarAdminFilters, showUnmappedOnlyInSidebar]);
+    await loadSidebarItems(mergedFilters, 0, query.trim());
+  }, [loadSidebarItems, sidebarAdminFilters, showUnmappedOnlyInSidebar]);
 
   const handleAdminFilterChange = useCallback(async (filters: SidebarBomFilters) => {
     await loadSidebarItems({ ...filters, unmappedOnly: showUnmappedOnlyInSidebar || undefined }, 0, sidebarSearchQuery);
@@ -600,10 +586,25 @@ const App: React.FC = () => {
   };
 
   // Wire useLocking hook
-  const { handleSignOn, handleSignOff } = useLocking(dbState, currentUser, setIsRefreshing, handleFetchFromDB);
+  const updateLocksAndStatuses = useCallback(async (itemId: string) => {
+    try {
+      // Lightweight: fetch only init (locks) and status for the affected item
+      const [init, partialStatuses] = await Promise.all([
+        dbService.fetchInit(),
+        dbService.fetchItemStatuses([itemId]),
+      ]);
+      setDbState(prev => prev ? { ...prev, locks: init.locks || {}, itemClassifications: init.itemClassifications || prev.itemClassifications } : prev);
+      setItemStatuses(prev => ({ ...prev, ...partialStatuses }));
+    } catch (err) {
+      console.warn('Lightweight lock refresh failed, falling back to full fetch', err);
+      await handleFetchFromDB();
+    }
+  }, [handleFetchFromDB, setItemStatuses]);
 
-  // For admin, sidebar items live in sidebarBomItems; for non-admin, in sidebarItems (from hook).
-  const effectiveSidebarItems = currentUser?.role === 'admin' ? sidebarBomItems : sidebarItems;
+  const { handleSignOn, handleSignOff } = useLocking(dbState, currentUser, setIsRefreshing, handleFetchFromDB, updateLocksAndStatuses);
+
+  // All users use server-paginated sidebar items
+  const effectiveSidebarItems = sidebarBomItems;
 
   // --- Session transition guards: preserve sidebar state across sign-on / sign-off ---
   const sessionTransitionRef = useRef(false);
@@ -616,30 +617,24 @@ const App: React.FC = () => {
   } | null>(null);
 
   const handleSignOnWithSidebar = useCallback(async (itemId: string) => {
-    const selectedItemData = effectiveSidebarItems.find(i => i.itemId === itemId);
-    if (currentUser?.role === 'admin') {
-      preSessionSidebarRef.current = {
-        items: [...sidebarBomItems],
-        totalCount: sidebarTotalCount,
-        filters: { ...sidebarAdminFilters },
-        searchQuery: sidebarSearchQuery,
-        page: bomPage,
-      };
-    }
+    preSessionSidebarRef.current = {
+      items: [...sidebarBomItems],
+      totalCount: sidebarTotalCount,
+      filters: { ...sidebarAdminFilters },
+      searchQuery: sidebarSearchQuery,
+      page: bomPage,
+    };
     sessionTransitionRef.current = true;
     await handleSignOn(itemId);
-    if (selectedItemData && currentUser?.role === 'admin') {
-      setSidebarBomItems([selectedItemData]);
-      setSidebarTotalCount(1);
-    }
+    // Keep the sidebar list intact so the selected card stays in position
     sessionTransitionRef.current = false;
-  }, [handleSignOn, effectiveSidebarItems, currentUser, sidebarBomItems, sidebarTotalCount, sidebarAdminFilters, sidebarSearchQuery, bomPage]);
+  }, [handleSignOn, currentUser, sidebarBomItems, sidebarTotalCount, sidebarAdminFilters, sidebarSearchQuery, bomPage]);
 
   const handleSignOffWithSidebar = useCallback(async (itemId: string) => {
     sessionTransitionRef.current = true;
     await handleSignOff(itemId);
     const saved = preSessionSidebarRef.current;
-    if (saved && currentUser?.role === 'admin') {
+    if (saved) {
       await loadSidebarItems(
         { ...saved.filters, unmappedOnly: showUnmappedOnlyInSidebar || undefined },
         saved.page,
@@ -743,7 +738,7 @@ const App: React.FC = () => {
         )}
 
         <ItemSidebar 
-          items={currentUser.role === 'admin' ? sidebarBomItems : sidebarItems} 
+          items={sidebarBomItems} 
           selectedId={selectedItemId} 
           onSelect={setSelectedItemId} 
           locks={dbState.locks}
@@ -753,13 +748,11 @@ const App: React.FC = () => {
           onToggleUnmappedOnly={() => {
             const next = !showUnmappedOnlyInSidebar;
             setShowUnmappedOnlyInSidebar(next);
-            if (currentUser?.role === 'admin') {
-              loadSidebarItems({ ...sidebarAdminFilters, unmappedOnly: next || undefined }, 0, sidebarSearchQuery);
-            }
+            loadSidebarItems({ ...sidebarAdminFilters, unmappedOnly: next || undefined }, 0, sidebarSearchQuery);
           }}
-          totalServerCount={currentUser.role === 'admin' ? sidebarTotalCount : undefined}
-          currentPage={currentUser.role === 'admin' ? bomPage : undefined}
-          onPageChange={currentUser.role === 'admin' ? handleAdminSidebarPageChange : undefined}
+          totalServerCount={sidebarTotalCount}
+          currentPage={bomPage}
+          onPageChange={handleAdminSidebarPageChange}
           onSearch={handleSidebarSearch}
           searchResults={sidebarSearchResults}
           searchTotalCount={sidebarSearchTotal}
@@ -769,7 +762,7 @@ const App: React.FC = () => {
           productTypes={bomFilters.productTypes}
           priorities={bomFilters.priorities}
           allUsers={dbState.users?.map(u => ({ userId: u.userId, userName: u.userName })) || []}
-          onFilterChange={currentUser.role === 'admin' ? handleAdminFilterChange : undefined}
+          onFilterChange={handleAdminFilterChange}
         />
         
         <Suspense fallback={<LazyFallback />}>

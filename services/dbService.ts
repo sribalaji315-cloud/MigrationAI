@@ -393,7 +393,7 @@ export const dbService = {
     return this._cachedFetch(`${SQL_ENDPOINT}/bom/items${query ? `?${query}` : ''}`, { headers: this._authHeaders(), _ttlMs: 15000 });
   },
 
-  async fetchBomCount(category?: string, productType?: string, search?: string, priority?: number, unmappedOnly?: boolean): Promise<number> {
+  async fetchBomCount(category?: string, productType?: string, search?: string, priority?: number, unmappedOnly?: boolean, excludeOtherLocks?: boolean): Promise<number> {
     if (!SQL_ENDPOINT) {
       throw new Error('Database connection not available.');
     }
@@ -403,6 +403,7 @@ export const dbService = {
     if (search) params.set('search', search);
     if (priority != null) params.set('priority', String(priority));
     if (unmappedOnly) params.set('unmappedOnly', 'true');
+    if (excludeOtherLocks) params.set('excludeOtherLocks', 'true');
     const query = params.toString();
     const data = await this._cachedFetch(`${SQL_ENDPOINT}/bom/count${query ? `?${query}` : ''}`, { headers: this._authHeaders() });
     return data?.total ?? 0;
@@ -636,11 +637,15 @@ export const dbService = {
     });
   },
 
-  async fetchItemStatuses(): Promise<Record<string, 'mapped' | 'unmapped' | 'notRequired'>> {
+  async fetchItemStatuses(itemIds?: string[]): Promise<Record<string, 'mapped' | 'unmapped' | 'notRequired'>> {
     if (!SQL_ENDPOINT) {
       throw new Error('Database connection not available.');
     }
-    const data = await this._cachedFetch(`${SQL_ENDPOINT}/item-statuses`, {
+    let url = `${SQL_ENDPOINT}/item-statuses`;
+    if (itemIds && itemIds.length > 0) {
+      url += `?itemIds=${encodeURIComponent(itemIds.join(','))}`;
+    }
+    const data = await this._cachedFetch(url, {
       headers: this._authHeaders(),
       _ttlMs: 0,
     });
@@ -1351,7 +1356,7 @@ export const dbService = {
     });
   },
 
-  async fetchMigrationManifestItemSummaries(options?: { search?: string; category?: string; productType?: string; priority?: number; attributeType?: string; source?: string; hasNoise?: boolean; hasMapping?: boolean; sortBy?: string; sortDir?: string; limit?: number; offset?: number }): Promise<{ items: MigrationManifestItemSummary[]; total: number }> {
+  async fetchMigrationManifestItemSummaries(options?: { search?: string; category?: string; productType?: string; priority?: number; attributeType?: string; source?: string; hasNoise?: boolean; hasMapping?: boolean; itemIds?: string; sortBy?: string; sortDir?: string; limit?: number; offset?: number }): Promise<{ items: MigrationManifestItemSummary[]; total: number }> {
     if (!SQL_ENDPOINT) throw new Error('Database connection not available.');
     const params = new URLSearchParams();
     if (options?.search) params.set('search', options.search);
@@ -1362,6 +1367,7 @@ export const dbService = {
     if (options?.source) params.set('source', options.source);
     if (options?.hasNoise !== undefined) params.set('hasNoise', String(options.hasNoise));
     if (options?.hasMapping !== undefined) params.set('hasMapping', String(options.hasMapping));
+    if (options?.itemIds) params.set('itemIds', options.itemIds);
     if (options?.sortBy) params.set('sortBy', options.sortBy);
     if (options?.sortDir) params.set('sortDir', options.sortDir ?? 'desc');
     if (options?.limit !== undefined) params.set('limit', String(options.limit));
