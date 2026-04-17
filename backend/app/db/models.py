@@ -190,6 +190,52 @@ class ItemLock(Base):
     acquired_at = Column(Float, nullable=False)
 
 
+class GroupFeature(Base):
+    """Stores group feature / sub-feature rows uploaded from CSV.
+
+    One row per (feature_group, feature_id, option) combination.
+    Columns mirror the group-features CSV upload format with added
+    mapping and status fields.
+    """
+
+    __tablename__ = "group_features"
+
+    id = Column(Integer, primary_key=True, index=True)
+    feature_group = Column(String, index=True, nullable=False)
+    feature_id = Column(String, index=True, nullable=False)
+    feature_desc = Column(String, nullable=True)
+    option = Column(String, nullable=False, default="")
+    option_desc = Column(String, nullable=True)
+    condition = Column(String, nullable=True)
+    till_date = Column(String, nullable=True)
+    target_attribute = Column(String, nullable=True)
+    target_value = Column(String, nullable=True)
+    value_status = Column(String, index=True, nullable=False, default="in_progress")  # discontinued|in_progress|approved
+    valuelist_id = Column(String, index=True, nullable=True)
+    suggested_attributes = Column(JSON, nullable=True)  # [{attributeId, description, score}, ...]
+    suggested_values = Column(JSON, nullable=True)       # [value1, value2, value3]
+    created_by = Column(String, nullable=True)
+    created_at = Column(Float, nullable=True)
+
+
+class GroupFeatureMappingJob(Base):
+    """Tracks background job that pulls GlobalMapping into group_features."""
+
+    __tablename__ = "group_feature_mapping_jobs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    status = Column(String, index=True, nullable=False)  # queued|running|completed|failed
+    triggered_by_user_id = Column(String, nullable=True)
+    triggered_by_username = Column(String, nullable=True)
+    total_features = Column(Integer, nullable=False, default=0)
+    processed_features = Column(Integer, nullable=False, default=0)
+    generated_rows = Column(Integer, nullable=False, default=0)
+    started_at = Column(Float, nullable=True)
+    finished_at = Column(Float, nullable=True)
+    updated_at = Column(Float, nullable=False, default=0)
+    error_message = Column(String, nullable=True)
+
+
 class TokenBlacklist(Base):
     """Revoked JWT tokens (jti claim). Checked on every authenticated request."""
 
@@ -303,6 +349,8 @@ class FeatureCombination(Base):
     mapping_status = Column(String, index=True, nullable=False, default="unmapped")  # complete|partial|unmapped
     priorities_json = Column(JSON, nullable=True)
     item_ids_json = Column(JSON, nullable=True)  # list of item_id strings in this combo
+    footprint = Column(String, nullable=True, index=True)  # legacy_value_footprint MD5 hash
+    value_list_id = Column(String, nullable=True, index=True)  # e.g. ACTRM_valuelist1
     built_at = Column(Float, nullable=True)
 
 

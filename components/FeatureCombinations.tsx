@@ -108,6 +108,7 @@ const FeatureCombinations: React.FC<FeatureCombinationsProps> = ({ currentUser, 
   // Summary list state
   const [rows, setRows] = useState<FeatureCombinationRow[]>([]);
   const [total, setTotal] = useState(0);
+  const [vlStats, setVlStats] = useState<{ sharedRows: number; uniqueRows: number; distinctShared: number; distinctUnique: number; totalDistinct: number } | null>(null);
   const [page, setPage] = useState(0);
   const [search, setSearch] = useState('');
   const [searchInput, setSearchInput] = useState('');
@@ -119,6 +120,9 @@ const FeatureCombinations: React.FC<FeatureCombinationsProps> = ({ currentUser, 
   const [filterPriorities, setFilterPriorities] = useState<string[]>([]);
   const [filterStatuses, setFilterStatuses] = useState<string[]>([]);
   const [filterOptions, setFilterOptions] = useState<{ featureIds: string[]; attributeTypes: string[]; priorities: number[]; statuses: string[] }>({ featureIds: [], attributeTypes: [], priorities: [], statuses: [] });
+  const [sharedFilterActive, setSharedFilterActive] = useState(false);
+  const [footprintFilterActive, setFootprintFilterActive] = useState(false);
+  const [footprintFilter, setFootprintFilter] = useState<string | undefined>(undefined);
 
   // Sort state
   const [sortBy, setSortBy] = useState<string | undefined>(undefined);
@@ -130,7 +134,7 @@ const FeatureCombinations: React.FC<FeatureCombinationsProps> = ({ currentUser, 
   const [isLoadingItems, setIsLoadingItems] = useState(false);
 
   // Right panel tab + consolidation state
-  const [rightTab, setRightTab] = useState<'items' | 'consolidate'>('items');
+  const [rightTab, setRightTab] = useState<'items' | 'values' | 'consolidate'>('items');
   const [consolidation, setConsolidation] = useState<ConsolidationAnalysis | null>(null);
   const [isLoadingConsolidation, setIsLoadingConsolidation] = useState(false);
 
@@ -233,7 +237,7 @@ const FeatureCombinations: React.FC<FeatureCombinationsProps> = ({ currentUser, 
   }, []);
 
   // --- Fetch summary list ---
-  const fetchList = useCallback(async (pageNum: number, searchTerm: string, featIds: string[], attrTypes: string[], prios: string[], statuses: string[], sBy?: string, sDir?: string, analysis?: boolean) => {
+  const fetchList = useCallback(async (pageNum: number, searchTerm: string, featIds: string[], attrTypes: string[], prios: string[], statuses: string[], sBy?: string, sDir?: string, analysis?: boolean, fp?: string) => {
     setIsLoading(true);
     try {
       const result = await dbService.fetchFeatureCombinations({
@@ -242,6 +246,7 @@ const FeatureCombinations: React.FC<FeatureCombinationsProps> = ({ currentUser, 
         attributeType: attrTypes.length ? attrTypes.join(',') : undefined,
         priority: prios.length === 1 ? Number(prios[0]) : undefined,
         status: statuses.length ? statuses.join(',') : undefined,
+        footprint: fp || undefined,
         sortBy: sBy || undefined,
         sortDir: sDir || undefined,
         analysisMode: analysis || undefined,
@@ -250,6 +255,7 @@ const FeatureCombinations: React.FC<FeatureCombinationsProps> = ({ currentUser, 
       });
       setRows(result.items);
       setTotal(result.total);
+      if (result.valueListStats) setVlStats(result.valueListStats);
     } catch (err: any) {
       console.error('fetch list failed', err);
     } finally {
@@ -257,13 +263,16 @@ const FeatureCombinations: React.FC<FeatureCombinationsProps> = ({ currentUser, 
     }
   }, []);
 
-  useEffect(() => { fetchList(page, search, filterFeatureIds, filterAttributeTypes, filterPriorities, filterStatuses, sortBy, sortDir, analysisMode); }, [page, search, filterFeatureIds, filterAttributeTypes, filterPriorities, filterStatuses, sortBy, sortDir, analysisMode, fetchList]);
+  useEffect(() => { fetchList(page, search, filterFeatureIds, filterAttributeTypes, filterPriorities, filterStatuses, sortBy, sortDir, analysisMode, footprintFilter); }, [page, search, filterFeatureIds, filterAttributeTypes, filterPriorities, filterStatuses, sortBy, sortDir, analysisMode, footprintFilter, fetchList]);
 
   const handleSearch = () => {
     setSearch(searchInput);
     setPage(0);
     setSelectedCombo(null);
     setComboItems([]);
+    setSharedFilterActive(false);
+    setFootprintFilterActive(false);
+    setFootprintFilter(undefined);
   };
 
   const handleMultiFilterChange = (setter: (v: string[]) => void) => (vals: string[]) => {
@@ -271,6 +280,9 @@ const FeatureCombinations: React.FC<FeatureCombinationsProps> = ({ currentUser, 
     setPage(0);
     setSelectedCombo(null);
     setComboItems([]);
+    setSharedFilterActive(false);
+    setFootprintFilterActive(false);
+    setFootprintFilter(undefined);
   };
 
   // --- Select a combo row ---
@@ -286,6 +298,7 @@ const FeatureCombinations: React.FC<FeatureCombinationsProps> = ({ currentUser, 
     setComputingStrategy(null);
     setVariantData(null);
     setCrossFeatureData(null);
+    setSharedFilterActive(false);
     if (consolidationPollRef.current) clearTimeout(consolidationPollRef.current);
     if (analysisMode) {
       // In analysis mode, auto-open consolidate tab but do NOT fetch analysis yet
@@ -519,6 +532,33 @@ const FeatureCombinations: React.FC<FeatureCombinationsProps> = ({ currentUser, 
         </div>
       )}
 
+      {/* Value List Stats */}
+      {vlStats && vlStats.totalDistinct > 0 && (
+        <div className="px-5 py-1.5 bg-slate-50 border-b border-slate-100 flex items-center gap-4 shrink-0">
+          <span className="text-[9px] font-bold text-slate-400 uppercase tracking-wider">Value Lists</span>
+          <div className="flex items-center gap-3">
+            <span className="inline-flex items-center gap-1">
+              <span className="inline-block w-1.5 h-1.5 rounded-full bg-orange-400" />
+              <span className="text-[10px] font-bold text-orange-600">{vlStats.distinctShared.toLocaleString()}</span>
+              <span className="text-[9px] text-slate-400">shared</span>
+              <span className="text-[9px] text-slate-300">({vlStats.sharedRows.toLocaleString()} rows)</span>
+            </span>
+            <span className="inline-flex items-center gap-1">
+              <span className="inline-block w-1.5 h-1.5 rounded-full bg-purple-400" />
+              <span className="text-[10px] font-bold text-purple-600">{vlStats.distinctUnique.toLocaleString()}</span>
+              <span className="text-[9px] text-slate-400">unique</span>
+              <span className="text-[9px] text-slate-300">({vlStats.uniqueRows.toLocaleString()} rows)</span>
+            </span>
+            <span className="text-[9px] text-slate-300">|</span>
+            <span className="inline-flex items-center gap-1">
+              <span className="text-[10px] font-bold text-slate-600">{vlStats.totalDistinct.toLocaleString()}</span>
+              <span className="text-[9px] text-slate-400">total distinct value lists</span>
+            </span>
+          </div>
+          <span className="text-[9px] text-slate-300 ml-auto italic">Shared lists (VL_) are reused across features with identical value footprints</span>
+        </div>
+      )}
+
       {/* Search + Filters */}
       <div className="px-5 py-2 bg-white border-b border-slate-100 flex items-center gap-2 shrink-0 flex-wrap">
         <input
@@ -581,13 +621,15 @@ const FeatureCombinations: React.FC<FeatureCombinationsProps> = ({ currentUser, 
                   <th className="text-left px-3 py-2 text-[9px] font-black uppercase tracking-wider text-slate-500 border-b border-slate-200">Legacy Values</th>
                   <th className="text-left px-3 py-2 text-[9px] font-black uppercase tracking-wider text-slate-500 border-b border-slate-200">D365 Attribute &amp; Values</th>
                   <th className="text-center px-3 py-2 text-[9px] font-black uppercase tracking-wider text-slate-500 border-b border-slate-200">Status</th>
+                  <th className="text-left px-3 py-2 text-[9px] font-black uppercase tracking-wider text-slate-500 border-b border-slate-200">Value List</th>
+                  <th className="text-left px-3 py-2 text-[9px] font-black uppercase tracking-wider text-slate-500 border-b border-slate-200">Shared</th>
                   <th className="text-right px-3 py-2 text-[9px] font-black uppercase tracking-wider text-slate-500 border-b border-slate-200 cursor-pointer select-none hover:text-blue-600" onClick={() => handleSort('itemCount')}>Items{sortArrow('itemCount')}</th>
                 </tr>
               </thead>
               <tbody>
                 {isLoading ? (
                   <tr>
-                    <td colSpan={8} className="text-center py-8">
+                    <td colSpan={10} className="text-center py-8">
                       <div className="flex items-center justify-center gap-2 text-slate-400">
                         <div className="w-4 h-4 border-2 border-blue-500 border-t-transparent rounded-full animate-spin" />
                         Loading…
@@ -596,7 +638,7 @@ const FeatureCombinations: React.FC<FeatureCombinationsProps> = ({ currentUser, 
                   </tr>
                 ) : rows.length === 0 ? (
                   <tr>
-                    <td colSpan={8} className="text-center py-8 text-slate-400">
+                    <td colSpan={10} className="text-center py-8 text-slate-400">
                       {total === 0 ? 'No combinations built yet. Click "Build Combinations" to start.' : 'No matches found.'}
                     </td>
                   </tr>
@@ -680,6 +722,29 @@ const FeatureCombinations: React.FC<FeatureCombinationsProps> = ({ currentUser, 
                           : r.mappingStatus === 'partial' ? `${r.mappedValueCount}/${r.legacyValueCount}` : 'unmapped'}
                       </span>
                     </td>
+                    <td className="px-3 py-2">
+                      {r.valueListId ? (
+                        <span className="inline-block px-1.5 py-0.5 bg-purple-50 text-purple-700 rounded text-[10px] font-medium" title={r.footprint || ''}>
+                          {r.valueListId}
+                        </span>
+                      ) : (
+                        <span className="text-[10px] text-slate-300">—</span>
+                      )}
+                    </td>
+                    <td className="px-3 py-2">
+                      {r.sharedFeatures && r.sharedFeatures.length > 0 ? (
+                        <div className="flex flex-wrap gap-0.5 max-w-[180px]">
+                          {r.sharedFeatures.slice(0, 3).map(f => (
+                            <span key={f} className="inline-block px-1 py-0.5 bg-orange-50 text-orange-600 rounded text-[9px] font-medium">{f}</span>
+                          ))}
+                          {r.sharedFeatures.length > 3 && (
+                            <span className="inline-block px-1 py-0.5 bg-orange-100 text-orange-500 rounded text-[9px] font-medium">+{r.sharedFeatures.length - 3}</span>
+                          )}
+                        </div>
+                      ) : (
+                        <span className="text-[10px] text-slate-300">—</span>
+                      )}
+                    </td>
                     <td className="px-3 py-2 text-right">
                       {hasPriorityFilter && r.filteredItemCount != null ? (
                         <span className="inline-flex items-center justify-center min-w-[28px] px-2 py-0.5 rounded-full bg-amber-100 text-amber-700 text-[10px] font-bold" title={`${r.filteredItemCount} of ${r.itemCount} items match P${filterPriorities[0]}`}>
@@ -758,6 +823,16 @@ const FeatureCombinations: React.FC<FeatureCombinationsProps> = ({ currentUser, 
                   >
                     Items ({comboItems.length})
                   </button>
+                  <button
+                    onClick={() => setRightTab('values')}
+                    className={`px-3 py-1.5 text-[9px] font-black uppercase tracking-wider border-b-2 transition-colors ${
+                      rightTab === 'values'
+                        ? 'border-emerald-500 text-emerald-600'
+                        : 'border-transparent text-slate-400 hover:text-slate-600'
+                    }`}
+                  >
+                    Values ({selectedCombo.normalizedValues.length})
+                  </button>
                   {analysisMode && (
                     <button
                       onClick={handleConsolidateClick}
@@ -825,6 +900,119 @@ const FeatureCombinations: React.FC<FeatureCombinationsProps> = ({ currentUser, 
                   </tbody>
                 </table>
               )
+            ) : rightTab === 'values' ? (
+              /* ---- VALUES TAB ---- */
+              (() => {
+                const d365Map = selectedCombo.d365Values || {};
+                const values = selectedCombo.normalizedValues || [];
+                const shared = selectedCombo.sharedFeatures || [];
+                const hasShared = shared.length > 0;
+                const allSharedIds = hasShared ? [selectedCombo.featureId, ...shared] : [];
+                return values.length === 0 ? (
+                  <div className="text-center py-8 text-slate-400 text-xs">No values for this combination</div>
+                ) : (
+                  <div className="flex flex-col h-full">
+                    {/* Shared filter bar */}
+                    {hasShared && (
+                      <div className="px-3 py-2 bg-orange-50 border-b border-orange-100 flex items-center gap-2 shrink-0">
+                        <span className="text-[9px] font-bold text-orange-500 uppercase tracking-wider">Shared with {shared.length} feature{shared.length > 1 ? 's' : ''}</span>
+                        <button
+                          onClick={() => {
+                            if (sharedFilterActive) {
+                              setSharedFilterActive(false);
+                              setFilterFeatureIds([]);
+                              setFootprintFilterActive(false);
+                              setFootprintFilter(undefined);
+                            } else {
+                              setSharedFilterActive(true);
+                              setFootprintFilterActive(false);
+                              setFootprintFilter(undefined);
+                              setSearch('');
+                              setSearchInput('');
+                              setFilterFeatureIds(allSharedIds);
+                              setFilterAttributeTypes([]);
+                              setFilterPriorities([]);
+                              setFilterStatuses([]);
+                              setPage(0);
+                            }
+                          }}
+                          className={`px-2 py-0.5 rounded text-[9px] font-bold transition-colors ${
+                            sharedFilterActive
+                              ? 'bg-orange-500 text-white hover:bg-orange-600'
+                              : 'bg-orange-100 text-orange-600 hover:bg-orange-200'
+                          }`}
+                        >
+                          {sharedFilterActive ? '✕ Clear filter' : '⧉ Show shared only'}
+                        </button>
+                        <button
+                          onClick={() => {
+                            if (footprintFilterActive) {
+                              setFootprintFilterActive(false);
+                              setFootprintFilter(undefined);
+                              setFilterFeatureIds([]);
+                              setSharedFilterActive(false);
+                            } else {
+                              setFootprintFilterActive(true);
+                              setSharedFilterActive(false);
+                              setFootprintFilter(selectedCombo.footprint || undefined);
+                              setSearch('');
+                              setSearchInput('');
+                              setFilterFeatureIds([]);
+                              setFilterAttributeTypes([]);
+                              setFilterPriorities([]);
+                              setFilterStatuses([]);
+                              setPage(0);
+                            }
+                          }}
+                          className={`px-2 py-0.5 rounded text-[9px] font-bold transition-colors ${
+                            footprintFilterActive
+                              ? 'bg-purple-500 text-white hover:bg-purple-600'
+                              : 'bg-purple-100 text-purple-600 hover:bg-purple-200'
+                          }`}
+                        >
+                          {footprintFilterActive ? '✕ Clear filter' : '⬡ Same footprint'}
+                        </button>
+                      </div>
+                    )}
+                  <table className="w-full text-xs">
+                    <thead className="bg-slate-50 sticky top-0">
+                      <tr>
+                        <th className="text-left px-3 py-2 text-[9px] font-black uppercase tracking-wider text-slate-500 border-b border-slate-200">#</th>
+                        <th className="text-left px-3 py-2 text-[9px] font-black uppercase tracking-wider text-slate-500 border-b border-slate-200">Legacy Value</th>
+                        <th className="text-left px-3 py-2 text-[9px] font-black uppercase tracking-wider text-slate-500 border-b border-slate-200">D365 Value</th>
+                        <th className="text-center px-3 py-2 text-[9px] font-black uppercase tracking-wider text-slate-500 border-b border-slate-200">Status</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {values.map((v, i) => {
+                        const d365Val = d365Map[v];
+                        const isMapped = !!d365Val;
+                        return (
+                          <tr key={v} className="border-b border-slate-50 hover:bg-slate-50">
+                            <td className="px-3 py-1.5 text-slate-300 text-[10px]">{i + 1}</td>
+                            <td className="px-3 py-1.5 font-medium text-slate-700">{v}</td>
+                            <td className="px-3 py-1.5">
+                              {isMapped ? (
+                                <span className="text-indigo-600 font-medium">{d365Val}</span>
+                              ) : (
+                                <span className="text-slate-300 italic">unmapped</span>
+                              )}
+                            </td>
+                            <td className="px-3 py-1.5 text-center">
+                              {isMapped ? (
+                                <span className="inline-block px-1.5 py-0.5 bg-emerald-50 text-emerald-600 rounded text-[9px] font-bold">Mapped</span>
+                              ) : (
+                                <span className="inline-block px-1.5 py-0.5 bg-slate-100 text-slate-400 rounded text-[9px] font-bold">Unmapped</span>
+                              )}
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                  </div>
+                );
+              })()
             ) : (
               /* ---- CONSOLIDATE TAB ---- */
               isLoadingConsolidation ? (

@@ -1,5 +1,5 @@
 
-import { GlobalMapping, DatabaseState, User, ConnectionMode, NewAttribute, WorkspaceMappingRow, MappingGenerationProgress, ValueListGroup, ValueListRow, NewClassification, BomHierarchyItem, MLPrediction, MLSettings, FeatureCombinationJobProgress, FeatureCombinationRow, FeatureCombinationItem, ConsolidationAnalysis, SubsetMergeDetail, AttributeCombinationJobProgress, AttributeCombinationRow, AttributeCombinationItem, AttrComboConsolidationAnalysis, MigrationManifestRow, MigrationManifestFilters, MigrationManifestItemSummary, MigrationManifestAttributeGroup, MigrationManifestValueDetail, MergedWorkspaceMappingRow, MergeJob, ValuelistStrategyJob, TargetAttributeProfile, ValuelistDedupGroup, ValuelistMergeProposal, ValuelistApplyResult } from '../types';
+import { GlobalMapping, DatabaseState, User, ConnectionMode, NewAttribute, WorkspaceMappingRow, MappingGenerationProgress, ValueListGroup, ValueListRow, NewClassification, BomHierarchyItem, MLPrediction, MLSettings, FeatureCombinationJobProgress, FeatureCombinationRow, FeatureCombinationItem, ConsolidationAnalysis, SubsetMergeDetail, AttributeCombinationJobProgress, AttributeCombinationRow, AttributeCombinationItem, AttrComboConsolidationAnalysis, MigrationManifestRow, MigrationManifestFilters, MigrationManifestItemSummary, MigrationManifestAttributeGroup, MigrationManifestValueDetail, MergedWorkspaceMappingRow, MergeJob, ValuelistStrategyJob, TargetAttributeProfile, ValuelistDedupGroup, ValuelistMergeProposal, ValuelistApplyResult, GroupFeatureRow, GroupFeatureMappingJobProgress, GroupFeatureWhereUsedItem, GroupFeatureFilters } from '../types';
 
 export interface SaveAllResult {
   mode: ConnectionMode;
@@ -1180,7 +1180,7 @@ export const dbService = {
     });
   },
 
-  async fetchFeatureCombinations(options?: { search?: string; featureId?: string; attributeType?: string; priority?: number; status?: string; sortBy?: string; sortDir?: string; analysisMode?: boolean; limit?: number; offset?: number }): Promise<{ items: FeatureCombinationRow[]; total: number }> {
+  async fetchFeatureCombinations(options?: { search?: string; featureId?: string; attributeType?: string; priority?: number; status?: string; footprint?: string; sortBy?: string; sortDir?: string; analysisMode?: boolean; limit?: number; offset?: number }): Promise<{ items: FeatureCombinationRow[]; total: number; valueListStats?: { sharedRows: number; uniqueRows: number; distinctShared: number; distinctUnique: number; totalDistinct: number } }> {
     if (!SQL_ENDPOINT) throw new Error('Database connection not available.');
     const params = new URLSearchParams();
     if (options?.search) params.set('search', options.search);
@@ -1188,6 +1188,7 @@ export const dbService = {
     if (options?.attributeType) params.set('attributeType', options.attributeType);
     if (options?.priority != null) params.set('priority', String(options.priority));
     if (options?.status) params.set('status', options.status);
+    if (options?.footprint) params.set('footprint', options.footprint);
     if (options?.sortBy) params.set('sortBy', options.sortBy);
     if (options?.sortDir) params.set('sortDir', options.sortDir);
     if (options?.analysisMode) params.set('analysisMode', 'true');
@@ -1539,5 +1540,129 @@ export const dbService = {
     }
     this._invalidateCache();
     return resp.json();
+  },
+
+  // ---------- Group Features ----------
+
+  async uploadGroupFeatures(rows: Record<string, string>[]): Promise<{ ok: boolean; rowsInserted: number }> {
+    const resp = await this._fetchWithRefresh(`${SQL_ENDPOINT}/group-features/upload`, {
+      method: 'POST',
+      headers: { ...this._authHeaders(), 'Content-Type': 'application/json' },
+      body: JSON.stringify(rows),
+    });
+    if (!resp.ok) { const t = await resp.text(); throw new Error(`Upload group features failed: ${resp.status} ${t}`); }
+    this._invalidateCache();
+    return resp.json();
+  },
+
+  async fetchGroupFeatures(params: { search?: string; featureGroup?: string; featureId?: string; valueStatus?: string; targetAttribute?: string; targetValue?: string; sortBy?: string; sortDir?: string; limit?: number; offset?: number }): Promise<{ items: GroupFeatureRow[]; total: number }> {
+    const sp = new URLSearchParams();
+    if (params.search) sp.set('search', params.search);
+    if (params.featureGroup) sp.set('featureGroup', params.featureGroup);
+    if (params.featureId) sp.set('featureId', params.featureId);
+    if (params.valueStatus) sp.set('valueStatus', params.valueStatus);
+    if (params.targetAttribute) sp.set('targetAttribute', params.targetAttribute);
+    if (params.targetValue) sp.set('targetValue', params.targetValue);
+    if (params.sortBy) sp.set('sortBy', params.sortBy);
+    if (params.sortDir) sp.set('sortDir', params.sortDir);
+    if (params.limit) sp.set('limit', String(params.limit));
+    if (params.offset) sp.set('offset', String(params.offset));
+    return this._cachedFetch(`${SQL_ENDPOINT}/group-features/list?${sp.toString()}`, { headers: this._authHeaders(), _ttlMs: 10_000 });
+  },
+
+  async fetchGroupFeatureFilters(featureGroup?: string): Promise<GroupFeatureFilters> {
+    const sp = new URLSearchParams();
+    if (featureGroup) sp.set('featureGroup', featureGroup);
+    return this._cachedFetch(`${SQL_ENDPOINT}/group-features/filters?${sp.toString()}`, { headers: this._authHeaders(), _ttlMs: 10_000 });
+  },
+
+  async fetchGroupFeatureStats(params: { search?: string; featureGroup?: string; featureId?: string; valueStatus?: string; targetAttribute?: string; targetValue?: string }): Promise<{ totalGroups: number; totalSubFeatures: number; totalValues: number; statusCounts: Record<string, number>; unmappedAttributes: number; totalWhereUsed: number }> {
+    const sp = new URLSearchParams();
+    if (params.search) sp.set('search', params.search);
+    if (params.featureGroup) sp.set('featureGroup', params.featureGroup);
+    if (params.featureId) sp.set('featureId', params.featureId);
+    if (params.valueStatus) sp.set('valueStatus', params.valueStatus);
+    if (params.targetAttribute) sp.set('targetAttribute', params.targetAttribute);
+    if (params.targetValue) sp.set('targetValue', params.targetValue);
+    return this._cachedFetch(`${SQL_ENDPOINT}/group-features/stats?${sp.toString()}`, { headers: this._authHeaders(), _ttlMs: 10_000 });
+  },
+
+  async triggerGroupFeatureMappingJob(): Promise<{ ok: boolean; jobId: number }> {
+    const resp = await this._fetchWithRefresh(`${SQL_ENDPOINT}/group-features/apply-mappings`, {
+      method: 'POST',
+      headers: { ...this._authHeaders(), 'Content-Type': 'application/json' },
+      body: '{}',
+    });
+    if (!resp.ok) { const t = await resp.text(); throw new Error(`Trigger mapping failed: ${resp.status} ${t}`); }
+    this._invalidateCache();
+    return resp.json();
+  },
+
+  async fetchGroupFeatureMappingProgress(): Promise<GroupFeatureMappingJobProgress> {
+    return this._cachedFetch(`${SQL_ENDPOINT}/group-features/mapping-progress`, { headers: this._authHeaders(), _ttlMs: 2_000 });
+  },
+
+  async fetchGroupFeatureWhereUsed(groupName: string): Promise<{ featureGroup: string; items: GroupFeatureWhereUsedItem[]; total: number }> {
+    return this._cachedFetch(`${SQL_ENDPOINT}/group-features/where-used/${encodeURIComponent(groupName)}`, { headers: this._authHeaders(), _ttlMs: 10_000 });
+  },
+
+  async updateGroupFeatureStatus(ids: number[], valueStatus: string): Promise<{ ok: boolean; updated: number }> {
+    const resp = await this._fetchWithRefresh(`${SQL_ENDPOINT}/group-features/update-status`, {
+      method: 'POST',
+      headers: { ...this._authHeaders(), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ids, valueStatus }),
+    });
+    if (!resp.ok) { const t = await resp.text(); throw new Error(`Update status failed: ${resp.status} ${t}`); }
+    this._invalidateCache();
+    return resp.json();
+  },
+
+  async generateGroupFeatureValuelist(featureGroup: string): Promise<{ ok: boolean; valuelistsCreated: number; valuelistRowsCreated: number; skippedFeatures: string[]; createdValuelistIds: string[] }> {
+    const resp = await this._fetchWithRefresh(`${SQL_ENDPOINT}/group-features/generate-valuelist`, {
+      method: 'POST',
+      headers: { ...this._authHeaders(), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ featureGroup }),
+    });
+    if (!resp.ok) { const t = await resp.text(); throw new Error(`Generate valuelist failed: ${resp.status} ${t}`); }
+    this._invalidateCache();
+    return resp.json();
+  },
+
+  exportGroupFeaturesCsvUrl(params: { search?: string; featureGroup?: string; featureId?: string; valueStatus?: string; targetAttribute?: string; targetValue?: string }): string {
+    const qp = new URLSearchParams();
+    if (params.search) qp.set('search', params.search);
+    if (params.featureGroup) qp.set('featureGroup', params.featureGroup);
+    if (params.featureId) qp.set('featureId', params.featureId);
+    if (params.valueStatus) qp.set('valueStatus', params.valueStatus);
+    if (params.targetAttribute) qp.set('targetAttribute', params.targetAttribute);
+    if (params.targetValue) qp.set('targetValue', params.targetValue);
+    return `${SQL_ENDPOINT}/group-features/export-csv?${qp.toString()}`;
+  },
+
+  async downloadGroupFeaturesCsv(params: { search?: string; featureGroup?: string; featureId?: string; valueStatus?: string; targetAttribute?: string; targetValue?: string }): Promise<void> {
+    const url = this.exportGroupFeaturesCsvUrl(params);
+    const resp = await this._fetchWithRefresh(url, { headers: this._authHeaders() });
+    if (!resp.ok) throw new Error(`Export failed: ${resp.status}`);
+    const blob = await resp.blob();
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'group_features_export.csv';
+    a.click();
+    URL.revokeObjectURL(a.href);
+  },
+
+  async triggerGroupFeatureSuggest(): Promise<{ ok: boolean; jobId: number }> {
+    const resp = await this._fetchWithRefresh(`${SQL_ENDPOINT}/group-features/suggest`, {
+      method: 'POST',
+      headers: { ...this._authHeaders(), 'Content-Type': 'application/json' },
+      body: '{}',
+    });
+    if (!resp.ok) { const t = await resp.text(); throw new Error(`Trigger suggest failed: ${resp.status} ${t}`); }
+    this._invalidateCache();
+    return resp.json();
+  },
+
+  async fetchGroupFeatureSuggestProgress(): Promise<GroupFeatureMappingJobProgress> {
+    return this._cachedFetch(`${SQL_ENDPOINT}/group-features/suggest-progress`, { headers: this._authHeaders(), _ttlMs: 2_000 });
   },
 };

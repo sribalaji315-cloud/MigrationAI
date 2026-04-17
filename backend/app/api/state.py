@@ -4,7 +4,7 @@ from sqlalchemy.orm import Session, selectinload
 from sqlalchemy import func, or_, cast, case, String, literal_column, text as sa_text
 from sqlalchemy.exc import IntegrityError, OperationalError
 from typing import Dict, List, Any, Optional, Set
-import io, csv, time, hashlib, asyncio, logging, json
+import io, csv, re, time, hashlib, asyncio, logging, json
 from ..db import models
 from ..db.session import get_db, SessionLocal
 from ..schemas import StateIn, ClassAttributeValuesIn
@@ -55,6 +55,8 @@ def _get_included_type_set(db: Session) -> Optional[Set[str]]:
 _metrics_cache: Dict[str, Any] = {}
 _metrics_cache_fingerprint: Dict[str, str] = {}
 _generation_lock = asyncio.Lock()
+_group_feature_mapping_lock = asyncio.Lock()
+_group_feature_suggest_lock = asyncio.Lock()
 GENERATION_STALE_TIMEOUT_SECONDS = 15 * 60
 GENERATION_INSERT_BATCH_SIZE = 1500
 GENERATION_INSERT_MAX_RETRIES = 5
@@ -697,7 +699,14 @@ def _make_values_key(sorted_values: List[str]) -> str:
 
 
 def _run_feature_combination_job(job_id: int):
-    """Synchronous worker: scan BomFeature, group by feature_id+values, count items."""
+    """Synchronous worker: build feature combinations from merged_workspace_mappings.
+
+    Groups rows by (legacy_feature_id, legacy_value_footprint).  Only rows
+    where legacy_value_footprint is non-empty are considered.  The values
+    included in each combo are derived using the same criteria as the
+    footprint computation (feasibility='Yes', non-empty legacy_value &
+    legacy_feature_id, included attribute types).
+    """
     db = SessionLocal()
 
     def _safe_commit(session, max_retries: int = 5):
@@ -722,14 +731,7 @@ def _run_feature_combination_job(job_id: int):
         job.updated_at = job.started_at
         _safe_commit(db)
 
-        # Use a separate read session so the scan doesn't hold a write lock
         scan_db = SessionLocal()
-
-        # Build item_id map (pk -> string item_id)
-        item_id_by_pk = {
-            row_id: item_id
-            for row_id, item_id in scan_db.query(models.BomItem.id, models.BomItem.item_id).all()
-        }
 
         # Build priority map (string item_id -> priority)
         priority_by_item = {
@@ -747,7 +749,7 @@ def _run_feature_combination_job(job_id: int):
                 if normalized_fid and at:
                     attr_type_by_feature.setdefault(normalized_fid, at)
 
-        # Build feature_id -> list of { attr, vm } from global mappings (supports multiple D365 attrs per feature)
+        # Build feature_id -> list of { attr, vm } from global mappings
         d365_by_feature: Dict[str, List[Dict[str, Any]]] = {}
         for gm in scan_db.query(models.GlobalMapping).all():
             new_attr = (getattr(gm, "new_attribute_id", "") or "").strip()
@@ -757,106 +759,124 @@ def _run_feature_combination_job(job_id: int):
                 if normalized_fid and new_attr:
                     d365_by_feature.setdefault(normalized_fid, []).append({"attr": new_attr, "vm": dict(vm)})
 
-        # Build exclusion indexes for combination filtering
-        _combo_excluded_features: Set[str] = set()  # features where entire mapping deprecated/ignored
-        _combo_ignored_values: Dict[str, Set[str]] = {}  # feature_id -> set of ignored values
-        for gm in scan_db.query(models.GlobalMapping).all():
-            gm_status = (getattr(gm, "status", "active") or "active").strip().lower()
-            gm_ignored = set(getattr(gm, "ignored_values", []) or [])
-            for fid in (getattr(gm, "legacy_feature_ids", []) or []):
-                nfid = str(fid or "").strip()
-                if not nfid:
-                    continue
-                if gm_status in ("deprecated", "ignored"):
-                    _combo_excluded_features.add(nfid)
-                if gm_ignored:
-                    _combo_ignored_values.setdefault(nfid, set()).update(gm_ignored)
+        # Build included attribute type filter (mirrors footprint generation logic)
+        included_type_set = _get_included_type_set(scan_db)
+        attr_type_filter_sql = ""
+        if included_type_set:
+            type_placeholders = ",".join(f"'{t}'" for t in included_type_set)
+            attr_type_filter_sql = f"AND LOWER(TRIM(attribute_type)) IN ({type_placeholders})"
 
-        total_features = int(scan_db.query(func.count(models.BomFeature.id)).scalar() or 0)
-        job.total_features = total_features
+        # -----------------------------------------------------------------
+        # Phase 1: Collect all rows with non-empty legacy_value_footprint
+        # -----------------------------------------------------------------
+        total_rows = int(scan_db.execute(
+            sa_text("SELECT COUNT(*) FROM merged_workspace_mappings WHERE COALESCE(TRIM(legacy_value_footprint), '') != ''")
+        ).scalar() or 0)
+        job.total_features = total_rows
         job.updated_at = time.time()
         _safe_commit(db)
 
-        # combination key -> { feature_id, description, unit, values, item_ids set }
-        combos: Dict[str, Dict[str, Any]] = {}
-        processed = 0
+        # Query the footprint values for grouping (only filter: footprint non-empty)
+        fp_rows = scan_db.execute(
+            sa_text("""SELECT legacy_item_id, TRIM(legacy_feature_id) as fid,
+                              legacy_value_footprint
+                       FROM merged_workspace_mappings
+                       WHERE COALESCE(TRIM(legacy_value_footprint), '') != ''
+                       ORDER BY fid, legacy_value_footprint""")
+        ).fetchall()
 
-        for feat in scan_db.query(models.BomFeature).yield_per(1000):
-            legacy_item_id = item_id_by_pk.get(getattr(feat, "item_id", None))
-            if not legacy_item_id:
-                processed += 1
-                continue
+        # Group by (feature_id, footprint) → set of item_ids
+        combo_items: Dict[tuple, set] = {}  # (fid, footprint) -> set of item_ids
+        for item_id, fid, fp in fp_rows:
+            key = (fid, fp)
+            combo_items.setdefault(key, set()).add(item_id)
 
-            feature_id = str(getattr(feat, "feature_id", "") or "").strip()
+        # -----------------------------------------------------------------
+        # Phase 2: For each combo, get the actual values that went into the
+        # footprint using the same criteria as the footprint generation.
+        # -----------------------------------------------------------------
+        # Collect all distinct (item, feature) pairs per combo to query values
+        # We only need one representative item per combo since all items in
+        # the same footprint group share identical sorted legacy values.
+        representative_items: Dict[tuple, str] = {}
+        for (fid, fp), item_ids in combo_items.items():
+            representative_items[(fid, fp)] = next(iter(item_ids))
 
-            # Skip entirely excluded features (deprecated/ignored mapping)
-            if feature_id in _combo_excluded_features:
-                processed += 1
-                continue
+        # Build lookup of footprint values: (fid, footprint) -> sorted value list
+        combo_values: Dict[tuple, List[str]] = {}
+        for (fid, fp), rep_item_id in representative_items.items():
+            val_rows = scan_db.execute(
+                sa_text(f"""SELECT DISTINCT TRIM(legacy_value) as val
+                            FROM merged_workspace_mappings
+                            WHERE legacy_item_id = :item_id
+                              AND TRIM(legacy_feature_id) = :fid
+                              AND feasibility = 'Yes'
+                              AND TRIM(legacy_value) != ''
+                              AND TRIM(legacy_feature_id) != ''
+                              {attr_type_filter_sql}
+                            ORDER BY val"""),
+                {"item_id": rep_item_id, "fid": fid},
+            ).fetchall()
+            combo_values[(fid, fp)] = sorted(set(r[0] for r in val_rows))
 
-            normalized = _normalize_feature_values(getattr(feat, "values", []))
-
-            # Filter out ignored + discontinued values
-            ignored_for_fid = _combo_ignored_values.get(feature_id, set())
-            raw_vals_data = getattr(feat, "values", []) or []
-            till_dates: Dict[str, str] = {}
-            if isinstance(raw_vals_data, dict):
-                till_dates = raw_vals_data.get("valueTillDates", {}) or {}
-
-            active_values: List[str] = []
-            for v in normalized:
-                if v in ignored_for_fid:
-                    continue
-                td_str = till_dates.get(v)
-                if td_str and str(td_str).strip():
-                    continue
-                active_values.append(v)
-
-            values_key = _make_values_key(active_values)
-            combo_key = f"{feature_id}||{values_key}"
-
-            if combo_key not in combos:
-                combos[combo_key] = {
-                    "feature_id": feature_id,
-                    "description": str(getattr(feat, "description", "") or "").strip(),
-                    "unit": str(getattr(feat, "unit", "") or "").strip(),
-                    "values": active_values,
-                    "item_ids": set(),
-                }
-            combos[combo_key]["item_ids"].add(legacy_item_id)
-            processed += 1
-
-            if processed % 500 == 0:
-                job.processed_features = processed
-                job.updated_at = time.time()
-                _safe_commit(db)
+        # -----------------------------------------------------------------
+        # Phase 3: Build description/unit lookup from BomFeature (optional)
+        # -----------------------------------------------------------------
+        feature_desc: Dict[str, str] = {}
+        feature_unit: Dict[str, str] = {}
+        for bf in scan_db.query(models.BomFeature).with_entities(
+            models.BomFeature.feature_id,
+            models.BomFeature.description,
+            models.BomFeature.unit,
+        ).distinct(models.BomFeature.feature_id).all():
+            fid_str = str(getattr(bf, "feature_id", "") or "").strip()
+            if fid_str and fid_str not in feature_desc:
+                feature_desc[fid_str] = str(getattr(bf, "description", "") or "").strip()
+                feature_unit[fid_str] = str(getattr(bf, "unit", "") or "").strip()
 
         scan_db.close()
+        scan_db = None
 
-        # Rebuild summary table
+        # -----------------------------------------------------------------
+        # Phase 4: Rebuild summary table
+        # -----------------------------------------------------------------
         db.query(models.FeatureCombination).delete()
         built_at = time.time()
+
+        # Sort combos by feature_id then footprint for deterministic value_list_id numbering
+        sorted_keys = sorted(combo_items.keys(), key=lambda k: (k[0], k[1]))
+
+        # Pre-compute which footprints are shared across multiple features.
+        # Shared footprints get a stable hash-based ID (VL_{hash[:8]}),
+        # unique footprints keep the per-feature naming (FEATURE_valuelistN).
+        fp_to_features: Dict[str, set] = {}
+        for fid, fp in sorted_keys:
+            if fp:
+                fp_to_features.setdefault(fp, set()).add(fid)
+        shared_fps: Set[str] = {fp for fp, fids in fp_to_features.items() if len(fids) > 1}
+
         rows: List[Dict[str, Any]] = []
-        for combo in combos.values():
-            # Collect distinct priorities for items in this combo
-            combo_priorities = sorted(set(
-                priority_by_item[iid]
-                for iid in combo["item_ids"]
-                if iid in priority_by_item
-            ))
-            fid = combo["feature_id"]
-            legacy_vals = combo["values"]
+        vl_counter: Dict[str, int] = {}  # feature_id -> running counter (non-shared only)
+
+        for fid, fp in sorted_keys:
+            item_ids = combo_items[(fid, fp)]
+            legacy_vals = combo_values.get((fid, fp), [])
             legacy_count = len(legacy_vals)
 
-            # D365 mapping lookup (may have multiple D365 attributes per feature)
+            # Priorities
+            combo_priorities = sorted(set(
+                priority_by_item[iid]
+                for iid in item_ids
+                if iid in priority_by_item
+            ))
+
+            # D365 mapping lookup
             d365_entries = d365_by_feature.get(fid, [])
             d365_attr_names = [e["attr"] for e in d365_entries]
             d365_attr = "; ".join(d365_attr_names) if d365_attr_names else None
-            # Merge value mappings from all D365 attributes for this feature
             d365_vm_merged: Dict[str, str] = {}
             for entry in d365_entries:
                 d365_vm_merged.update(entry["vm"])
-            # Build per-value mapping: only include values present in this combo
             d365_vals: Dict[str, str] = {}
             mapped_count = 0
             for lv in legacy_vals:
@@ -864,11 +884,10 @@ def _run_feature_combination_job(job_id: int):
                 if mapped_v is not None and str(mapped_v).strip():
                     d365_vals[lv] = str(mapped_v).strip()
                     mapped_count += 1
-            # Status: complete if all mapped, partial if some, unmapped if none
+
             if not d365_attr:
                 status = "unmapped"
             elif legacy_count == 0:
-                # Attribute-only mapping with no values to map — consider complete
                 status = "complete"
             elif mapped_count == 0:
                 status = "unmapped"
@@ -877,28 +896,40 @@ def _run_feature_combination_job(job_id: int):
             else:
                 status = "partial"
 
+            # Value list ID: shared footprints get stable hash-based ID,
+            # unique footprints keep per-feature sequential naming.
+            if fp and fp in shared_fps:
+                value_list_id = f"VL_{fp[:8]}"
+            else:
+                vl_counter.setdefault(fid, 0)
+                vl_counter[fid] += 1
+                value_list_id = f"{fid}_valuelist{vl_counter[fid]}"
+
             rows.append({
                 "feature_id": fid,
-                "description": combo["description"] or None,
-                "unit": combo["unit"] or None,
+                "description": feature_desc.get(fid) or None,
+                "unit": feature_unit.get(fid) or None,
                 "attribute_type": attr_type_by_feature.get(fid) or None,
                 "normalized_values_key": _make_values_key(legacy_vals),
                 "normalized_values_json": legacy_vals,
-                "item_count": len(combo["item_ids"]),
+                "item_count": len(item_ids),
                 "legacy_value_count": legacy_count,
                 "d365_attribute_id": d365_attr,
                 "d365_values_json": d365_vals if d365_vals else None,
                 "mapped_value_count": mapped_count,
                 "mapping_status": status,
                 "priorities_json": combo_priorities if combo_priorities else None,
-                "item_ids_json": sorted(combo["item_ids"]),
+                "item_ids_json": sorted(item_ids),
+                "footprint": fp,
+                "value_list_id": value_list_id,
                 "built_at": built_at,
             })
+
         if rows:
             db.bulk_insert_mappings(models.FeatureCombination, rows)
 
         job.status = "completed"
-        job.processed_features = processed
+        job.processed_features = total_rows
         job.generated_rows = len(rows)
         job.finished_at = time.time()
         job.updated_at = job.finished_at
@@ -1067,6 +1098,7 @@ def list_feature_combinations(
     attributeType: Optional[str] = None,
     priority: Optional[int] = None,
     status: Optional[str] = None,
+    footprint: Optional[str] = None,
     sortBy: Optional[str] = None,
     sortDir: Optional[str] = None,
     analysisMode: Optional[bool] = None,
@@ -1107,6 +1139,8 @@ def list_feature_combinations(
             base = base.filter(models.FeatureCombination.mapping_status == sts[0])
         elif sts:
             base = base.filter(models.FeatureCombination.mapping_status.in_(sts))
+    if footprint:
+        base = base.filter(models.FeatureCombination.footprint == footprint)
     # For priority filter: use JSON contains via string match (SQLite doesn't have native JSON contains)
     if priority is not None:
         base = base.filter(
@@ -1198,6 +1232,24 @@ def list_feature_combinations(
         )
         combo_count_map = {fid: cnt for fid, cnt in counts}
 
+    # Pre-compute shared features per footprint (other features sharing the same hash)
+    footprints_in_page = list({r.footprint for r in rows if r.footprint})
+    shared_features_map: Dict[str, list] = {}
+    if footprints_in_page:
+        fp_rows = (
+            db.query(models.FeatureCombination.footprint, models.FeatureCombination.feature_id)
+            .filter(
+                models.FeatureCombination.footprint.in_(footprints_in_page),
+                models.FeatureCombination.footprint.isnot(None),
+                models.FeatureCombination.footprint != "",
+            )
+            .all()
+        )
+        fp_to_features: Dict[str, set] = {}
+        for fp, fid in fp_rows:
+            fp_to_features.setdefault(fp, set()).add(fid)
+        shared_features_map = {fp: sorted(fids) for fp, fids in fp_to_features.items()}
+
     # When a priority filter is active, compute filtered item counts per combo
     filtered_item_counts: Dict[int, int] = {}
     if priority is not None and rows:
@@ -1229,11 +1281,40 @@ def list_feature_combinations(
             "mappingStatus": r.mapping_status if hasattr(r, "mapping_status") else "unmapped",
             "priorities": r.priorities_json or [],
             "builtAt": r.built_at,
+            "footprint": getattr(r, "footprint", None) or "",
+            "valueListId": getattr(r, "value_list_id", None) or "",
+            "sharedFeatures": [f for f in shared_features_map.get(getattr(r, "footprint", None) or "", []) if f != r.feature_id],
             **({"savedPlanStrategy": saved_plans_map.get(r.feature_id)} if analysisMode else {}),
         }
         for r in rows
     ]
-    return {"items": items, "total": total}
+
+    # Compute global value-list stats (across all combos, not just this page)
+    vl_stats_rows = (
+        db.query(models.FeatureCombination.value_list_id)
+        .filter(
+            models.FeatureCombination.value_list_id.isnot(None),
+            models.FeatureCombination.value_list_id != "",
+        )
+        .all()
+    )
+    all_vl_ids = [r[0] for r in vl_stats_rows]
+    shared_vl = sum(1 for v in all_vl_ids if v.startswith("VL_"))
+    unique_vl = len(all_vl_ids) - shared_vl
+    distinct_shared = len({v for v in all_vl_ids if v.startswith("VL_")})
+    distinct_unique = len({v for v in all_vl_ids if not v.startswith("VL_")})
+
+    return {
+        "items": items,
+        "total": total,
+        "valueListStats": {
+            "sharedRows": shared_vl,
+            "uniqueRows": unique_vl,
+            "distinctShared": distinct_shared,
+            "distinctUnique": distinct_unique,
+            "totalDistinct": distinct_shared + distinct_unique,
+        },
+    }
 
 
 @router.get("/feature-combinations/{combo_id}/items")
@@ -1242,32 +1323,25 @@ def get_feature_combination_items(
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user),
 ):
-    """Return the BOM items whose features match the selected combination."""
+    """Return the BOM items whose features match the selected combination.
+
+    Uses the pre-computed ``item_ids_json`` stored during the combination build
+    rather than re-scanning BomFeature rows.  The old approach re-normalised
+    values without filtering ignored/discontinued values, causing a key mismatch
+    with the build-time key and returning 0 items.
+    """
     combo = db.query(models.FeatureCombination).filter(models.FeatureCombination.id == combo_id).first()
     if not combo:
         raise HTTPException(status_code=404, detail="combination not found")
 
-    target_feature_id = combo.feature_id
-    target_key = combo.normalized_values_key
-
-    # Scan BomFeature rows for this feature_id, then filter by normalized key
-    features = (
-        db.query(models.BomFeature)
-        .filter(models.BomFeature.feature_id == target_feature_id)
-        .all()
-    )
-    matching_item_pks: Set[int] = set()
-    for feat in features:
-        normalized = _normalize_feature_values(getattr(feat, "values", []))
-        if _make_values_key(normalized) == target_key:
-            matching_item_pks.add(feat.item_id)
-
-    if not matching_item_pks:
+    # item_ids_json is populated during the build with the correct item_id strings
+    stored_item_ids = getattr(combo, "item_ids_json", None) or []
+    if not stored_item_ids:
         return {"items": []}
 
     bom_items = (
         db.query(models.BomItem)
-        .filter(models.BomItem.id.in_(matching_item_pks))
+        .filter(models.BomItem.item_id.in_(stored_item_ids))
         .order_by(models.BomItem.item_id)
         .all()
     )
@@ -3201,20 +3275,29 @@ async def sync_state(payload: StateIn, db: Session = Depends(get_db), current_us
 
                 keep_row_id_by_key[natural_key] = int(existing_row.id)
 
-                if _global_mapping_row_changed(
-                    existing_row,
-                    row["legacy_feature_ids"],
-                    row["new_attribute_id"],
-                    row["attribute_type"],
-                    row["value_mappings"],
+                incoming_status = row.get("status") or "active"
+                incoming_ignored = row.get("ignored_values") or []
+                existing_status = getattr(existing_row, "status", "active") or "active"
+                existing_ignored = list(getattr(existing_row, "ignored_values", []) or [])
+
+                if (
+                    _global_mapping_row_changed(
+                        existing_row,
+                        row["legacy_feature_ids"],
+                        row["new_attribute_id"],
+                        row["attribute_type"],
+                        row["value_mappings"],
+                    )
+                    or existing_status != incoming_status
+                    or existing_ignored != incoming_ignored
                 ):
                     existing_version = int(getattr(existing_row, "version", 1) or 1)
                     existing_row.legacy_feature_ids = row["legacy_feature_ids"]
                     existing_row.new_attribute_id = row["new_attribute_id"]
                     existing_row.attribute_type = row["attribute_type"]
                     existing_row.value_mappings = row["value_mappings"]
-                    existing_row.status = row.get("status") or "active"
-                    existing_row.ignored_values = row.get("ignored_values") or []
+                    existing_row.status = incoming_status
+                    existing_row.ignored_values = incoming_ignored
                     existing_row.version = max(existing_version + 1, int(row.get("version") or existing_version))
                     existing_row.modified_by = current_user_id
                     existing_row.modified_at = now_ts
@@ -6575,12 +6658,24 @@ def get_merged_workspace_mappings_detail(
     }
 
 
+# Cache for merged workspace mappings summary (invalidated after batch jobs)
+_merged_summary_cache: Dict[str, Any] = {}
+_merged_summary_cache_ts: float = 0.0
+_MERGED_SUMMARY_CACHE_TTL = 300  # 5 minutes
+
+
 @router.get("/merged-workspace-mappings-summary")
 def get_merged_workspace_mappings_summary(
+    refresh: bool = False,
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user),
 ):
     """Return a summary of merged workspace mappings with dashboard metrics."""
+    global _merged_summary_cache, _merged_summary_cache_ts
+    now = time.time()
+    if not refresh and _merged_summary_cache and (now - _merged_summary_cache_ts) < _MERGED_SUMMARY_CACHE_TTL:
+        return _merged_summary_cache
+
     total_rows = db.query(func.count(models.MergedWorkspaceMapping.id)).scalar() or 0
     distinct_items = db.query(func.count(func.distinct(models.MergedWorkspaceMapping.legacy_item_id))).scalar() or 0
 
@@ -6695,7 +6790,7 @@ def get_merged_workspace_mappings_summary(
         """)).fetchall()
         fp_attr_labels = {r[0]: r[1] for r in label_rows}
 
-    return {
+    result = {
         "totalRows": int(total_rows),
         "distinctItems": int(distinct_items),
         "metrics": {
@@ -6718,6 +6813,10 @@ def get_merged_workspace_mappings_summary(
         "filterOptions": filter_options,
         "fpAttrLabels": fp_attr_labels,
     }
+
+    _merged_summary_cache = result
+    _merged_summary_cache_ts = time.time()
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -7088,6 +7187,11 @@ def _run_merge_batch_job(job_id: int):
         db.commit()
 
         logger.info("Merge job %s: manifest item stats computed.", job_id)
+
+        # Invalidate summary cache so the dashboard picks up fresh data
+        global _merged_summary_cache, _merged_summary_cache_ts
+        _merged_summary_cache = {}
+        _merged_summary_cache_ts = 0.0
 
         job.status = "completed"
         job.finished_at = time.time()
@@ -7670,4 +7774,1075 @@ def valuelist_strategy_apply(
         "valuelistRowsCreated": vl_rows_created,
         "profilesUpdated": profiles_updated,
         "mappingsUpdated": mappings_updated,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Group Features
+# ---------------------------------------------------------------------------
+
+
+@router.post("/group-features/upload")
+def upload_group_features(
+    payload: List[Dict[str, Any]] = Body(...),
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """Upload group feature CSV rows.
+
+    Each row has: featureGroup, featureId, featureDesc, option, optionDesc,
+    condition, tillDate.
+    Values with a tillDate are stored with value_status='discontinued'.
+    All other values default to 'in_progress'.
+    """
+    if (getattr(current_user, "role", "") or "").strip().lower() != "admin":
+        raise HTTPException(status_code=403, detail="Admin only")
+
+    # Clear existing group features before re-upload
+    db.query(models.GroupFeature).delete(synchronize_session=False)
+    db.commit()
+
+    now_ts = time.time()
+    username = getattr(current_user, "username", "")
+    rows_to_insert: List[Dict[str, Any]] = []
+
+    for row in payload:
+        feature_group = str(row.get("featureGroup") or row.get("FeatureGroup") or "").strip()
+        feature_id = str(row.get("featureId") or row.get("feature") or row.get("Feature") or "").strip()
+        if not feature_group or not feature_id:
+            continue
+
+        option = str(row.get("option") or row.get("Option") or "").strip()
+        till_date = str(row.get("tillDate") or row.get("Till") or "").strip()
+
+        # Determine value_status: discontinued if tillDate present, else in_progress
+        value_status = "discontinued" if till_date else "in_progress"
+
+        rows_to_insert.append({
+            "feature_group": feature_group,
+            "feature_id": feature_id,
+            "feature_desc": str(row.get("featureDesc") or row.get("featureDescription") or row.get("Feature Desc") or "").strip() or None,
+            "option": option,
+            "option_desc": str(row.get("optionDesc") or row.get("optionDescription") or row.get("Option Desc") or "").strip() or None,
+            "condition": str(row.get("condition") or row.get("Condition") or "").strip() or None,
+            "till_date": till_date or None,
+            "target_attribute": None,
+            "target_value": None,
+            "value_status": value_status,
+            "valuelist_id": None,
+            "created_by": username,
+            "created_at": now_ts,
+        })
+
+    if rows_to_insert:
+        for i in range(0, len(rows_to_insert), GENERATION_INSERT_BATCH_SIZE):
+            batch = rows_to_insert[i:i + GENERATION_INSERT_BATCH_SIZE]
+            db.bulk_insert_mappings(models.GroupFeature, batch)
+        db.commit()
+
+    _audit(db, current_user, "group_features_upload", f"Uploaded {len(rows_to_insert)} group feature rows")
+    return {"ok": True, "rowsInserted": len(rows_to_insert)}
+
+
+@router.post("/group-features/apply-mappings")
+def trigger_group_feature_mapping(
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """Trigger a batch job that pulls GlobalMapping into the group_features table."""
+    if (getattr(current_user, "role", "") or "").strip().lower() != "admin":
+        raise HTTPException(status_code=403, detail="Admin only")
+
+    active = (
+        db.query(models.GroupFeatureMappingJob)
+        .filter(models.GroupFeatureMappingJob.status.in_(["queued", "running"]))
+        .first()
+    )
+    if active:
+        return {"ok": True, "jobId": int(active.id)}
+
+    # Clear stale target values so re-mapping starts fresh
+    db.query(models.GroupFeature).update(
+        {"target_attribute": None, "target_value": None},
+        synchronize_session=False,
+    )
+    db.commit()
+
+    job = models.GroupFeatureMappingJob(
+        status="queued",
+        triggered_by_user_id=str(getattr(current_user, "id", "")),
+        triggered_by_username=getattr(current_user, "username", ""),
+        updated_at=time.time(),
+    )
+    db.add(job)
+    db.commit()
+    db.refresh(job)
+
+    _start_group_feature_mapping_job(int(job.id), background_tasks=background_tasks)
+    return {"ok": True, "jobId": int(job.id)}
+
+
+def _start_group_feature_mapping_job(job_id: int, background_tasks: Optional["BackgroundTasks"] = None):
+    if background_tasks is not None:
+        background_tasks.add_task(_run_group_feature_mapping_async, job_id)
+    else:
+        loop = asyncio.get_running_loop()
+        loop.create_task(_run_group_feature_mapping_async(job_id))
+
+
+async def _run_group_feature_mapping_async(job_id: int):
+    async with _group_feature_mapping_lock:
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, _run_group_feature_mapping_job, job_id)
+
+
+def _gf_tokenize_text(value: str) -> List[str]:
+    """Split text into deduplicated tokens (camelCase-aware, lowercase, no punctuation)."""
+    text = str(value or "").strip()
+    if not text:
+        return []
+    text = re.sub(r"([a-z])([A-Z])", r"\1 \2", text)
+    text = re.sub(r"[^a-zA-Z0-9]+", " ", text.lower()).strip()
+    if not text:
+        return []
+    parts = [t for t in text.split() if len(t) > 1]
+    seen: set = set()
+    unique: List[str] = []
+    for p in parts:
+        if p not in seen:
+            seen.add(p)
+            unique.append(p)
+    return unique
+
+
+def _gf_token_overlap_score(left: List[str], right: List[str]) -> float:
+    """Jaccard-like overlap score between two token lists."""
+    if not left or not right:
+        return 0.0
+    right_set = set(right)
+    hit = sum(1 for t in left if t in right_set)
+    denom = max(1, min(len(left), len(right)))
+    return max(0.0, min(1.0, hit / denom))
+
+
+def _run_group_feature_mapping_job(job_id: int):
+    """Pull global mappings into group_features rows, resolving target_attribute + target_value."""
+    db = SessionLocal()
+    try:
+        job = db.query(models.GroupFeatureMappingJob).filter(models.GroupFeatureMappingJob.id == job_id).first()
+        if not job:
+            return
+
+        now_ts = time.time()
+        job.status = "running"
+        if not job.started_at:
+            job.started_at = now_ts
+        job.updated_at = now_ts
+        db.commit()
+
+        # Build mapping index: feature_id -> GlobalMapping
+        all_gm = db.query(models.GlobalMapping).filter(models.GlobalMapping.status == "active").all()
+        mapping_by_feature = _build_latest_mapping_by_feature(all_gm)
+
+        # Gather distinct sub-feature IDs from group_features
+        all_gf_features = db.query(models.GroupFeature.feature_id).distinct().all()
+        feature_ids = [r[0] for r in all_gf_features]
+
+        job.total_features = len(feature_ids)
+        db.commit()
+
+        updated_count = 0
+        for i, fid in enumerate(feature_ids):
+            gm = mapping_by_feature.get(fid)
+            if not gm:
+                job.processed_features = i + 1
+                job.updated_at = time.time()
+                if (i + 1) % 50 == 0:
+                    db.commit()
+                continue
+
+            target_attr = str(getattr(gm, "new_attribute_id", "") or "").strip()
+            value_mappings = getattr(gm, "value_mappings", {}) or {}
+
+            # Update all group_feature rows for this feature_id
+            gf_rows = db.query(models.GroupFeature).filter(models.GroupFeature.feature_id == fid).all()
+            for gf in gf_rows:
+                gf.target_attribute = target_attr if target_attr else None
+                option = (gf.option or "").strip()
+                if option and target_attr:
+                    # Resolve value mapping (exact match, then prefix)
+                    resolved = value_mappings.get(option)
+                    if resolved is None:
+                        prefix = option.split(" ")[0] if " " in option else None
+                        if prefix:
+                            resolved = value_mappings.get(prefix)
+                    gf.target_value = resolved if resolved else None
+                updated_count += 1
+
+            job.processed_features = i + 1
+            job.generated_rows = updated_count
+            job.updated_at = time.time()
+            if (i + 1) % 50 == 0:
+                db.commit()
+
+        job.status = "completed"
+        job.finished_at = time.time()
+        job.updated_at = time.time()
+        job.generated_rows = updated_count
+        db.commit()
+
+    except Exception as exc:
+        try:
+            job_row = db.query(models.GroupFeatureMappingJob).filter(models.GroupFeatureMappingJob.id == job_id).first()
+            if job_row:
+                job_row.status = "failed"
+                job_row.error_message = str(exc)[:500]
+                job_row.finished_at = time.time()
+                job_row.updated_at = time.time()
+                db.commit()
+        except Exception:
+            pass
+        logger.exception("Group feature mapping job %s failed", job_id)
+    finally:
+        db.close()
+
+
+@router.get("/group-features/mapping-progress")
+def get_group_feature_mapping_progress(
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    job = (
+        db.query(models.GroupFeatureMappingJob)
+        .order_by(models.GroupFeatureMappingJob.id.desc())
+        .first()
+    )
+    if not job:
+        return {"status": "idle", "isActive": False, "progress": 0, "totalFeatures": 0, "processedFeatures": 0, "generatedRows": 0}
+    is_active = job.status in ("queued", "running")
+    progress = (job.processed_features / job.total_features) if job.total_features > 0 else (1.0 if job.status == "completed" else 0)
+    return {
+        "id": int(job.id),
+        "status": job.status,
+        "isActive": is_active,
+        "progress": progress,
+        "totalFeatures": job.total_features,
+        "processedFeatures": job.processed_features,
+        "generatedRows": job.generated_rows,
+        "startedAt": job.started_at,
+        "finishedAt": job.finished_at,
+        "error": job.error_message,
+    }
+
+
+def _apply_gf_nullable_filter(query, column, param_value: Optional[str]):
+    """Apply a filter that supports '__blank__' sentinel for NULL/empty values."""
+    if not param_value:
+        return query
+    vals = [v.strip() for v in param_value.split(",") if v.strip()]
+    if not vals:
+        return query
+    has_blank = "__blank__" in vals
+    non_blank = [v for v in vals if v != "__blank__"]
+    if has_blank and non_blank:
+        query = query.filter(or_(column.in_(non_blank), column == None, column == ""))
+    elif has_blank:
+        query = query.filter(or_(column == None, column == ""))
+    elif len(non_blank) == 1:
+        query = query.filter(column == non_blank[0])
+    else:
+        query = query.filter(column.in_(non_blank))
+    return query
+
+
+@router.get("/group-features/list")
+def list_group_features(
+    search: Optional[str] = None,
+    featureGroup: Optional[str] = None,
+    featureId: Optional[str] = None,
+    valueStatus: Optional[str] = None,
+    targetAttribute: Optional[str] = None,
+    targetValue: Optional[str] = None,
+    sortBy: Optional[str] = None,
+    sortDir: Optional[str] = Query(None, regex="^(asc|desc)$"),
+    limit: int = Query(100, ge=1, le=5000),
+    offset: int = Query(0, ge=0),
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """Paginated list of group features, optionally filtered."""
+    base = db.query(models.GroupFeature)
+
+    if search:
+        if len(search) > MAX_SEARCH_LENGTH:
+            raise HTTPException(status_code=400, detail="search too long")
+        like = f"%{search}%"
+        base = base.filter(
+            or_(
+                models.GroupFeature.feature_group.ilike(like),
+                models.GroupFeature.feature_id.ilike(like),
+                models.GroupFeature.feature_desc.ilike(like),
+                models.GroupFeature.option.ilike(like),
+            )
+        )
+    if featureGroup:
+        groups = [g.strip() for g in featureGroup.split(",") if g.strip()]
+        if len(groups) == 1:
+            base = base.filter(models.GroupFeature.feature_group == groups[0])
+        elif groups:
+            base = base.filter(models.GroupFeature.feature_group.in_(groups))
+    if featureId:
+        fids = [f.strip() for f in featureId.split(",") if f.strip()]
+        if len(fids) == 1:
+            base = base.filter(models.GroupFeature.feature_id == fids[0])
+        elif fids:
+            base = base.filter(models.GroupFeature.feature_id.in_(fids))
+    if valueStatus:
+        sts = [s.strip() for s in valueStatus.split(",") if s.strip()]
+        if len(sts) == 1:
+            base = base.filter(models.GroupFeature.value_status == sts[0])
+        elif sts:
+            base = base.filter(models.GroupFeature.value_status.in_(sts))
+    base = _apply_gf_nullable_filter(base, models.GroupFeature.target_attribute, targetAttribute)
+    base = _apply_gf_nullable_filter(base, models.GroupFeature.target_value, targetValue)
+
+    total = base.count()
+
+    # Pre-compute where-used counts for ALL groups matching the filter (needed for sort-by-whereUsed)
+    all_groups = [r[0] for r in base.with_entities(models.GroupFeature.feature_group).distinct().all() if r[0]]
+    where_used_counts: dict = {}
+    for grp in all_groups:
+        sub_fids = [
+            row[0]
+            for row in db.query(models.GroupFeature.feature_id)
+            .filter(models.GroupFeature.feature_group == grp)
+            .distinct()
+            .all()
+        ]
+        if sub_fids:
+            cnt = (
+                db.query(models.BomFeature.item_id)
+                .filter(models.BomFeature.feature_id.in_(sub_fids))
+                .distinct()
+                .count()
+            )
+            where_used_counts[grp] = cnt
+        else:
+            where_used_counts[grp] = 0
+
+    # Sorting
+    sort_by_where_used = sortBy == "whereUsedCount"
+
+    _SORT_COLUMNS = {
+        "featureGroup": models.GroupFeature.feature_group,
+        "featureId": models.GroupFeature.feature_id,
+        "option": models.GroupFeature.option,
+        "tillDate": models.GroupFeature.till_date,
+        "targetAttribute": models.GroupFeature.target_attribute,
+        "targetValue": models.GroupFeature.target_value,
+        "valueStatus": models.GroupFeature.value_status,
+    }
+
+    if sort_by_where_used:
+        # Fetch all filtered IDs, sort in Python by where_used_counts, then paginate
+        all_rows = base.order_by(models.GroupFeature.feature_group, models.GroupFeature.feature_id, models.GroupFeature.option).all()
+        desc = sortDir == "desc"
+        all_rows.sort(key=lambda r: (where_used_counts.get(r.feature_group, 0), r.feature_group, r.feature_id or "", r.option or ""), reverse=desc)
+        rows = all_rows[offset:offset + limit]
+    elif sortBy and sortBy in _SORT_COLUMNS:
+        col = _SORT_COLUMNS[sortBy]
+        order = col.desc() if sortDir == "desc" else col.asc()
+        rows = base.order_by(order, models.GroupFeature.feature_group, models.GroupFeature.feature_id).offset(offset).limit(limit).all()
+    else:
+        rows = base.order_by(models.GroupFeature.feature_group, models.GroupFeature.feature_id, models.GroupFeature.option).offset(offset).limit(limit).all()
+
+    items = []
+    for r in rows:
+        items.append({
+            "id": int(r.id),
+            "featureGroup": r.feature_group,
+            "featureId": r.feature_id,
+            "featureDesc": r.feature_desc,
+            "option": r.option,
+            "optionDesc": r.option_desc,
+            "condition": r.condition,
+            "tillDate": r.till_date,
+            "targetAttribute": r.target_attribute,
+            "targetValue": r.target_value,
+            "valueStatus": r.value_status,
+            "valuelistId": r.valuelist_id,
+            "whereUsedCount": where_used_counts.get(r.feature_group, 0),
+            "suggestedAttributes": r.suggested_attributes,
+            "suggestedValues": r.suggested_values,
+        })
+
+    return {"items": items, "total": total}
+
+
+@router.get("/group-features/filters")
+def get_group_feature_filters(
+    featureGroup: Optional[str] = None,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """Return distinct filter values for group features. featureIds cascade when featureGroup is set."""
+    groups = sorted({r[0] for r in db.query(models.GroupFeature.feature_group).distinct().all() if r[0]})
+    fid_q = db.query(models.GroupFeature.feature_id)
+    if featureGroup:
+        sel_groups = [g.strip() for g in featureGroup.split(",") if g.strip()]
+        if sel_groups:
+            fid_q = fid_q.filter(models.GroupFeature.feature_group.in_(sel_groups))
+    fids = sorted({r[0] for r in fid_q.distinct().all() if r[0]})
+    statuses = sorted({r[0] for r in db.query(models.GroupFeature.value_status).distinct().all() if r[0]})
+
+    # Target attribute / value distinct values (include __blank__ sentinel)
+    ta_raw = {(r[0] or "") for r in db.query(models.GroupFeature.target_attribute).distinct().all()}
+    target_attrs = sorted([v for v in ta_raw if v])
+    if "" in ta_raw or None in ta_raw or any(r[0] is None for r in db.query(models.GroupFeature.target_attribute).filter(
+        or_(models.GroupFeature.target_attribute == None, models.GroupFeature.target_attribute == "")
+    ).limit(1).all()):
+        target_attrs.insert(0, "__blank__")
+
+    tv_raw = {(r[0] or "") for r in db.query(models.GroupFeature.target_value).distinct().all()}
+    target_vals = sorted([v for v in tv_raw if v])
+    if "" in tv_raw or None in tv_raw or any(r[0] is None for r in db.query(models.GroupFeature.target_value).filter(
+        or_(models.GroupFeature.target_value == None, models.GroupFeature.target_value == "")
+    ).limit(1).all()):
+        target_vals.insert(0, "__blank__")
+
+    return {"featureGroups": groups, "featureIds": fids, "valueStatuses": statuses, "targetAttributes": target_attrs, "targetValues": target_vals}
+
+
+@router.get("/group-features/stats")
+def get_group_feature_stats(
+    search: Optional[str] = None,
+    featureGroup: Optional[str] = None,
+    featureId: Optional[str] = None,
+    valueStatus: Optional[str] = None,
+    targetAttribute: Optional[str] = None,
+    targetValue: Optional[str] = None,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """Return summary statistics for group features (respects active filters)."""
+    base = db.query(models.GroupFeature)
+    if search:
+        if len(search) > MAX_SEARCH_LENGTH:
+            raise HTTPException(status_code=400, detail="search too long")
+        like = f"%{search}%"
+        base = base.filter(or_(
+            models.GroupFeature.feature_group.ilike(like),
+            models.GroupFeature.feature_id.ilike(like),
+            models.GroupFeature.feature_desc.ilike(like),
+            models.GroupFeature.option.ilike(like),
+        ))
+    if featureGroup:
+        gs = [g.strip() for g in featureGroup.split(",") if g.strip()]
+        if len(gs) == 1:
+            base = base.filter(models.GroupFeature.feature_group == gs[0])
+        elif gs:
+            base = base.filter(models.GroupFeature.feature_group.in_(gs))
+    if featureId:
+        fs = [f.strip() for f in featureId.split(",") if f.strip()]
+        if len(fs) == 1:
+            base = base.filter(models.GroupFeature.feature_id == fs[0])
+        elif fs:
+            base = base.filter(models.GroupFeature.feature_id.in_(fs))
+    if valueStatus:
+        ss = [s.strip() for s in valueStatus.split(",") if s.strip()]
+        if len(ss) == 1:
+            base = base.filter(models.GroupFeature.value_status == ss[0])
+        elif ss:
+            base = base.filter(models.GroupFeature.value_status.in_(ss))
+    base = _apply_gf_nullable_filter(base, models.GroupFeature.target_attribute, targetAttribute)
+    base = _apply_gf_nullable_filter(base, models.GroupFeature.target_value, targetValue)
+
+    total_rows = base.count()
+
+    # Distinct groups and sub-features within filtered set
+    id_sub = base.with_entities(models.GroupFeature.id).subquery()
+    total_groups = db.query(models.GroupFeature.feature_group).filter(
+        models.GroupFeature.id.in_(id_sub.select())
+    ).distinct().count()
+    total_sub_features = db.query(
+        models.GroupFeature.feature_group, models.GroupFeature.feature_id
+    ).filter(
+        models.GroupFeature.id.in_(id_sub.select())
+    ).distinct().count()
+
+    # Status breakdown
+    status_counts = {}
+    for row in db.query(models.GroupFeature.value_status, func.count()).filter(
+        models.GroupFeature.id.in_(id_sub.select())
+    ).group_by(models.GroupFeature.value_status).all():
+        status_counts[row[0] or "unknown"] = row[1]
+
+    # Unmapped: target_attribute is NULL or empty, excluding discontinued
+    unmapped = base.filter(
+        or_(models.GroupFeature.target_attribute == None, models.GroupFeature.target_attribute == ""),
+        models.GroupFeature.value_status != "discontinued",
+    ).count()
+
+    # Where-used: total distinct BOM items across all groups in filtered set
+    filtered_groups = [r[0] for r in base.with_entities(models.GroupFeature.feature_group).distinct().all() if r[0]]
+    total_where_used = 0
+    if filtered_groups:
+        all_fids = [r[0] for r in db.query(models.GroupFeature.feature_id).filter(
+            models.GroupFeature.feature_group.in_(filtered_groups)
+        ).distinct().all() if r[0]]
+        if all_fids:
+            total_where_used = db.query(models.BomFeature.item_id).filter(
+                models.BomFeature.feature_id.in_(all_fids)
+            ).distinct().count()
+
+    return {
+        "totalGroups": total_groups,
+        "totalSubFeatures": total_sub_features,
+        "totalValues": total_rows,
+        "statusCounts": status_counts,
+        "unmappedAttributes": unmapped,
+        "totalWhereUsed": total_where_used,
+    }
+
+
+@router.get("/group-features/by-group/{group_name:path}")
+def get_group_feature_detail(
+    group_name: str,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """Get all sub-features for a specific group feature, with target mappings."""
+    rows = (
+        db.query(models.GroupFeature)
+        .filter(models.GroupFeature.feature_group == group_name)
+        .order_by(models.GroupFeature.feature_id, models.GroupFeature.option)
+        .all()
+    )
+    items = []
+    for r in rows:
+        items.append({
+            "id": int(r.id),
+            "featureGroup": r.feature_group,
+            "featureId": r.feature_id,
+            "featureDesc": r.feature_desc,
+            "option": r.option,
+            "optionDesc": r.option_desc,
+            "condition": r.condition,
+            "tillDate": r.till_date,
+            "targetAttribute": r.target_attribute,
+            "targetValue": r.target_value,
+            "valueStatus": r.value_status,
+            "valuelistId": r.valuelist_id,
+        })
+    return {"featureGroup": group_name, "subFeatures": items, "total": len(items)}
+
+
+@router.get("/group-features/where-used/{group_name:path}")
+def get_group_feature_where_used(
+    group_name: str,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """Find all BOM items that use a specific group feature.
+
+    Matches by finding sub-feature IDs from group_features table and then
+    locating BOM items that have those feature_ids in bom_features.
+    """
+    # Get all sub-feature IDs for this group
+    sub_fids = [
+        r[0]
+        for r in db.query(models.GroupFeature.feature_id)
+        .filter(models.GroupFeature.feature_group == group_name)
+        .distinct()
+        .all()
+    ]
+    if not sub_fids:
+        return {"featureGroup": group_name, "items": [], "total": 0}
+
+    # Find BOM items that have ANY of these features
+    item_pks = (
+        db.query(models.BomFeature.item_id)
+        .filter(models.BomFeature.feature_id.in_(sub_fids))
+        .distinct()
+        .all()
+    )
+    item_pk_set = {r[0] for r in item_pks}
+
+    if not item_pk_set:
+        return {"featureGroup": group_name, "items": [], "total": 0}
+
+    bom_items = (
+        db.query(models.BomItem)
+        .filter(models.BomItem.id.in_(item_pk_set))
+        .order_by(models.BomItem.item_id)
+        .all()
+    )
+
+    items = []
+    for bi in bom_items:
+        items.append({
+            "itemId": bi.item_id,
+            "description": bi.description,
+            "category": bi.category,
+            "productType": bi.product_type,
+            "priority": bi.priority,
+        })
+
+    return {"featureGroup": group_name, "items": items, "total": len(items)}
+
+
+@router.get("/group-features/export-csv")
+def export_group_features_csv(
+    search: Optional[str] = None,
+    featureGroup: Optional[str] = None,
+    featureId: Optional[str] = None,
+    valueStatus: Optional[str] = None,
+    targetAttribute: Optional[str] = None,
+    targetValue: Optional[str] = None,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """Export current filtered group features view as CSV."""
+    import csv
+    import io
+
+    base = db.query(models.GroupFeature)
+    if search:
+        if len(search) > MAX_SEARCH_LENGTH:
+            raise HTTPException(status_code=400, detail="search too long")
+        like = f"%{search}%"
+        base = base.filter(
+            or_(
+                models.GroupFeature.feature_group.ilike(like),
+                models.GroupFeature.feature_id.ilike(like),
+                models.GroupFeature.feature_desc.ilike(like),
+                models.GroupFeature.option.ilike(like),
+            )
+        )
+    if featureGroup:
+        groups = [g.strip() for g in featureGroup.split(",") if g.strip()]
+        if len(groups) == 1:
+            base = base.filter(models.GroupFeature.feature_group == groups[0])
+        elif groups:
+            base = base.filter(models.GroupFeature.feature_group.in_(groups))
+    if featureId:
+        fids = [f.strip() for f in featureId.split(",") if f.strip()]
+        if len(fids) == 1:
+            base = base.filter(models.GroupFeature.feature_id == fids[0])
+        elif fids:
+            base = base.filter(models.GroupFeature.feature_id.in_(fids))
+    if valueStatus:
+        sts = [s.strip() for s in valueStatus.split(",") if s.strip()]
+        if len(sts) == 1:
+            base = base.filter(models.GroupFeature.value_status == sts[0])
+        elif sts:
+            base = base.filter(models.GroupFeature.value_status.in_(sts))
+    base = _apply_gf_nullable_filter(base, models.GroupFeature.target_attribute, targetAttribute)
+    base = _apply_gf_nullable_filter(base, models.GroupFeature.target_value, targetValue)
+
+    rows = base.order_by(models.GroupFeature.feature_group, models.GroupFeature.feature_id, models.GroupFeature.option).all()
+
+    # Pre-compute where-used counts per group
+    all_groups = list({r.feature_group for r in rows if r.feature_group})
+    where_used_counts: dict = {}
+    for grp in all_groups:
+        sub_fids = [row[0] for row in db.query(models.GroupFeature.feature_id).filter(
+            models.GroupFeature.feature_group == grp).distinct().all()]
+        if sub_fids:
+            cnt = db.query(models.BomFeature.item_id).filter(
+                models.BomFeature.feature_id.in_(sub_fids)).distinct().count()
+            where_used_counts[grp] = cnt
+        else:
+            where_used_counts[grp] = 0
+
+    columns = ["FeatureGroup", "WhereUsed", "Feature", "Feature Desc", "Option", "Option Desc", "Condition", "Till", "Target Attribute", "Target Value", "Status", "Value List", "Suggested Attributes", "Suggested Values"]
+
+    def iter_csv():
+        buf = io.StringIO()
+        writer = csv.writer(buf)
+        writer.writerow(columns)
+        yield buf.getvalue()
+        buf.seek(0)
+        buf.truncate(0)
+        for r in rows:
+            writer.writerow([
+                r.feature_group or "",
+                where_used_counts.get(r.feature_group, 0),
+                r.feature_id or "",
+                r.feature_desc or "",
+                r.option or "",
+                r.option_desc or "",
+                r.condition or "",
+                r.till_date or "",
+                r.target_attribute or "",
+                r.target_value or "",
+                r.value_status or "",
+                r.valuelist_id or "",
+                "; ".join(f"{s['attributeId']} ({int(s['score']*100)}%)" for s in (r.suggested_attributes or [])),
+                "; ".join(r.suggested_values or []),
+            ])
+            yield buf.getvalue()
+            buf.seek(0)
+            buf.truncate(0)
+
+    csv_headers = {"Content-Disposition": "attachment; filename=group_features_export.csv"}
+    return StreamingResponse(iter_csv(), media_type="text/csv", headers=csv_headers)
+
+
+@router.post("/group-features/update-status")
+def update_group_feature_status(
+    payload: Dict[str, Any] = Body(...),
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """Update value_status for specific group feature rows."""
+    if (getattr(current_user, "role", "") or "").strip().lower() != "admin":
+        raise HTTPException(status_code=403, detail="Admin only")
+
+    ids = payload.get("ids", [])
+    new_status = str(payload.get("valueStatus") or "").strip()
+    if not ids or new_status not in ("discontinued", "in_progress", "approved"):
+        raise HTTPException(status_code=400, detail="ids and valid valueStatus required")
+
+    updated = 0
+    for gf_id in ids:
+        row = db.query(models.GroupFeature).filter(models.GroupFeature.id == int(gf_id)).first()
+        if row:
+            row.value_status = new_status
+            updated += 1
+    db.commit()
+    return {"ok": True, "updated": updated}
+
+
+@router.post("/group-features/generate-valuelist")
+def generate_group_feature_valuelist(
+    payload: Dict[str, Any] = Body(...),
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """Generate valuelist_id entries for a specific group feature.
+
+    Only sub-features where ALL values are approved or discontinued are eligible.
+    Naming convention: groupfeature_subfeature (e.g., MOTOR_VOLTAGE).
+    """
+    if (getattr(current_user, "role", "") or "").strip().lower() != "admin":
+        raise HTTPException(status_code=403, detail="Admin only")
+
+    feature_group = str(payload.get("featureGroup") or "").strip()
+    if not feature_group:
+        raise HTTPException(status_code=400, detail="featureGroup required")
+
+    # Get all rows for this group
+    gf_rows = (
+        db.query(models.GroupFeature)
+        .filter(models.GroupFeature.feature_group == feature_group)
+        .all()
+    )
+    if not gf_rows:
+        raise HTTPException(status_code=404, detail="No group features found")
+
+    # Group by sub-feature (feature_id)
+    by_sub: Dict[str, List] = {}
+    for r in gf_rows:
+        by_sub.setdefault(r.feature_id, []).append(r)
+
+    created_vl_ids: List[str] = []
+    vl_rows_created = 0
+    skipped_features: List[str] = []
+
+    for sub_fid, sub_rows in by_sub.items():
+        # Check eligibility: all values must be approved or discontinued
+        all_final = all(
+            (r.value_status or "").strip().lower() in ("approved", "discontinued")
+            for r in sub_rows
+        )
+        if not all_final:
+            skipped_features.append(sub_fid)
+            continue
+
+        # Build valuelist_id: groupfeature_subfeature
+        vl_id = f"{feature_group}_{sub_fid}"
+
+        # Delete existing valuelist rows with this ID
+        db.query(models.ValueList).filter(models.ValueList.valuelist_id == vl_id).delete(synchronize_session=False)
+
+        # Insert new valuelist rows (only approved values, not discontinued)
+        for r in sub_rows:
+            if (r.value_status or "").strip().lower() == "discontinued":
+                continue
+            option = (r.option or "").strip()
+            if not option:
+                continue
+            target_val = (r.target_value or "").strip()
+            db.add(models.ValueList(
+                valuelist_id=vl_id,
+                valuelist_id_description=f"{feature_group} / {sub_fid}",
+                unit=None,
+                value=target_val if target_val else option,
+                value_description=r.option_desc,
+            ))
+            vl_rows_created += 1
+
+        # Update group_feature rows with the valuelist_id
+        for r in sub_rows:
+            r.valuelist_id = vl_id
+
+        created_vl_ids.append(vl_id)
+
+    db.commit()
+
+    _audit(db, current_user, "group_feature_valuelist_generate",
+           f"Generated {len(created_vl_ids)} valuelists for group '{feature_group}', skipped {len(skipped_features)} sub-features")
+
+    return {
+        "ok": True,
+        "featureGroup": feature_group,
+        "valuelistsCreated": len(created_vl_ids),
+        "valuelistRowsCreated": vl_rows_created,
+        "skippedFeatures": skipped_features,
+        "createdValuelistIds": created_vl_ids,
+    }
+
+
+# ---------------------------------------------------------------------------
+# AI Suggest – attribute + value suggestions for group features
+# ---------------------------------------------------------------------------
+
+@router.post("/group-features/suggest")
+async def trigger_group_feature_suggest(
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """Trigger a background job that computes attribute + value suggestions."""
+    if (getattr(current_user, "role", "") or "").strip().lower() != "admin":
+        raise HTTPException(status_code=403, detail="Admin only")
+
+    active = (
+        db.query(models.GroupFeatureMappingJob)
+        .filter(
+            models.GroupFeatureMappingJob.status.in_(["queued", "running"]),
+            models.GroupFeatureMappingJob.triggered_by_username.like("suggest:%"),
+        )
+        .first()
+    )
+    if active:
+        return {"ok": True, "jobId": int(active.id)}
+
+    # Clear old suggestions
+    db.query(models.GroupFeature).update(
+        {"suggested_attributes": None, "suggested_values": None},
+        synchronize_session=False,
+    )
+    db.commit()
+
+    job = models.GroupFeatureMappingJob(
+        status="queued",
+        triggered_by_user_id=str(getattr(current_user, "id", "")),
+        triggered_by_username=f"suggest:{getattr(current_user, 'username', '')}",
+        updated_at=time.time(),
+    )
+    db.add(job)
+    db.commit()
+    db.refresh(job)
+
+    _start_group_feature_suggest_job(int(job.id), background_tasks=background_tasks)
+    return {"ok": True, "jobId": int(job.id)}
+
+
+def _start_group_feature_suggest_job(job_id: int, background_tasks: Optional["BackgroundTasks"] = None):
+    if background_tasks is not None:
+        background_tasks.add_task(_run_group_feature_suggest_async, job_id)
+    else:
+        loop = asyncio.get_running_loop()
+        loop.create_task(_run_group_feature_suggest_async(job_id))
+
+
+async def _run_group_feature_suggest_async(job_id: int):
+    async with _group_feature_suggest_lock:
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, _run_group_feature_suggest_job, job_id)
+
+
+def _run_group_feature_suggest_job(job_id: int):
+    """Compute attribute + value suggestions for every group-feature row."""
+    db = SessionLocal()
+    try:
+        job = db.query(models.GroupFeatureMappingJob).filter(models.GroupFeatureMappingJob.id == job_id).first()
+        if not job:
+            return
+
+        now_ts = time.time()
+        job.status = "running"
+        if not job.started_at:
+            job.started_at = now_ts
+        job.updated_at = now_ts
+        db.commit()
+
+        # ── 1. Collect all unique (attributeId, description) from Classification ──
+        all_classes = db.query(models.Classification).all()
+        attr_map: Dict[str, str] = {}  # attributeId -> description
+        for cls_row in all_classes:
+            for attr in (cls_row.attributes or []):
+                aid = attr.get("attributeId") or attr.get("attribute_id") or ""
+                if aid and aid not in attr_map:
+                    desc = attr.get("description") or ""
+                    attr_map[aid] = desc
+
+        # Pre-tokenize each target attribute
+        attr_tokens: List[tuple] = []  # [(attributeId, description, tokens), ...]
+        for aid, desc in attr_map.items():
+            tokens = _gf_tokenize_text(f"{aid} {desc}")
+            if tokens:
+                attr_tokens.append((aid, desc, tokens))
+
+        # ── 2. Build mapping index for value suggestions ──
+        all_gm = db.query(models.GlobalMapping).filter(models.GlobalMapping.status == "active").all()
+        mapping_by_feature = _build_latest_mapping_by_feature(all_gm)
+
+        # ── 2b. Build WorkspaceMapping fallback index: (feature_id, legacy_value) -> new_value ──
+        ws_rows = db.query(
+            models.WorkspaceMapping.legacy_feature_id,
+            models.WorkspaceMapping.legacy_value,
+            models.WorkspaceMapping.new_value,
+        ).filter(
+            models.WorkspaceMapping.new_value.isnot(None),
+            models.WorkspaceMapping.new_value != "",
+        ).all()
+        ws_lookup: Dict[str, Dict[str, str]] = {}  # feature_id -> {legacy_value -> new_value}
+        for wf, wv, wnv in ws_rows:
+            fid_key = (wf or "").strip()
+            val_key = (wv or "").strip()
+            if fid_key and val_key:
+                if fid_key not in ws_lookup:
+                    ws_lookup[fid_key] = {}
+                if val_key not in ws_lookup[fid_key]:
+                    ws_lookup[fid_key][val_key] = (wnv or "").strip()
+
+        # ── 3. Gather distinct feature_ids ──
+        all_gf_features = db.query(
+            models.GroupFeature.feature_id,
+            models.GroupFeature.feature_desc,
+        ).distinct().all()
+        feature_list = [(r[0], r[1] or "") for r in all_gf_features]
+
+        job.total_features = len(feature_list)
+        db.commit()
+
+        updated_count = 0
+        for i, (fid, fdesc) in enumerate(feature_list):
+            # ── Attribute suggestions via token overlap ──
+            source_tokens = _gf_tokenize_text(f"{fid} {fdesc}")
+            scored: List[tuple] = []
+            if source_tokens and attr_tokens:
+                for aid, adesc, atk in attr_tokens:
+                    score = _gf_token_overlap_score(source_tokens, atk)
+                    if score >= 0.2:
+                        # Count absolute hits for tiebreaking (more hits = more specific)
+                        right_set = set(atk)
+                        hits = sum(1 for t in source_tokens if t in right_set)
+                        scored.append((aid, adesc, round(score, 3), hits))
+                scored.sort(key=lambda x: (-x[2], -x[3]))
+
+            top_attrs = [{"attributeId": s[0], "description": s[1], "score": s[2]} for s in scored[:3]]
+
+            # ── Value suggestions: per-row lookup ──
+            gm = mapping_by_feature.get(fid)
+            gm_vm = (getattr(gm, "value_mappings", {}) or {}) if gm else {}
+            ws_fid_map = ws_lookup.get(fid, {})
+
+            gf_rows = db.query(models.GroupFeature).filter(models.GroupFeature.feature_id == fid).all()
+            for gf in gf_rows:
+                gf.suggested_attributes = top_attrs if top_attrs else None
+
+                # Skip value suggestion if target_value already populated or row is discontinued
+                existing_val = (gf.target_value or "").strip()
+                row_status = (gf.value_status or "").strip().lower()
+                if existing_val or row_status == "discontinued":
+                    gf.suggested_values = None
+                    updated_count += 1
+                    continue
+
+                # Lookup value: try option then option_desc in GlobalMapping, fallback WorkspaceMapping
+                option = (gf.option or "").strip()
+                option_desc = (gf.option_desc or "").strip()
+                suggested_val = None
+
+                if gm_vm and option:
+                    resolved = _resolve_value_mapping(gm_vm, option)
+                    if resolved and resolved.strip():
+                        suggested_val = resolved.strip()
+                if not suggested_val and gm_vm and option_desc:
+                    resolved = _resolve_value_mapping(gm_vm, option_desc)
+                    if resolved and resolved.strip():
+                        suggested_val = resolved.strip()
+                # Fallback: WorkspaceMapping
+                if not suggested_val and option and ws_fid_map:
+                    wv = ws_fid_map.get(option)
+                    if wv:
+                        suggested_val = wv
+                if not suggested_val and option_desc and ws_fid_map:
+                    wv = ws_fid_map.get(option_desc)
+                    if wv:
+                        suggested_val = wv
+
+                # "NOT REQUIRED" is not a valid suggestion
+                if suggested_val and suggested_val.upper() == "NOT REQUIRED":
+                    suggested_val = None
+
+                gf.suggested_values = [suggested_val] if suggested_val else None
+                updated_count += 1
+
+            job.processed_features = i + 1
+            job.generated_rows = updated_count
+            job.updated_at = time.time()
+            if (i + 1) % 50 == 0:
+                db.commit()
+
+        job.status = "completed"
+        job.finished_at = time.time()
+        job.updated_at = time.time()
+        job.generated_rows = updated_count
+        db.commit()
+
+    except Exception as exc:
+        try:
+            job_row = db.query(models.GroupFeatureMappingJob).filter(models.GroupFeatureMappingJob.id == job_id).first()
+            if job_row:
+                job_row.status = "failed"
+                job_row.error_message = str(exc)[:500]
+                job_row.finished_at = time.time()
+                job_row.updated_at = time.time()
+                db.commit()
+        except Exception:
+            pass
+        logger.exception("Group feature suggest job %s failed", job_id)
+    finally:
+        db.close()
+
+
+@router.get("/group-features/suggest-progress")
+def get_group_feature_suggest_progress(
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    job = (
+        db.query(models.GroupFeatureMappingJob)
+        .filter(models.GroupFeatureMappingJob.triggered_by_username.like("suggest:%"))
+        .order_by(models.GroupFeatureMappingJob.id.desc())
+        .first()
+    )
+    if not job:
+        return {"status": "idle", "isActive": False, "progress": 0, "totalFeatures": 0, "processedFeatures": 0, "generatedRows": 0}
+    is_active = job.status in ("queued", "running")
+    progress = (job.processed_features / job.total_features) if job.total_features > 0 else (1.0 if job.status == "completed" else 0)
+    return {
+        "id": int(job.id),
+        "status": job.status,
+        "isActive": is_active,
+        "progress": progress,
+        "totalFeatures": job.total_features,
+        "processedFeatures": job.processed_features,
+        "generatedRows": job.generated_rows,
     }

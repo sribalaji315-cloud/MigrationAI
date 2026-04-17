@@ -1227,9 +1227,10 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
       const sampleTypeA = availableAttributeTypes[0] || 'type_a';
       const sampleTypeB = availableAttributeTypes[1] || sampleTypeA;
       rows = [
-        ['legacyFeatureIds', 'newAttributeId', 'attributeType', 'legacy value', 'new value'],
-        ['FRM_MAT', 'MAT_COMP', sampleTypeA, 'RED', 'RED_MAT'],
-        ['FRM_MFG', 'MAT_MFG1;MAT_MFG2', sampleTypeB, 'VIOLET', 'VIOLETNEW'],
+        ['legacyFeatureIds', 'newAttributeId', 'attributeType', 'status', 'legacy value', 'new value', 'ignored'],
+        ['FRM_MAT', 'MAT_COMP', sampleTypeA, 'active', 'RED', 'RED_MAT', 'no'],
+        ['FRM_MAT', 'MAT_COMP', sampleTypeA, 'active', 'OBSOLETE_VAL', 'OBSOLETE_VAL', 'yes'],
+        ['FRM_MFG', 'MAT_MFG1;MAT_MFG2', sampleTypeB, 'active', 'VIOLET', 'VIOLETNEW', 'no'],
       ];
     } else if (category === 'classification') {
       rows = [
@@ -1268,7 +1269,7 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
     if (category !== 'mapping') return;
 
     const allMappings = await fetchAllGlobalMappings();
-    const rows: string[][] = [['legacyFeatureIds', 'newAttributeId', 'attributeType', 'status', 'ignoredValues', 'legacy value', 'new value']];
+    const rows: string[][] = [['legacyFeatureIds', 'newAttributeId', 'attributeType', 'status', 'legacy value', 'new value', 'ignored']];
 
     allMappings.forEach(m => {
       if (!isTypeIncludedInExport(m.attributeType)) return;
@@ -1276,16 +1277,24 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
       const targetCell = m.newAttributeId || '';
       const attrTypeCell = normalizeAttributeType((m as any).attributeType);
       const statusCell = m.status || 'active';
-      const ignoredCell = (m.ignoredValues || []).join('|');
+      const ignoredSet = new Set(m.ignoredValues || []);
       const pairs = Object.entries(m.valueMappings || {});
 
-      if (!pairs.length) {
-        rows.push([featureCell, targetCell, attrTypeCell, statusCell, ignoredCell, '', '']);
+      if (!pairs.length && !ignoredSet.size) {
+        rows.push([featureCell, targetCell, attrTypeCell, statusCell, '', '', 'no']);
         return;
       }
 
       pairs.forEach(([legacyValue, newValue]) => {
-        rows.push([featureCell, targetCell, attrTypeCell, statusCell, ignoredCell, legacyValue || '', newValue || '']);
+        const isIgnored = ignoredSet.has(legacyValue) ? 'yes' : 'no';
+        rows.push([featureCell, targetCell, attrTypeCell, statusCell, legacyValue || '', newValue || '', isIgnored]);
+      });
+
+      // Export ignored values that don't already appear in valueMappings
+      ignoredSet.forEach(iv => {
+        if (!m.valueMappings || !(iv in m.valueMappings)) {
+          rows.push([featureCell, targetCell, attrTypeCell, statusCell, iv, iv, 'yes']);
+        }
       });
     });
 
@@ -1305,7 +1314,7 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
     if (category !== 'mapping') return;
 
     const allMappings = await fetchAllGlobalMappings();
-    const rows: string[][] = [['legacyFeatureId', 'newAttributeId', 'attributeType', 'status', 'ignoredValues', 'legacy value', 'new value']];
+    const rows: string[][] = [['legacyFeatureId', 'newAttributeId', 'attributeType', 'status', 'legacy value', 'new value', 'ignored']];
 
     allMappings.forEach(m => {
       if (!isTypeIncludedInExport(m.attributeType)) return;
@@ -1313,18 +1322,26 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
       const targetCell = m.newAttributeId || '';
       const attrTypeCell = normalizeAttributeType((m as any).attributeType);
       const statusCell = m.status || 'active';
-      const ignoredCell = (m.ignoredValues || []).join('|');
+      const ignoredSet = new Set(m.ignoredValues || []);
       const pairs = Object.entries(m.valueMappings || {});
       const sourceFeatures = featureIds.length ? featureIds : [''];
 
       sourceFeatures.forEach(featureId => {
-        if (!pairs.length) {
-          rows.push([featureId, targetCell, attrTypeCell, statusCell, ignoredCell, '', '']);
+        if (!pairs.length && !ignoredSet.size) {
+          rows.push([featureId, targetCell, attrTypeCell, statusCell, '', '', 'no']);
           return;
         }
 
         pairs.forEach(([legacyValue, newValue]) => {
-          rows.push([featureId, targetCell, attrTypeCell, statusCell, ignoredCell, legacyValue || '', newValue || '']);
+          const isIgnored = ignoredSet.has(legacyValue) ? 'yes' : 'no';
+          rows.push([featureId, targetCell, attrTypeCell, statusCell, legacyValue || '', newValue || '', isIgnored]);
+        });
+
+        // Export ignored values that don't already appear in valueMappings
+        ignoredSet.forEach(iv => {
+          if (!m.valueMappings || !(iv in m.valueMappings)) {
+            rows.push([featureId, targetCell, attrTypeCell, statusCell, iv, iv, 'yes']);
+          }
         });
       });
     });
@@ -1398,9 +1415,13 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
           const newValue = (r['new value'] || r['newValue'] || r['new_value'] || '').trim();
           const valuePairs = parseList(r['valuePairs'] || r['valuepairs'] || '', /\|/);
           const csvStatus = (r['status'] || '').trim().toLowerCase() || undefined;
+          // Support both: per-row "ignored" yes/no column and legacy pipe-separated "ignoredValues" column
           const csvIgnoredValues = parseList(r['ignoredValues'] || r['ignored values'] || r['ignored_values'] || '', /[|,;]/);
+          const rowIgnored = (r['ignored'] || '').trim().toLowerCase();
+          const isRowIgnored = rowIgnored === 'yes' || rowIgnored === 'true' || rowIgnored === '1';
 
           const rowValueMappings: Record<string, string> = {};
+          const rowIgnoredList: string[] = [...csvIgnoredValues];
           valuePairs.forEach(p => {
             const [from, to] = p.split(':');
             const fromVal = (from || '').trim();
@@ -1408,6 +1429,9 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
             if (fromVal) rowValueMappings[fromVal] = toVal;
           });
           if (legacyValue) {
+            if (isRowIgnored) {
+              rowIgnoredList.push(legacyValue);
+            }
             rowValueMappings[legacyValue] = newValue;
           }
 
@@ -1418,7 +1442,7 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
               attributeType,
               valueMappings: { ...rowValueMappings },
               ...(csvStatus && { status: csvStatus as any }),
-              ...(csvIgnoredValues.length && { ignoredValues: csvIgnoredValues }),
+              ...(rowIgnoredList.length && { ignoredValues: [...rowIgnoredList] }),
             });
           });
         });

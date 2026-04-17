@@ -217,6 +217,9 @@ export interface FeatureCombinationRow {
   mappingStatus: 'complete' | 'partial' | 'unmapped';
   priorities: number[];
   builtAt?: number | null;
+  footprint?: string;
+  valueListId?: string;
+  sharedFeatures?: string[];
   savedPlanStrategy?: string | null;
 }
 
@@ -561,4 +564,52 @@ export interface ValuelistApplyResult {
   valuelistRowsCreated: number;
   profilesUpdated: number;
   mappingsUpdated: number;
+}
+
+// Group Features
+export interface GroupFeatureRow {
+  id: number;
+  featureGroup: string;
+  featureId: string;
+  featureDesc: string | null;
+  option: string;
+  optionDesc: string | null;
+  condition: string | null;
+  tillDate: string | null;
+  targetAttribute: string | null;
+  targetValue: string | null;
+  valueStatus: string;
+  valuelistId: string | null;
+  whereUsedCount?: number;
+  suggestedAttributes?: { attributeId: string; description: string; score: number }[] | null;
+  suggestedValues?: string[] | null;
+}
+
+export interface GroupFeatureMappingJobProgress {
+  id?: number;
+  status: 'idle' | 'queued' | 'running' | 'completed' | 'failed';
+  isActive: boolean;
+  progress: number;
+  totalFeatures: number;
+  processedFeatures: number;
+  generatedRows: number;
+  startedAt?: number | null;
+  finishedAt?: number | null;
+  error?: string | null;
+}
+
+export interface GroupFeatureWhereUsedItem {
+  itemId: string;
+  description: string;
+  category: string;
+  productType: string;
+  priority?: number | null;
+}
+
+export interface GroupFeatureFilters {
+  featureGroups: string[];
+  featureIds: string[];
+  valueStatuses: string[];
+  targetAttributes: string[];
+  targetValues: string[];
 }

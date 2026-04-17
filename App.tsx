@@ -17,6 +17,7 @@ const BOMHierarchy = lazy(() => import('./components/BOMHierarchy'));
 const FeatureCombinations = lazy(() => import('./components/FeatureCombinations'));
 const AttributeCombinations = lazy(() => import('./components/AttributeCombinations'));
 const MigrationManifest = lazy(() => import('./components/MigrationManifest'));
+const GroupFeatures = lazy(() => import('./components/GroupFeatures'));
 
 const LazyFallback = () => (
   <div className="flex items-center justify-center p-8">
@@ -60,6 +61,7 @@ const App: React.FC = () => {
   const [showFeatureCombinations, setShowFeatureCombinations] = useState(false);
   const [showAttributeCombinations, setShowAttributeCombinations] = useState(false);
   const [showMigrationManifest, setShowMigrationManifest] = useState(false);
+  const [showGroupFeatures, setShowGroupFeatures] = useState(false);
   const [showUnmappedOnlyInSidebar, setShowUnmappedOnlyInSidebar] = useState(false);
   const [featureFlags, setFeatureFlags] = useState<FeatureFlags>(() => ({
     useNewClassTargetMapping: import.meta.env.VITE_USE_NEW_CLASS_TARGET_MAPPING === 'true',
@@ -715,6 +717,9 @@ const App: React.FC = () => {
         onOpenMigrationManifest={() => {
           setShowMigrationManifest(true);
         }}
+        onOpenGroupFeatures={() => {
+          setShowGroupFeatures(true);
+        }}
         mappingGenerationProgress={mappingGenerationProgress}
         onRetriggerGeneration={handleRetriggerGeneration}
         onRevertAllToGlobal={handleRevertAllToGlobal}
@@ -873,6 +878,15 @@ const App: React.FC = () => {
             <MigrationManifest
               currentUser={currentUser}
               onClose={() => setShowMigrationManifest(false)}
+            />
+          </Suspense>
+        )}
+
+        {showGroupFeatures && (
+          <Suspense fallback={<LazyFallback />}>
+            <GroupFeatures
+              currentUser={currentUser}
+              onClose={() => setShowGroupFeatures(false)}
             />
           </Suspense>
         )}

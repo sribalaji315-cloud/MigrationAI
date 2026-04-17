@@ -25,7 +25,7 @@ const DonutStat: React.FC<DonutStatProps> = ({ label, value, primaryColor, secon
   const circumference = 2 * Math.PI * radius;
   const clamped = Math.max(0, Math.min(1, value));
   const offset = circumference * (1 - clamped);
-  const percent = Math.round(clamped * 100);
+  const percent = clamped >= 1 ? 100 : Math.floor(clamped * 100);
 
   return (
     <div className="flex flex-col items-center gap-2 p-4 bg-white rounded-2xl border border-slate-100 shadow-sm">
