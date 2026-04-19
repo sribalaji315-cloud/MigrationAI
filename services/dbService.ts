@@ -1617,6 +1617,43 @@ export const dbService = {
     return resp.json();
   },
 
+  async bulkUpdateGroupFeatureTarget(ids: number[], updates: { targetAttribute?: string | null; targetValue?: string | null }): Promise<{ ok: boolean; updated: number }> {
+    const resp = await this._fetchWithRefresh(`${SQL_ENDPOINT}/group-features/bulk-update-target`, {
+      method: 'POST',
+      headers: { ...this._authHeaders(), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ids, ...updates }),
+    });
+    if (!resp.ok) { const t = await resp.text(); throw new Error(`Bulk update failed: ${resp.status} ${t}`); }
+    this._invalidateCache();
+    return resp.json();
+  },
+
+  async updateGroupFeatureRow(id: number, updates: { targetAttribute?: string | null; targetValue?: string | null; valueStatus?: string }): Promise<{ ok: boolean; id: number; targetAttribute: string | null; targetValue: string | null; valueStatus: string }> {
+    const resp = await this._fetchWithRefresh(`${SQL_ENDPOINT}/group-features/update-row`, {
+      method: 'POST',
+      headers: { ...this._authHeaders(), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id, ...updates }),
+    });
+    if (!resp.ok) { const t = await resp.text(); throw new Error(`Update row failed: ${resp.status} ${t}`); }
+    this._invalidateCache();
+    return resp.json();
+  },
+
+  async fetchGroupFeatureClassificationAttributes(search?: string, limit = 20): Promise<{ items: { attributeId: string; description: string; classCount: number }[] }> {
+    const params = new URLSearchParams();
+    if (search) params.set('search', search);
+    params.set('limit', String(limit));
+    return this._cachedFetch(`${SQL_ENDPOINT}/group-features/classification-attributes?${params}`, { headers: this._authHeaders(), _ttlMs: 10_000 });
+  },
+
+  async fetchGroupFeatureAttributeValues(attributeId: string, search?: string, limit = 20): Promise<{ items: { value: string; description: string }[] }> {
+    const params = new URLSearchParams();
+    params.set('attributeId', attributeId);
+    if (search) params.set('search', search);
+    params.set('limit', String(limit));
+    return this._cachedFetch(`${SQL_ENDPOINT}/group-features/attribute-values?${params}`, { headers: this._authHeaders(), _ttlMs: 10_000 });
+  },
+
   async generateGroupFeatureValuelist(featureGroup: string): Promise<{ ok: boolean; valuelistsCreated: number; valuelistRowsCreated: number; skippedFeatures: string[]; createdValuelistIds: string[] }> {
     const resp = await this._fetchWithRefresh(`${SQL_ENDPOINT}/group-features/generate-valuelist`, {
       method: 'POST',

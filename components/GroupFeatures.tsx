@@ -178,6 +178,194 @@ const statusColor = (s: string) => {
   }
 };
 
+const STATUS_OPTIONS = ['in_progress', 'approved', 'discontinued', 'ignored'];
+
+/* ---------- Inline searchable dropdown ---------- */
+interface InlineDropdownProps {
+  value: string | null;
+  onSave: (val: string | null) => void;
+  fetchOptions: (search: string) => Promise<{ label: string; description?: string }[]>;
+  suggestions?: { label: string; description?: string; score?: number }[];
+  placeholder?: string;
+  emptyColor?: string;
+  autoOpen?: boolean;
+}
+
+const InlineSearchDropdown: React.FC<InlineDropdownProps> = ({ value, onSave, fetchOptions, suggestions, placeholder, emptyColor, autoOpen }) => {
+  const [open, setOpen] = useState(!!autoOpen);
+  const [search, setSearch] = useState('');
+  const [options, setOptions] = useState<{ label: string; description?: string }[]>([]);
+  const [loading, setLoading] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+  const inputRef = useRef<HTMLInputElement>(null);
+  const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(() => {
+    const handler = (e: MouseEvent) => {
+      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
+    };
+    document.addEventListener('mousedown', handler);
+    return () => document.removeEventListener('mousedown', handler);
+  }, []);
+
+  const loadOptions = useCallback(async (q: string) => {
+    setLoading(true);
+    try {
+      const opts = await fetchOptions(q);
+      setOptions(opts);
+    } catch { setOptions([]); }
+    setLoading(false);
+  }, [fetchOptions]);
+
+  // Auto-load options when autoOpen
+  useEffect(() => {
+    if (autoOpen) { loadOptions(''); setTimeout(() => inputRef.current?.focus(), 50); }
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const handleOpen = useCallback(() => {
+    setOpen(true);
+    setSearch('');
+    loadOptions('');
+    setTimeout(() => inputRef.current?.focus(), 50);
+  }, [loadOptions]);
+
+  const handleSearch = useCallback((val: string) => {
+    setSearch(val);
+    if (debounceRef.current) clearTimeout(debounceRef.current);
+    debounceRef.current = setTimeout(() => loadOptions(val), 200);
+  }, [loadOptions]);
+
+  const handleSelect = useCallback((val: string) => {
+    onSave(val);
+    setOpen(false);
+  }, [onSave]);
+
+  const handleClear = useCallback((e: React.MouseEvent) => {
+    e.stopPropagation();
+    onSave(null);
+    setOpen(false);
+  }, [onSave]);
+
+  // Merge suggestions at top, then fetched options (deduped)
+  const mergedOptions = useMemo(() => {
+    const result: { label: string; description?: string; isSuggestion?: boolean }[] = [];
+    const seen = new Set<string>();
+    if (suggestions && suggestions.length > 0) {
+      for (const s of suggestions.slice(0, 3)) {
+        result.push({ label: s.label, description: s.description || (s.score != null ? `${Math.round(s.score * 100)}% match` : ''), isSuggestion: true });
+        seen.add(s.label.toUpperCase());
+      }
+    }
+    for (const o of options) {
+      if (!seen.has(o.label.toUpperCase())) {
+        result.push(o);
+        seen.add(o.label.toUpperCase());
+      }
+    }
+    return result;
+  }, [suggestions, options]);
+
+  if (!open) {
+    return (
+      <span
+        onClick={(e) => { e.stopPropagation(); handleOpen(); }}
+        className={`cursor-pointer px-1 py-0.5 rounded text-xs hover:ring-1 hover:ring-blue-400 inline-block min-w-[40px] ${value ? 'font-medium text-emerald-700' : (emptyColor || 'text-red-400 bg-red-50')}`}
+        title="Click to edit"
+      >
+        {value || placeholder || '—'}
+      </span>
+    );
+  }
+
+  return (
+    <div ref={ref} className="relative z-40" onClick={e => e.stopPropagation()}>
+      <input
+        ref={inputRef}
+        type="text"
+        value={search}
+        onChange={e => handleSearch(e.target.value)}
+        placeholder="Search…"
+        className="w-full px-1.5 py-0.5 border border-blue-400 rounded text-xs focus:outline-none focus:ring-1 focus:ring-blue-500 min-w-[120px]"
+      />
+      <div className="absolute top-full left-0 mt-0.5 w-64 bg-white border border-slate-200 rounded-md shadow-lg max-h-48 overflow-auto">
+        {loading ? (
+          <div className="px-3 py-2 text-xs text-slate-400 flex items-center gap-1">
+            <div className="w-3 h-3 border-2 border-blue-400 border-t-transparent rounded-full animate-spin" />
+            Loading…
+          </div>
+        ) : mergedOptions.length === 0 ? (
+          <div className="px-3 py-2 text-xs text-slate-400">No matches</div>
+        ) : (
+          <>
+            {mergedOptions.map((o, i) => (
+              <div
+                key={`${o.label}-${i}`}
+                onClick={() => handleSelect(o.label)}
+                className={`px-3 py-1.5 hover:bg-blue-50 cursor-pointer text-xs flex items-center justify-between ${o.isSuggestion ? 'bg-amber-50 border-l-2 border-amber-400' : ''} ${o.label === value ? 'bg-emerald-50 font-semibold' : ''}`}
+              >
+                <span className="truncate">{o.label}</span>
+                {o.description && <span className="text-[9px] text-slate-400 ml-2 shrink-0">{o.description}</span>}
+              </div>
+            ))}
+          </>
+        )}
+        {value && (
+          <div className="border-t border-slate-100 px-3 py-1.5">
+            <button onClick={handleClear} className="text-[9px] text-red-500 hover:text-red-700 font-bold uppercase">Clear</button>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+};
+
+/* ---------- Inline status dropdown ---------- */
+interface InlineStatusDropdownProps {
+  value: string;
+  onSave: (val: string) => void;
+}
+
+const InlineStatusDropdown: React.FC<InlineStatusDropdownProps> = ({ value, onSave }) => {
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const handler = (e: MouseEvent) => {
+      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
+    };
+    document.addEventListener('mousedown', handler);
+    return () => document.removeEventListener('mousedown', handler);
+  }, []);
+
+  if (!open) {
+    return (
+      <span
+        onClick={(e) => { e.stopPropagation(); setOpen(true); }}
+        className={`inline-block px-1.5 py-0.5 rounded text-[9px] font-bold uppercase cursor-pointer hover:ring-1 hover:ring-blue-400 ${statusColor(value)}`}
+        title="Click to change status"
+      >
+        {value}
+      </span>
+    );
+  }
+
+  return (
+    <div ref={ref} className="relative z-40" onClick={e => e.stopPropagation()}>
+      <div className="absolute top-0 left-0 bg-white border border-slate-200 rounded-md shadow-lg py-1 w-32">
+        {STATUS_OPTIONS.map(s => (
+          <div
+            key={s}
+            onClick={() => { onSave(s); setOpen(false); }}
+            className={`px-3 py-1.5 cursor-pointer text-xs font-bold uppercase hover:bg-slate-50 ${s === value ? 'bg-blue-50' : ''}`}
+          >
+            <span className={`inline-block px-1.5 py-0.5 rounded ${statusColor(s)}`}>{s}</span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+};
+
 /* ---------- Column definitions ---------- */
 type ColAlign = 'left' | 'center';
 interface ColDef {
@@ -186,8 +374,15 @@ interface ColDef {
   sortKey?: string;          // if sortable
   align?: ColAlign;
   defaultVisible?: boolean;  // default true
-  render: (r: GroupFeatureRow) => React.ReactNode;
+  render: (r: GroupFeatureRow, callbacks?: ColumnCallbacks) => React.ReactNode;
   className?: string;
+}
+
+interface ColumnCallbacks {
+  onUpdateRow: (id: number, updates: { targetAttribute?: string | null; targetValue?: string | null; valueStatus?: string }) => void;
+  fetchAttrOptions: (search: string) => Promise<{ label: string; description?: string }[]>;
+  fetchValOptions: (attributeId: string, search: string) => Promise<{ label: string; description?: string }[]>;
+  isAdmin: boolean;
 }
 
 const ALL_COLUMNS: ColDef[] = [
@@ -203,9 +398,46 @@ const ALL_COLUMNS: ColDef[] = [
   { key: 'optionDesc', label: 'Option Desc', render: r => <span className="text-slate-400 truncate max-w-[120px] block">{r.optionDesc || '—'}</span> },
   { key: 'condition', label: 'Condition', defaultVisible: false, render: r => <span className="text-slate-400">{r.condition || '—'}</span> },
   { key: 'tillDate', label: 'Till Date', sortKey: 'tillDate', render: r => <span className="text-slate-400 whitespace-nowrap">{r.tillDate || '—'}</span> },
-  { key: 'targetAttr', label: 'Target Attr', sortKey: 'targetAttribute', render: r => <span className="font-medium text-emerald-700 whitespace-nowrap">{r.targetAttribute || '—'}</span> },
-  { key: 'targetValue', label: 'Target Value', sortKey: 'targetValue', render: r => <span className="text-slate-600">{r.targetValue || '—'}</span> },
-  { key: 'status', label: 'Status', sortKey: 'valueStatus', align: 'center', render: r => <span className={`inline-block px-1.5 py-0.5 rounded text-[9px] font-bold uppercase ${statusColor(r.valueStatus)}`}>{r.valueStatus}</span> },
+  { key: 'targetAttr', label: 'Target Attr', sortKey: 'targetAttribute', render: (r, cb) => {
+    if (!cb?.isAdmin) return <span className="font-medium text-emerald-700 whitespace-nowrap">{r.targetAttribute || '—'}</span>;
+    const suggestions = r.suggestedAttributes?.map(s => ({ label: s.attributeId, description: s.description, score: s.score })) || [];
+    // If existing mapping exists, make it the top suggestion
+    if (r.targetAttribute) {
+      const existing = { label: r.targetAttribute, description: 'Current mapping', score: 1 };
+      const filtered = suggestions.filter(s => s.label.toUpperCase() !== r.targetAttribute!.toUpperCase());
+      suggestions.length = 0;
+      suggestions.push(existing, ...filtered);
+    }
+    return <InlineSearchDropdown
+      value={r.targetAttribute}
+      suggestions={suggestions.slice(0, 3)}
+      fetchOptions={cb.fetchAttrOptions}
+      onSave={(val) => cb.onUpdateRow(r.id, { targetAttribute: val })}
+      placeholder="Set attribute"
+    />;
+  }},
+  { key: 'targetValue', label: 'Target Value', sortKey: 'targetValue', render: (r, cb) => {
+    if (!cb?.isAdmin) return <span className="text-slate-600">{r.targetValue || '—'}</span>;
+    if (!r.targetAttribute) return <span className="text-slate-300 text-[9px]">Set attr first</span>;
+    const suggestions = r.suggestedValues?.map(v => ({ label: v })) || [];
+    if (r.targetValue) {
+      const existing = { label: r.targetValue, description: 'Current value' };
+      const filtered = suggestions.filter(s => s.label.toUpperCase() !== r.targetValue!.toUpperCase());
+      suggestions.length = 0;
+      suggestions.push(existing, ...filtered);
+    }
+    return <InlineSearchDropdown
+      value={r.targetValue}
+      suggestions={suggestions.slice(0, 3)}
+      fetchOptions={(search) => cb.fetchValOptions(r.targetAttribute!, search)}
+      onSave={(val) => cb.onUpdateRow(r.id, { targetValue: val })}
+      placeholder="Set value"
+    />;
+  }},
+  { key: 'status', label: 'Status', sortKey: 'valueStatus', align: 'center', render: (r, cb) => {
+    if (!cb?.isAdmin) return <span className={`inline-block px-1.5 py-0.5 rounded text-[9px] font-bold uppercase ${statusColor(r.valueStatus)}`}>{r.valueStatus}</span>;
+    return <InlineStatusDropdown value={r.valueStatus} onSave={(val) => cb.onUpdateRow(r.id, { valueStatus: val })} />;
+  }},
   { key: 'valueList', label: 'Value List', render: r => <span className="text-slate-400 whitespace-nowrap">{r.valuelistId || '—'}</span> },
   { key: 'suggestedAttrs', label: 'Suggested Attrs', defaultVisible: false, render: r => {
     const sa = r.suggestedAttributes;
@@ -244,6 +476,11 @@ const GroupFeatures: React.FC<GroupFeaturesProps> = ({ currentUser, onClose }) =
   const [search, setSearch] = useState('');
   const [searchInput, setSearchInput] = useState('');
   const [isLoading, setIsLoading] = useState(false);
+
+  // Selection state for bulk actions
+  const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set());
+  const [showBulkAttr, setShowBulkAttr] = useState(false);
+  const [isBulkUpdating, setIsBulkUpdating] = useState(false);
 
   // Filter state
   const [filterGroups, setFilterGroups] = useState<string[]>([]);
@@ -361,6 +598,81 @@ const GroupFeatures: React.FC<GroupFeaturesProps> = ({ currentUser, onClose }) =
 
   useEffect(() => { fetchStats(); }, [fetchStats]);
 
+  // --- Inline editing callbacks ---
+  const handleUpdateRow = useCallback(async (id: number, updates: { targetAttribute?: string | null; targetValue?: string | null; valueStatus?: string }) => {
+    try {
+      const result = await dbService.updateGroupFeatureRow(id, updates);
+      setRows(prev => prev.map(r => r.id === id ? {
+        ...r,
+        targetAttribute: result.targetAttribute,
+        targetValue: result.targetValue,
+        valueStatus: result.valueStatus,
+      } : r));
+      setSubFeatures(prev => prev.map(r => r.id === id ? {
+        ...r,
+        targetAttribute: result.targetAttribute,
+        targetValue: result.targetValue,
+        valueStatus: result.valueStatus,
+      } : r));
+      fetchStats();
+    } catch (err: any) {
+      alert(`Update failed: ${err.message}`);
+    }
+  }, [fetchStats]);
+
+  const fetchAttrOptions = useCallback(async (search: string): Promise<{ label: string; description?: string }[]> => {
+    const result = await dbService.fetchGroupFeatureClassificationAttributes(search || undefined, 20);
+    return result.items.map(a => ({ label: a.attributeId, description: a.description || `${a.classCount} classes` }));
+  }, []);
+
+  const fetchValOptions = useCallback(async (attributeId: string, search: string): Promise<{ label: string; description?: string }[]> => {
+    const result = await dbService.fetchGroupFeatureAttributeValues(attributeId, search || undefined, 20);
+    return result.items.map(v => ({ label: v.value, description: v.description }));
+  }, []);
+
+  const columnCallbacks = useMemo<ColumnCallbacks>(() => ({
+    onUpdateRow: handleUpdateRow,
+    fetchAttrOptions,
+    fetchValOptions,
+    isAdmin,
+  }), [handleUpdateRow, fetchAttrOptions, fetchValOptions, isAdmin]);
+
+  // --- Bulk update handler ---
+  const handleBulkSetAttribute = useCallback(async (targetAttribute: string | null) => {
+    if (selectedIds.size === 0) return;
+    setIsBulkUpdating(true);
+    try {
+      const ids = Array.from(selectedIds);
+      await dbService.bulkUpdateGroupFeatureTarget(ids, { targetAttribute });
+      // Update local rows
+      setRows(prev => prev.map(r => selectedIds.has(r.id) ? { ...r, targetAttribute } : r));
+      setSubFeatures(prev => prev.map(r => selectedIds.has(r.id) ? { ...r, targetAttribute } : r));
+      setSelectedIds(new Set());
+      setShowBulkAttr(false);
+      fetchStats();
+    } catch (err: any) {
+      alert(`Bulk update failed: ${err.message}`);
+    } finally {
+      setIsBulkUpdating(false);
+    }
+  }, [selectedIds, fetchStats]);
+
+  const toggleSelectAll = useCallback(() => {
+    if (selectedIds.size === rows.length) {
+      setSelectedIds(new Set());
+    } else {
+      setSelectedIds(new Set(rows.map(r => r.id)));
+    }
+  }, [rows, selectedIds]);
+
+  const toggleSelectRow = useCallback((id: number) => {
+    setSelectedIds(prev => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id); else next.add(id);
+      return next;
+    });
+  }, []);
+
   // --- Fetch list ---
   const handleSort = useCallback((col: string) => {
     if (sortBy === col) {
@@ -472,7 +784,7 @@ const GroupFeatures: React.FC<GroupFeaturesProps> = ({ currentUser, onClose }) =
 
       const result = await dbService.uploadGroupFeatures(payloadRows);
       setUploadResult(result);
-      fetchList(0, search, filterGroups, filterFeatureIds, filterStatuses);
+      fetchList(0, search, filterGroups, filterFeatureIds, filterStatuses, sortBy, sortDir);
       setPage(0);
       loadFilters();
     } catch (err: any) {
@@ -731,6 +1043,39 @@ const GroupFeatures: React.FC<GroupFeaturesProps> = ({ currentUser, onClose }) =
         </div>
       )}
 
+      {/* Bulk action bar */}
+      {isAdmin && selectedIds.size > 0 && (
+        <div className="shrink-0 bg-blue-50 border-b border-blue-200 px-5 py-2 flex items-center gap-3">
+          <span className="text-[9px] font-black text-blue-700 uppercase tracking-wider">{selectedIds.size} selected</span>
+          <button
+            onClick={() => setShowBulkAttr(true)}
+            className="px-3 py-1 bg-blue-600 text-white rounded text-[9px] font-black uppercase tracking-wider hover:bg-blue-700"
+          >
+            Set Target Attribute
+          </button>
+          <button
+            onClick={() => setSelectedIds(new Set())}
+            className="px-3 py-1 bg-slate-200 text-slate-600 rounded text-[9px] font-black uppercase tracking-wider hover:bg-slate-300"
+          >
+            Clear Selection
+          </button>
+          {showBulkAttr && (
+            <div className="relative">
+              <InlineSearchDropdown
+                value={null}
+                fetchOptions={fetchAttrOptions}
+                onSave={(val) => { if (val) handleBulkSetAttribute(val); else setShowBulkAttr(false); }}
+                placeholder="Search attribute…"
+                autoOpen
+              />
+              {isBulkUpdating && (
+                <span className="ml-2 text-[9px] text-blue-600 font-bold animate-pulse">Updating…</span>
+              )}
+            </div>
+          )}
+        </div>
+      )}
+
       {/* Filters */}
       <div className="shrink-0 bg-slate-50 border-b border-slate-200 px-5 py-2 flex items-center gap-3 flex-wrap">
         <form onSubmit={handleSearchSubmit} className="flex items-center gap-1">
@@ -779,6 +1124,16 @@ const GroupFeatures: React.FC<GroupFeaturesProps> = ({ currentUser, onClose }) =
             <table className="w-full text-xs">
               <thead className="bg-slate-50 sticky top-0 z-10">
                 <tr>
+                  {isAdmin && (
+                    <th className="px-2 py-2 border-b border-slate-200 w-8">
+                      <input
+                        type="checkbox"
+                        checked={rows.length > 0 && selectedIds.size === rows.length}
+                        onChange={toggleSelectAll}
+                        className="rounded border-slate-300 text-blue-600 focus:ring-blue-500"
+                      />
+                    </th>
+                  )}
                   {activeCols.map(c => (
                     <th
                       key={c.key}
@@ -793,7 +1148,7 @@ const GroupFeatures: React.FC<GroupFeaturesProps> = ({ currentUser, onClose }) =
               <tbody>
                 {isLoading ? (
                   <tr>
-                    <td colSpan={activeCols.length} className="text-center py-8">
+                    <td colSpan={activeCols.length + (isAdmin ? 1 : 0)} className="text-center py-8">
                       <div className="flex items-center justify-center gap-2 text-slate-400">
                         <div className="w-4 h-4 border-2 border-blue-500 border-t-transparent rounded-full animate-spin" />
                         Loading…
@@ -802,7 +1157,7 @@ const GroupFeatures: React.FC<GroupFeaturesProps> = ({ currentUser, onClose }) =
                   </tr>
                 ) : rows.length === 0 ? (
                   <tr>
-                    <td colSpan={activeCols.length} className="text-center py-8 text-slate-400">
+                    <td colSpan={activeCols.length + (isAdmin ? 1 : 0)} className="text-center py-8 text-slate-400">
                       {total === 0 ? 'No group features uploaded yet. Upload a CSV to start.' : 'No matches found.'}
                     </td>
                   </tr>
@@ -812,8 +1167,19 @@ const GroupFeatures: React.FC<GroupFeaturesProps> = ({ currentUser, onClose }) =
                     onClick={() => handleSelectGroup(r.featureGroup)}
                     className={`cursor-pointer border-b border-slate-100 transition-colors ${selectedGroup === r.featureGroup ? 'bg-blue-50 hover:bg-blue-100' : 'hover:bg-slate-50'}`}
                   >
+                    {isAdmin && (
+                      <td className="px-2 py-1.5">
+                        <input
+                          type="checkbox"
+                          checked={selectedIds.has(r.id)}
+                          onChange={(e) => { e.stopPropagation(); toggleSelectRow(r.id); }}
+                          onClick={(e) => e.stopPropagation()}
+                          className="rounded border-slate-300 text-blue-600 focus:ring-blue-500"
+                        />
+                      </td>
+                    )}
                     {activeCols.map(c => (
-                      <td key={c.key} className={`px-3 py-1.5${c.align === 'center' ? ' text-center' : ''}`}>{c.render(r)}</td>
+                      <td key={c.key} className={`px-3 py-1.5${c.align === 'center' ? ' text-center' : ''}`}>{c.render(r, columnCallbacks)}</td>
                     ))}
                   </tr>
                 ))}

@@ -8502,7 +8502,7 @@ def update_group_feature_status(
 
     ids = payload.get("ids", [])
     new_status = str(payload.get("valueStatus") or "").strip()
-    if not ids or new_status not in ("discontinued", "in_progress", "approved"):
+    if not ids or new_status not in ("discontinued", "in_progress", "approved", "ignored"):
         raise HTTPException(status_code=400, detail="ids and valid valueStatus required")
 
     updated = 0
@@ -8513,6 +8513,144 @@ def update_group_feature_status(
             updated += 1
     db.commit()
     return {"ok": True, "updated": updated}
+
+
+@router.post("/group-features/bulk-update-target")
+def bulk_update_group_feature_target(
+    payload: Dict[str, Any] = Body(...),
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """Bulk-update target_attribute (and optionally target_value) for multiple group feature rows."""
+    if (getattr(current_user, "role", "") or "").strip().lower() != "admin":
+        raise HTTPException(status_code=403, detail="Admin only")
+
+    ids = payload.get("ids", [])
+    if not ids:
+        raise HTTPException(status_code=400, detail="ids is required")
+
+    target_attribute = payload.get("targetAttribute")
+    target_value = payload.get("targetValue")
+
+    if target_attribute is None and target_value is None:
+        raise HTTPException(status_code=400, detail="targetAttribute or targetValue required")
+
+    updated = 0
+    for gf_id in ids:
+        row = db.query(models.GroupFeature).filter(models.GroupFeature.id == int(gf_id)).first()
+        if row:
+            if target_attribute is not None:
+                row.target_attribute = (str(target_attribute).strip() or None) if target_attribute else None
+            if target_value is not None:
+                row.target_value = (str(target_value).strip() or None) if target_value else None
+            updated += 1
+    db.commit()
+    return {"ok": True, "updated": updated}
+
+
+@router.post("/group-features/update-row")
+def update_group_feature_row(
+    payload: Dict[str, Any] = Body(...),
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """Update target_attribute, target_value, and/or value_status for a single group feature row."""
+    if (getattr(current_user, "role", "") or "").strip().lower() != "admin":
+        raise HTTPException(status_code=403, detail="Admin only")
+
+    row_id = payload.get("id")
+    if not row_id:
+        raise HTTPException(status_code=400, detail="id is required")
+
+    row = db.query(models.GroupFeature).filter(models.GroupFeature.id == int(row_id)).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Row not found")
+
+    if "targetAttribute" in payload:
+        row.target_attribute = (str(payload["targetAttribute"]).strip() or None) if payload["targetAttribute"] else None
+    if "targetValue" in payload:
+        row.target_value = (str(payload["targetValue"]).strip() or None) if payload["targetValue"] else None
+    if "valueStatus" in payload:
+        new_status = str(payload["valueStatus"]).strip()
+        if new_status not in ("discontinued", "in_progress", "approved", "ignored"):
+            raise HTTPException(status_code=400, detail="Invalid status")
+        row.value_status = new_status
+
+    db.commit()
+    db.refresh(row)
+    return {
+        "ok": True,
+        "id": row.id,
+        "targetAttribute": row.target_attribute,
+        "targetValue": row.target_value,
+        "valueStatus": row.value_status,
+    }
+
+
+@router.get("/group-features/classification-attributes")
+def get_group_feature_classification_attributes(
+    search: Optional[str] = None,
+    limit: int = 20,
+    db: Session = Depends(get_db),
+):
+    """Return distinct classification attribute IDs, optionally filtered by search, limited to `limit`."""
+    search_lower = (search or "").strip().lower()[:200]
+    all_cls = db.query(models.Classification).all()
+    attr_freq: Dict[str, int] = {}
+    attr_canonical: Dict[str, str] = {}
+    attr_desc: Dict[str, str] = {}
+    for cls_row in all_cls:
+        for attr in (cls_row.attributes or []):
+            aid = attr.get("attributeId") or attr.get("attribute_id") or ""
+            if not aid:
+                continue
+            key = aid.upper().replace(" ", "")
+            if search_lower and search_lower not in aid.lower():
+                continue
+            attr_freq[key] = attr_freq.get(key, 0) + 1
+            if key not in attr_canonical:
+                attr_canonical[key] = aid
+                attr_desc[key] = attr.get("description") or ""
+    sorted_keys = sorted(attr_freq.keys(), key=lambda k: -attr_freq[k])
+    items = []
+    for key in sorted_keys[:limit]:
+        items.append({"attributeId": attr_canonical[key], "description": attr_desc[key], "classCount": attr_freq[key]})
+    return {"items": items}
+
+
+@router.get("/group-features/attribute-values")
+def get_group_feature_attribute_values(
+    attributeId: str,
+    search: Optional[str] = None,
+    limit: int = 20,
+    db: Session = Depends(get_db),
+):
+    """Return allowed values for a given attribute across all classifications."""
+    attr_key = attributeId.strip().upper().replace(" ", "")
+    search_lower = (search or "").strip().lower()[:200]
+    all_cls = db.query(models.Classification).all()
+    value_set: Dict[str, str] = {}  # upper key -> canonical
+    value_desc: Dict[str, str] = {}
+    for cls_row in all_cls:
+        for attr in (cls_row.attributes or []):
+            aid = attr.get("attributeId") or attr.get("attribute_id") or ""
+            if not aid or aid.upper().replace(" ", "") != attr_key:
+                continue
+            for v in (attr.get("allowedValues") or []):
+                if not v:
+                    continue
+                vkey = v.upper().strip()
+                if search_lower and search_lower not in v.lower():
+                    continue
+                if vkey not in value_set:
+                    value_set[vkey] = v
+                    descs = attr.get("valueDescriptions") or {}
+                    value_desc[vkey] = descs.get(v, "")
+    sorted_vals = sorted(value_set.keys())
+    items = []
+    for vkey in sorted_vals[:limit]:
+        items.append({"value": value_set[vkey], "description": value_desc.get(vkey, "")})
+    return {"items": items}
 
 
 @router.post("/group-features/generate-valuelist")
