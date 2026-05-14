@@ -543,7 +543,9 @@ const GroupFeatures: React.FC<GroupFeaturesProps> = ({ currentUser, onClose }) =
   const [rightPanelWidth, setRightPanelWidth] = useState(380);
   const draggingRef = useRef(false);
 
-  const isAdmin = (currentUser.role === 'admin');
+  // All authenticated users have full write access to Group Features.
+  // The 3 header buttons (Upload CSV, Apply Mappings, AI Suggest) are gated separately below using currentUser.role.
+  const isAdmin = true;
   const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
 
   // --- Resize ---
@@ -922,7 +924,7 @@ const GroupFeatures: React.FC<GroupFeaturesProps> = ({ currentUser, onClose }) =
           )}
         </div>
         <div className="flex items-center gap-2">
-          {isAdmin && (
+          {currentUser.role === 'admin' && (
             <>
               <input ref={fileInputRef} type="file" accept=".csv" className="hidden" onChange={handleUpload} />
               <button

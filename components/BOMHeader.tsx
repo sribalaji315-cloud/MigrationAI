@@ -307,6 +307,17 @@ const BOMHeader: React.FC<BOMHeaderProps> = ({ onRegenerate, isRefreshing, onIns
               {opt.label}
             </button>
           ))}
+          <div className="h-6 w-px bg-slate-200 mx-1"></div>
+          <button
+            type="button"
+            onClick={onOpenGroupFeatures}
+            className="flex items-center gap-1.5 px-2.5 py-1.5 bg-amber-50 text-amber-700 border border-amber-100 hover:bg-amber-100 rounded-md text-[9px] font-black transition-all whitespace-nowrap uppercase tracking-wider"
+          >
+            <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10" />
+            </svg>
+            Group Features
+          </button>
           {currentUser.role === 'admin' && (
             <>
               <div className="h-6 w-px bg-slate-200 mx-1"></div>
@@ -363,17 +374,6 @@ const BOMHeader: React.FC<BOMHeaderProps> = ({ onRegenerate, isRefreshing, onIns
                       <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6M7 4h7l5 5v11a2 2 0 01-2 2H7a2 2 0 01-2-2V6a2 2 0 012-2z" />
                     </svg>
                     Migration Manifest
-                  </button>
-
-                  <button 
-                    type="button"
-                    onClick={onOpenGroupFeatures}
-                    className="flex items-center gap-1.5 px-2.5 py-1.5 bg-amber-50 text-amber-700 border border-amber-100 hover:bg-amber-100 rounded-md text-[9px] font-black transition-all whitespace-nowrap uppercase tracking-wider"
-                  >
-                    <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10" />
-                    </svg>
-                    Group Features
                   </button>
 
                   <button 

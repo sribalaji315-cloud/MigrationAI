@@ -7797,9 +7797,6 @@ def upload_group_features(
     Values with a tillDate are stored with value_status='discontinued'.
     All other values default to 'in_progress'.
     """
-    if (getattr(current_user, "role", "") or "").strip().lower() != "admin":
-        raise HTTPException(status_code=403, detail="Admin only")
-
     # Clear existing group features before re-upload
     db.query(models.GroupFeature).delete(synchronize_session=False)
     db.commit()
@@ -7853,9 +7850,6 @@ def trigger_group_feature_mapping(
     current_user: models.User = Depends(get_current_user),
 ):
     """Trigger a batch job that pulls GlobalMapping into the group_features table."""
-    if (getattr(current_user, "role", "") or "").strip().lower() != "admin":
-        raise HTTPException(status_code=403, detail="Admin only")
-
     active = (
         db.query(models.GroupFeatureMappingJob)
         .filter(models.GroupFeatureMappingJob.status.in_(["queued", "running"]))
@@ -8499,9 +8493,6 @@ def update_group_feature_status(
     current_user: models.User = Depends(get_current_user),
 ):
     """Update value_status for specific group feature rows."""
-    if (getattr(current_user, "role", "") or "").strip().lower() != "admin":
-        raise HTTPException(status_code=403, detail="Admin only")
-
     ids = payload.get("ids", [])
     new_status = str(payload.get("valueStatus") or "").strip()
     if not ids or new_status not in GROUP_FEATURE_VALUE_STATUSES:
@@ -8524,9 +8515,6 @@ def bulk_update_group_feature_target(
     current_user: models.User = Depends(get_current_user),
 ):
     """Bulk-update target_attribute (and optionally target_value) for multiple group feature rows."""
-    if (getattr(current_user, "role", "") or "").strip().lower() != "admin":
-        raise HTTPException(status_code=403, detail="Admin only")
-
     ids = payload.get("ids", [])
     if not ids:
         raise HTTPException(status_code=400, detail="ids is required")
@@ -8557,9 +8545,6 @@ def update_group_feature_row(
     current_user: models.User = Depends(get_current_user),
 ):
     """Update target_attribute, target_value, and/or value_status for a single group feature row."""
-    if (getattr(current_user, "role", "") or "").strip().lower() != "admin":
-        raise HTTPException(status_code=403, detail="Admin only")
-
     row_id = payload.get("id")
     if not row_id:
         raise HTTPException(status_code=400, detail="id is required")
@@ -8666,9 +8651,6 @@ def generate_group_feature_valuelist(
     Only sub-features where ALL values are approved or discontinued are eligible.
     Naming convention: groupfeature_subfeature (e.g., MOTOR_VOLTAGE).
     """
-    if (getattr(current_user, "role", "") or "").strip().lower() != "admin":
-        raise HTTPException(status_code=403, detail="Admin only")
-
     feature_group = str(payload.get("featureGroup") or "").strip()
     if not feature_group:
         raise HTTPException(status_code=400, detail="featureGroup required")
@@ -8756,9 +8738,6 @@ async def trigger_group_feature_suggest(
     current_user: models.User = Depends(get_current_user),
 ):
     """Trigger a background job that computes attribute + value suggestions."""
-    if (getattr(current_user, "role", "") or "").strip().lower() != "admin":
-        raise HTTPException(status_code=403, detail="Admin only")
-
     active = (
         db.query(models.GroupFeatureMappingJob)
         .filter(
