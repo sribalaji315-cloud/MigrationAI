@@ -7781,6 +7781,8 @@ def valuelist_strategy_apply(
 # Group Features
 # ---------------------------------------------------------------------------
 
+GROUP_FEATURE_VALUE_STATUSES = {"discontinued", "in_progress", "review", "approved", "ignored"}
+
 
 @router.post("/group-features/upload")
 def upload_group_features(
@@ -8502,7 +8504,7 @@ def update_group_feature_status(
 
     ids = payload.get("ids", [])
     new_status = str(payload.get("valueStatus") or "").strip()
-    if not ids or new_status not in ("discontinued", "in_progress", "approved", "ignored"):
+    if not ids or new_status not in GROUP_FEATURE_VALUE_STATUSES:
         raise HTTPException(status_code=400, detail="ids and valid valueStatus required")
 
     updated = 0
@@ -8572,7 +8574,7 @@ def update_group_feature_row(
         row.target_value = (str(payload["targetValue"]).strip() or None) if payload["targetValue"] else None
     if "valueStatus" in payload:
         new_status = str(payload["valueStatus"]).strip()
-        if new_status not in ("discontinued", "in_progress", "approved", "ignored"):
+        if new_status not in GROUP_FEATURE_VALUE_STATUSES:
             raise HTTPException(status_code=400, detail="Invalid status")
         row.value_status = new_status
 

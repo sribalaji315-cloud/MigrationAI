@@ -210,7 +210,7 @@ class GroupFeature(Base):
     till_date = Column(String, nullable=True)
     target_attribute = Column(String, nullable=True)
     target_value = Column(String, nullable=True)
-    value_status = Column(String, index=True, nullable=False, default="in_progress")  # discontinued|in_progress|approved
+    value_status = Column(String, index=True, nullable=False, default="in_progress")  # discontinued|in_progress|review|approved|ignored
     valuelist_id = Column(String, index=True, nullable=True)
     suggested_attributes = Column(JSON, nullable=True)  # [{attributeId, description, score}, ...]
     suggested_values = Column(JSON, nullable=True)       # [value1, value2, value3]

@@ -173,12 +173,13 @@ const statusColor = (s: string) => {
   switch (s) {
     case 'discontinued': return 'bg-red-100 text-red-700';
     case 'approved': return 'bg-emerald-100 text-emerald-700';
+    case 'review': return 'bg-cyan-100 text-cyan-700';
     case 'ignored': return 'bg-slate-100 text-slate-500';
     default: return 'bg-amber-100 text-amber-700';
   }
 };
 
-const STATUS_OPTIONS = ['in_progress', 'approved', 'discontinued', 'ignored'];
+const STATUS_OPTIONS = ['in_progress', 'review', 'approved', 'discontinued', 'ignored'];
 
 /* ---------- Inline searchable dropdown ---------- */
 interface InlineDropdownProps {
