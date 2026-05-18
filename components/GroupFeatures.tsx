@@ -481,6 +481,7 @@ const GroupFeatures: React.FC<GroupFeaturesProps> = ({ currentUser, onClose }) =
   // Selection state for bulk actions
   const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set());
   const [showBulkAttr, setShowBulkAttr] = useState(false);
+  const [showBulkStatus, setShowBulkStatus] = useState(false);
   const [isBulkUpdating, setIsBulkUpdating] = useState(false);
 
   // Filter state
@@ -640,26 +641,6 @@ const GroupFeatures: React.FC<GroupFeaturesProps> = ({ currentUser, onClose }) =
     isAdmin,
   }), [handleUpdateRow, fetchAttrOptions, fetchValOptions, isAdmin]);
 
-  // --- Bulk update handler ---
-  const handleBulkSetAttribute = useCallback(async (targetAttribute: string | null) => {
-    if (selectedIds.size === 0) return;
-    setIsBulkUpdating(true);
-    try {
-      const ids = Array.from(selectedIds);
-      await dbService.bulkUpdateGroupFeatureTarget(ids, { targetAttribute });
-      // Update local rows
-      setRows(prev => prev.map(r => selectedIds.has(r.id) ? { ...r, targetAttribute } : r));
-      setSubFeatures(prev => prev.map(r => selectedIds.has(r.id) ? { ...r, targetAttribute } : r));
-      setSelectedIds(new Set());
-      setShowBulkAttr(false);
-      fetchStats();
-    } catch (err: any) {
-      alert(`Bulk update failed: ${err.message}`);
-    } finally {
-      setIsBulkUpdating(false);
-    }
-  }, [selectedIds, fetchStats]);
-
   const toggleSelectAll = useCallback(() => {
     if (selectedIds.size === rows.length) {
       setSelectedIds(new Set());
@@ -715,6 +696,48 @@ const GroupFeatures: React.FC<GroupFeaturesProps> = ({ currentUser, onClose }) =
       setIsLoading(false);
     }
   }, []);
+
+  const clearBulkSelection = useCallback(() => {
+    setSelectedIds(new Set());
+    setShowBulkAttr(false);
+    setShowBulkStatus(false);
+  }, []);
+
+  // --- Bulk update handlers ---
+  const handleBulkSetAttribute = useCallback(async (targetAttribute: string | null) => {
+    if (selectedIds.size === 0) return;
+    setIsBulkUpdating(true);
+    try {
+      const ids = Array.from(selectedIds);
+      await dbService.bulkUpdateGroupFeatureTarget(ids, { targetAttribute });
+      setRows(prev => prev.map(r => selectedIds.has(r.id) ? { ...r, targetAttribute } : r));
+      setSubFeatures(prev => prev.map(r => selectedIds.has(r.id) ? { ...r, targetAttribute } : r));
+      clearBulkSelection();
+      fetchStats();
+    } catch (err: any) {
+      alert(`Bulk update failed: ${err.message}`);
+    } finally {
+      setIsBulkUpdating(false);
+    }
+  }, [selectedIds, clearBulkSelection, fetchStats]);
+
+  const handleBulkSetStatus = useCallback(async (valueStatus: string) => {
+    if (selectedIds.size === 0) return;
+    setIsBulkUpdating(true);
+    try {
+      const ids = Array.from(selectedIds);
+      await dbService.updateGroupFeatureStatus(ids, valueStatus);
+      setRows(prev => prev.map(r => selectedIds.has(r.id) ? { ...r, valueStatus } : r));
+      setSubFeatures(prev => prev.map(r => selectedIds.has(r.id) ? { ...r, valueStatus } : r));
+      clearBulkSelection();
+      fetchStats();
+      await fetchList(page, search, filterGroups, filterFeatureIds, filterStatuses, sortBy, sortDir, filterTargetAttrs, filterTargetVals);
+    } catch (err: any) {
+      alert(`Bulk status update failed: ${err.message}`);
+    } finally {
+      setIsBulkUpdating(false);
+    }
+  }, [selectedIds, clearBulkSelection, fetchStats, fetchList, page, search, filterGroups, filterFeatureIds, filterStatuses, sortBy, sortDir, filterTargetAttrs, filterTargetVals]);
 
   useEffect(() => {
     fetchList(page, search, filterGroups, filterFeatureIds, filterStatuses, sortBy, sortDir, filterTargetAttrs, filterTargetVals);
@@ -1051,13 +1074,22 @@ const GroupFeatures: React.FC<GroupFeaturesProps> = ({ currentUser, onClose }) =
         <div className="shrink-0 bg-blue-50 border-b border-blue-200 px-5 py-2 flex items-center gap-3">
           <span className="text-[9px] font-black text-blue-700 uppercase tracking-wider">{selectedIds.size} selected</span>
           <button
-            onClick={() => setShowBulkAttr(true)}
+            onClick={() => { setShowBulkAttr(true); setShowBulkStatus(false); }}
+            disabled={isBulkUpdating}
             className="px-3 py-1 bg-blue-600 text-white rounded text-[9px] font-black uppercase tracking-wider hover:bg-blue-700"
           >
             Set Target Attribute
           </button>
           <button
-            onClick={() => setSelectedIds(new Set())}
+            onClick={() => { setShowBulkStatus(true); setShowBulkAttr(false); }}
+            disabled={isBulkUpdating}
+            className="px-3 py-1 bg-emerald-600 text-white rounded text-[9px] font-black uppercase tracking-wider hover:bg-emerald-700"
+          >
+            Set Status
+          </button>
+          <button
+            onClick={clearBulkSelection}
+            disabled={isBulkUpdating}
             className="px-3 py-1 bg-slate-200 text-slate-600 rounded text-[9px] font-black uppercase tracking-wider hover:bg-slate-300"
           >
             Clear Selection
@@ -1071,6 +1103,26 @@ const GroupFeatures: React.FC<GroupFeaturesProps> = ({ currentUser, onClose }) =
                 placeholder="Search attribute…"
                 autoOpen
               />
+              {isBulkUpdating && (
+                <span className="ml-2 text-[9px] text-blue-600 font-bold animate-pulse">Updating…</span>
+              )}
+            </div>
+          )}
+          {showBulkStatus && (
+            <div className="relative">
+              <div className="absolute top-full left-0 mt-1 bg-white border border-slate-200 rounded-md shadow-lg py-1 w-36 z-30">
+                {STATUS_OPTIONS.map(status => (
+                  <button
+                    key={status}
+                    type="button"
+                    onClick={() => handleBulkSetStatus(status)}
+                    disabled={isBulkUpdating}
+                    className="block w-full text-left px-3 py-1.5 text-xs font-bold uppercase hover:bg-slate-50 disabled:opacity-50"
+                  >
+                    <span className={`inline-block px-1.5 py-0.5 rounded ${statusColor(status)}`}>{status}</span>
+                  </button>
+                ))}
+              </div>
               {isBulkUpdating && (
                 <span className="ml-2 text-[9px] text-blue-600 font-bold animate-pulse">Updating…</span>
               )}
