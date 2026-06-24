@@ -8120,7 +8120,8 @@ def list_group_features(
             cnt = (
                 db.query(models.BomFeature.item_id)
                 .filter(models.BomFeature.feature_id.in_(sub_fids))
-                .distinct()
+                .group_by(models.BomFeature.item_id)
+                .having(func.count(models.BomFeature.feature_id.distinct()) == len(sub_fids))
                 .count()
             )
             where_used_counts[grp] = cnt
@@ -8280,17 +8281,28 @@ def get_group_feature_stats(
         models.GroupFeature.value_status != "discontinued",
     ).count()
 
-    # Where-used: total distinct BOM items across all groups in filtered set
+    # Where-used: total distinct BOM items across all groups in filtered set.
+    # Per group, an item counts only if it uses ALL of that group's sub-features
+    # (intersection). The overall total is the union of those per-group item sets.
     filtered_groups = [r[0] for r in base.with_entities(models.GroupFeature.feature_group).distinct().all() if r[0]]
     total_where_used = 0
     if filtered_groups:
-        all_fids = [r[0] for r in db.query(models.GroupFeature.feature_id).filter(
-            models.GroupFeature.feature_group.in_(filtered_groups)
-        ).distinct().all() if r[0]]
-        if all_fids:
-            total_where_used = db.query(models.BomFeature.item_id).filter(
-                models.BomFeature.feature_id.in_(all_fids)
-            ).distinct().count()
+        where_used_item_ids: set = set()
+        for grp in filtered_groups:
+            grp_fids = [r[0] for r in db.query(models.GroupFeature.feature_id).filter(
+                models.GroupFeature.feature_group == grp
+            ).distinct().all() if r[0]]
+            if not grp_fids:
+                continue
+            rows = (
+                db.query(models.BomFeature.item_id)
+                .filter(models.BomFeature.feature_id.in_(grp_fids))
+                .group_by(models.BomFeature.item_id)
+                .having(func.count(models.BomFeature.feature_id.distinct()) == len(grp_fids))
+                .all()
+            )
+            where_used_item_ids.update(r[0] for r in rows)
+        total_where_used = len(where_used_item_ids)
 
     return {
         "totalGroups": total_groups,
@@ -8356,11 +8368,14 @@ def get_group_feature_where_used(
     if not sub_fids:
         return {"featureGroup": group_name, "items": [], "total": 0}
 
-    # Find BOM items that have ANY of these features
+    # Find BOM items that have ALL of these features (intersection).
+    # Group by item, count how many distinct sub-feature IDs each item has,
+    # and keep only items that have every sub-feature in the group.
     item_pks = (
         db.query(models.BomFeature.item_id)
         .filter(models.BomFeature.feature_id.in_(sub_fids))
-        .distinct()
+        .group_by(models.BomFeature.item_id)
+        .having(func.count(models.BomFeature.feature_id.distinct()) == len(sub_fids))
         .all()
     )
     item_pk_set = {r[0] for r in item_pks}
@@ -8447,7 +8462,10 @@ def export_group_features_csv(
             models.GroupFeature.feature_group == grp).distinct().all()]
         if sub_fids:
             cnt = db.query(models.BomFeature.item_id).filter(
-                models.BomFeature.feature_id.in_(sub_fids)).distinct().count()
+                models.BomFeature.feature_id.in_(sub_fids)
+            ).group_by(models.BomFeature.item_id).having(
+                func.count(models.BomFeature.feature_id.distinct()) == len(sub_fids)
+            ).count()
             where_used_counts[grp] = cnt
         else:
             where_used_counts[grp] = 0
