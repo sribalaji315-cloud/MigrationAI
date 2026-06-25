@@ -441,6 +441,85 @@ const LegacyFilterDropdown = ({
   );
 };
 
+const MetaFilterDropdown = ({
+  value,
+  options,
+  onChange,
+  placeholder,
+}: {
+  value: string;
+  options: string[];
+  onChange: (val: string) => void;
+  placeholder: string;
+}) => {
+  const [isOpen, setIsOpen] = useState(false);
+  const wrapperRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    const handleClickOutside = (event: MouseEvent) => {
+      if (wrapperRef.current && !wrapperRef.current.contains(event.target as Node)) {
+        setIsOpen(false);
+      }
+    };
+    document.addEventListener('mousedown', handleClickOutside);
+    return () => document.removeEventListener('mousedown', handleClickOutside);
+  }, []);
+
+  return (
+    <div ref={wrapperRef} className="relative">
+      <button
+        type="button"
+        onClick={() => setIsOpen(o => !o)}
+        className="w-36 h-7 px-2 pr-6 rounded-lg border border-slate-200 bg-white text-[9px] font-black text-slate-600 uppercase tracking-widest flex items-center justify-between shadow-sm hover:bg-slate-50"
+      >
+        <span className="truncate">
+          {value.trim() ? value : placeholder}
+        </span>
+        <span className="absolute right-1.5 top-1/2 -translate-y-1/2 text-slate-400">
+          <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M19 9l-7 7-7-7" />
+          </svg>
+        </span>
+      </button>
+
+      {isOpen && (
+        <div className="absolute z-40 mt-1 w-44 bg-white border border-slate-200 rounded-lg shadow-lg max-h-64 overflow-hidden">
+          <div className="max-h-60 overflow-y-auto">
+            <button
+              type="button"
+              onClick={() => {
+                onChange('');
+                setIsOpen(false);
+              }}
+              className="w-full text-left px-3 py-1.5 text-[9px] font-black uppercase tracking-tight hover:bg-indigo-50 text-slate-400 truncate"
+            >
+              All
+            </button>
+            {options.map((opt) => (
+              <button
+                key={opt}
+                type="button"
+                onClick={() => {
+                  onChange(opt);
+                  setIsOpen(false);
+                }}
+                className={`w-full text-left px-3 py-1.5 text-[9px] font-black uppercase tracking-tight hover:bg-indigo-50 truncate ${
+                  value === opt ? 'bg-indigo-50 text-indigo-700' : 'text-slate-700'
+                }`}
+              >
+                {opt}
+              </button>
+            ))}
+            {options.length === 0 && (
+              <div className="px-3 py-2 text-[9px] font-bold text-slate-400 text-center">No data</div>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
+
 const ValueSelector = ({
   value,
   options,
@@ -649,6 +728,8 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
   const [mlPredictions, setMlPredictions] = useState<MLPrediction[]>([]);
   const [legacyFilter, setLegacyFilter] = useState('');
   const [showUnmappedOnly, setShowUnmappedOnly] = useState(false);
+  const [feasibilityFilter, setFeasibilityFilter] = useState('');
+  const [valueStatusFilter, setValueStatusFilter] = useState('');
   const [expandedFeatures, setExpandedFeatures] = useState<Record<string, boolean>>({});
   const [unmappedTargetsExpanded, setUnmappedTargetsExpanded] = useState(true);
   const isEditingRef = useRef(false);
@@ -736,6 +817,8 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
       if (itemChanged) {
         setLegacyFilter('');
         setShowUnmappedOnly(false);
+        setFeasibilityFilter('');
+        setValueStatusFilter('');
         setExpandedFeatures({});
         // Auto-enable class view when item has an assigned class
         if (assignedClassId && assignedClassId !== 'UNCLASSIFIED') {
@@ -752,6 +835,8 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
       setManualInputs({});
       setLegacyFilter('');
       setShowUnmappedOnly(false);
+      setFeasibilityFilter('');
+      setValueStatusFilter('');
       setExpandedFeatures({});
     }
   }, [item, assignedClassId, localItemMappings]);
@@ -963,6 +1048,44 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
     });
     return Array.from(set).sort((a, b) => a.localeCompare(b));
   }, [item]);
+
+  const metaFilterOptions = useMemo(() => {
+    if (!item) return { feasibility: [] as string[], valueStatus: [] as string[] };
+
+    const globalByFeature: Record<string, GlobalMapping[]> = {};
+    engineeringGlobalMappings.forEach(m => {
+      m.legacyFeatureIds.forEach(fid => {
+        if (!globalByFeature[fid]) globalByFeature[fid] = [];
+        globalByFeature[fid].push(m);
+      });
+    });
+
+    const localByFeature: Record<string, any> = {};
+    stagedLocalMappings.forEach(m => {
+      m.legacyFeatureIds.forEach(fid => {
+        localByFeature[fid] = m;
+      });
+    });
+
+    const feasibilitySet = new Set<string>();
+    const valueStatusSet = new Set<string>();
+
+    item.features.forEach(f => {
+      const localOverride = localByFeature[f.featureId];
+      const globalMappingsForFeature = globalByFeatureMap[f.featureId] || globalByFeature[f.featureId] || [];
+      const effectiveMapping = localOverride || globalMappingsForFeature[0] || null;
+      f.values.forEach(v => {
+        const vm = effectiveMapping?.valueMeta?.[v];
+        if (vm?.feasibility) feasibilitySet.add(vm.feasibility);
+        if (vm?.valueStatus) valueStatusSet.add(vm.valueStatus);
+      });
+    });
+
+    return {
+      feasibility: Array.from(feasibilitySet).sort((a, b) => a.localeCompare(b)),
+      valueStatus: Array.from(valueStatusSet).sort((a, b) => a.localeCompare(b)),
+    };
+  }, [item, engineeringGlobalMappings, stagedLocalMappings, globalByFeatureMap]);
 
   const unmappedStats = useMemo(() => {
     if (!item) return { attributes: 0, values: 0, totalAttributes: 0, totalValues: 0 };
@@ -1242,6 +1365,11 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
         || (globalMappingsForFeature[0]?.attributeType)
         || '';
 
+      // Preserve per-value metadata (condition/feasibility/valueStatus) so it stays
+      // visible while the user is editing. It is keyed by legacy value and is
+      // independent of the chosen target attribute.
+      const preservedValueMeta = existingLocal?.valueMeta || globalRef?.valueMeta;
+
       return [
         ...filtered,
         {
@@ -1249,6 +1377,7 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
           newAttributeId: attrId,
           attributeType: preservedAttrType,
           valueMappings: nextValueMappings,
+          valueMeta: preservedValueMeta,
           mappedFrom: 'local' as const,
         },
       ];
@@ -1268,6 +1397,7 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
           newAttributeId: globalRef?.newAttributeId || '',
           attributeType: globalRef?.attributeType || '',
           valueMappings: globalRef ? { ...globalRef.valueMappings, [legacyVal]: newVal } : { [legacyVal]: newVal },
+          valueMeta: globalRef?.valueMeta,
           mappedFrom: 'local' as const,
         });
       } else {
@@ -1280,6 +1410,7 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
             newAttributeId: existingMapping.newAttributeId,
             attributeType: existingMapping.attributeType || '',
             valueMappings: { ...existingMapping.valueMappings, [legacyVal]: newVal },
+            valueMeta: existingMapping.valueMeta,
             mappedFrom: 'local' as const,
           });
         } else {
@@ -1487,6 +1618,24 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
                     </div>
                   )}
 
+                  {metaFilterOptions.feasibility.length > 0 && (
+                    <MetaFilterDropdown
+                      value={feasibilityFilter}
+                      options={metaFilterOptions.feasibility}
+                      onChange={(val) => setFeasibilityFilter(val)}
+                      placeholder="Feasibility..."
+                    />
+                  )}
+
+                  {metaFilterOptions.valueStatus.length > 0 && (
+                    <MetaFilterDropdown
+                      value={valueStatusFilter}
+                      options={metaFilterOptions.valueStatus}
+                      onChange={(val) => setValueStatusFilter(val)}
+                      placeholder="Value status..."
+                    />
+                  )}
+
                   <div className="flex items-center gap-2">
                     <button
                       type="button"
@@ -1651,6 +1800,18 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
               return null;
             }
 
+            if (feasibilityFilter || valueStatusFilter) {
+              const anyValueMatches = f.values.some(v => {
+                const vm = effectiveMapping?.valueMeta?.[v];
+                const feasOk = !feasibilityFilter || (vm?.feasibility || '') === feasibilityFilter;
+                const statusOk = !valueStatusFilter || (vm?.valueStatus || '') === valueStatusFilter;
+                return feasOk && statusOk;
+              });
+              if (!anyValueMatches) {
+                return null;
+              }
+            }
+
             let candidateValuesForAttribute = attributeCandidateValues[selectedAttribute] || [];
             if (useNewClassTargetMapping && (stagedClassId || 'UNCLASSIFIED') !== 'UNCLASSIFIED') {
               const activeClass = classes.find(c => c.classId === (stagedClassId || 'UNCLASSIFIED'));
@@ -1802,10 +1963,23 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
                           targetValueDescription = descMap[mappedValue] || '';
                         }
 
+                        // Per-row metadata sourced from workspace_mappings (via grouped GlobalMapping.valueMeta)
+                        const valueMeta = effectiveMapping?.valueMeta?.[v];
+                        const rowCondition = (valueMeta?.condition ?? f.condition) || '';
+                        const rowFeasibility = valueMeta?.feasibility || '';
+                        const rowValueStatus = valueMeta?.valueStatus || '';
+
+                        if (feasibilityFilter && rowFeasibility !== feasibilityFilter) {
+                          return null;
+                        }
+                        if (valueStatusFilter && rowValueStatus !== valueStatusFilter) {
+                          return null;
+                        }
+
                         return (
                           <div
                             key={`${item.itemId}-${f.featureId}-row-${vidx}`}
-                            className="grid grid-cols-[1fr_0.8fr_auto_1fr_0.8fr] gap-2 items-center"
+                            className="grid grid-cols-[1fr_0.8fr_auto_1fr_0.8fr_0.7fr_auto_auto] gap-2 items-center"
                           >
                             {/* Source value */}
                             <div className="px-3 py-2 bg-slate-900 text-white rounded-lg text-[9px] font-black uppercase tracking-tight truncate max-w-full">
@@ -1841,6 +2015,37 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
                             {/* Target value description */}
                             <div className="px-2 py-2 bg-slate-50 text-slate-500 rounded-lg text-[8px] font-medium normal-case tracking-normal truncate min-h-[32px] border border-slate-100" title={targetValueDescription}>
                               {targetValueDescription || ''}
+                            </div>
+                            {/* Condition */}
+                            <div
+                              className="px-2 py-2 bg-indigo-50/60 text-indigo-600 rounded-lg text-[8px] font-bold normal-case tracking-normal truncate min-h-[32px] border border-indigo-100"
+                              title={rowCondition ? `Condition: ${rowCondition}` : 'No condition'}
+                            >
+                              {rowCondition || <span className="text-slate-300 font-medium">—</span>}
+                            </div>
+                            {/* Feasibility */}
+                            <div
+                              className={`px-2 py-2 rounded-lg text-[8px] font-black uppercase tracking-tight text-center min-h-[32px] flex items-center justify-center border w-14 ${
+                                rowFeasibility === 'Yes'
+                                  ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
+                                  : rowFeasibility === 'No'
+                                    ? 'bg-rose-50 text-rose-600 border-rose-200'
+                                    : 'bg-slate-50 text-slate-300 border-slate-100'
+                              }`}
+                              title={rowFeasibility ? `Feasibility: ${rowFeasibility}` : 'Feasibility not set'}
+                            >
+                              {rowFeasibility || '—'}
+                            </div>
+                            {/* Value status */}
+                            <div
+                              className={`px-2 py-2 rounded-lg text-[8px] font-black uppercase tracking-tight text-center min-h-[32px] flex items-center justify-center border w-20 ${
+                                rowValueStatus
+                                  ? 'bg-amber-50 text-amber-700 border-amber-200'
+                                  : 'bg-slate-50 text-slate-300 border-slate-100'
+                              }`}
+                              title={rowValueStatus ? `Value status: ${rowValueStatus}` : 'No value status'}
+                            >
+                              {rowValueStatus || '—'}
                             </div>
                           </div>
                         );

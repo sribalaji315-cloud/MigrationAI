@@ -2100,6 +2100,7 @@ def get_workspace_mappings_for_item(
             "formula": (row.formula or "").strip() or None,
             "mappedFrom": source,
             "valueStatus": row.value_status,
+            "feasibility": row.feasibility,
             "signedOnByUserId": row.signed_on_by_user_id,
             "signedOnByUsername": row.signed_on_by_username,
             "signedOnAt": row.signed_on_at,

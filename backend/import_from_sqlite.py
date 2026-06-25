@@ -275,7 +275,6 @@ def run_import(cfg: dict, *, dry_run: bool = False, force: bool = False, wipe: b
                         f"    Feature(feature_id={gf['feature_id']!r}, "
                         f"values={payload!r})"
                     )
-                    )
                 features_created += len(grouped_features)
                 items_created += 1
                 continue

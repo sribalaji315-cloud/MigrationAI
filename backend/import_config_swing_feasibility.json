@@ -1,0 +1,24 @@
+{
+    "source_db_path": "C:\\Users\\ISA2\\OneDrive - HAWORTH INC\\Downloads\\migration app inputs\\sqlite.db",
+
+    "parent_table": "SwingExpansions",
+    "parent_pk_column": "Id",
+    "parent_item_column": "ITEM",
+
+    "child_table": "SwingExpansionValues",
+    "child_fk_column": "SwingExpansionId",
+    "child_feature_column": "Feature",
+    "child_value_column": "Option",
+
+    "child_feasible_column": "feasible",
+    "child_condition_column": "Condition",
+
+    "feasible_enum_map": {
+        "1": "Yes",
+        "2": "No",
+        "3": "Review",
+        "4": "Conditional"
+    },
+
+    "preserve_condition_when_empty": true
+}

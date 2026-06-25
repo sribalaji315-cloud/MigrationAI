@@ -93,6 +93,8 @@ export interface GlobalMapping {
   legacyFeatureIds: string[];
   newAttributeId: string;
   valueMappings: Record<string, string>;
+  // Per-legacy-value metadata (condition/feasibility/valueStatus) sourced from workspace_mappings rows.
+  valueMeta?: Record<string, { condition?: string | null; feasibility?: string | null; valueStatus?: string | null }>;
   attributeType: MappingAttributeType;
   mappedFrom?: 'global' | 'local';
   status?: 'active' | 'deprecated' | 'ignored';
@@ -146,6 +148,7 @@ export interface WorkspaceMappingRow {
   formula?: string;
   mappedFrom?: string;
   valueStatus?: 'discontinued' | 'ignored' | 'deprecated' | null;
+  feasibility?: string | null;
   signedOnByUserId?: string | null;
   signedOnByUsername?: string | null;
   signedOnAt?: number | null;

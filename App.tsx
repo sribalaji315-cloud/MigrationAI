@@ -205,12 +205,19 @@ const App: React.FC = () => {
             attributeType: row.attributeType || '',
             mappedFrom: (row.mappedFrom as GlobalMapping['mappedFrom']) || 'global',
             valueMappings: {},
+            valueMeta: {},
           };
           grouped[key] = m;
         }
         if (row.legacyValue !== '' || row.newValue !== '') {
           m.valueMappings[row.legacyValue] = row.newValue;
         }
+        if (!m.valueMeta) m.valueMeta = {};
+        m.valueMeta[row.legacyValue] = {
+          condition: row.condition ?? null,
+          feasibility: row.feasibility ?? null,
+          valueStatus: row.valueStatus ?? null,
+        };
       }
       setDbState(prev => prev ? {
         ...prev,
