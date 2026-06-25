@@ -18,6 +18,7 @@ const FeatureCombinations = lazy(() => import('./components/FeatureCombinations'
 const AttributeCombinations = lazy(() => import('./components/AttributeCombinations'));
 const MigrationManifest = lazy(() => import('./components/MigrationManifest'));
 const GroupFeatures = lazy(() => import('./components/GroupFeatures'));
+const ProductViewer = lazy(() => import('./components/ProductViewer'));
 
 const LazyFallback = () => (
   <div className="flex items-center justify-center p-8">
@@ -62,6 +63,7 @@ const App: React.FC = () => {
   const [showAttributeCombinations, setShowAttributeCombinations] = useState(false);
   const [showMigrationManifest, setShowMigrationManifest] = useState(false);
   const [showGroupFeatures, setShowGroupFeatures] = useState(false);
+  const [showProductViewer, setShowProductViewer] = useState(false);
   const [showUnmappedOnlyInSidebar, setShowUnmappedOnlyInSidebar] = useState(false);
   const [featureFlags, setFeatureFlags] = useState<FeatureFlags>(() => ({
     useNewClassTargetMapping: import.meta.env.VITE_USE_NEW_CLASS_TARGET_MAPPING === 'true',
@@ -168,6 +170,8 @@ const App: React.FC = () => {
   const fetchFromDBRef = useRef<() => void>(() => {});
   const handleWsEvent = useCallback((event: WsEvent) => {
     if (event.type === 'lock_change' || event.type === 'data_sync') {
+      fetchFromDBRef.current();
+    } else if (event.type === 'approval_change') {
       fetchFromDBRef.current();
     } else if (event.type === 'generation_progress') {
       if (event.payload?.status === 'completed') {
@@ -798,6 +802,9 @@ const App: React.FC = () => {
         onOpenGroupFeatures={() => {
           setShowGroupFeatures(true);
         }}
+        onOpenProductViewer={() => {
+          setShowProductViewer(true);
+        }}
         mappingGenerationProgress={mappingGenerationProgress}
         onRetriggerGeneration={handleRetriggerGeneration}
         onRevertAllToGlobal={handleRevertAllToGlobal}
@@ -968,6 +975,15 @@ const App: React.FC = () => {
             <GroupFeatures
               currentUser={currentUser}
               onClose={() => setShowGroupFeatures(false)}
+            />
+          </Suspense>
+        )}
+
+        {showProductViewer && (
+          <Suspense fallback={<LazyFallback />}>
+            <ProductViewer
+              currentUser={currentUser}
+              onClose={() => setShowProductViewer(false)}
             />
           </Suspense>
         )}

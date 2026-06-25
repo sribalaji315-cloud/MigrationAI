@@ -7,6 +7,7 @@ from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.gzip import GZipMiddleware
 from .api import auth, state, classifications, valuelists, ml
+from .api import public
 from .api.websocket import manager
 from .db.session import engine, Base, SessionLocal
 from .db import models
@@ -40,6 +41,7 @@ app.include_router(state.router)
 app.include_router(classifications.router)
 app.include_router(valuelists.router)
 app.include_router(ml.router)
+app.include_router(public.router)
 
 
 @app.middleware("http")

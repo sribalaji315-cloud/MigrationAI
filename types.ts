@@ -44,6 +44,25 @@ export interface LegacyItem {
   classification?: string;
   mlPredictions?: MLPrediction[];
   features: LegacyFeature[];
+  // Item-level migration approval (set via the explicit "Approve for migration" action)
+  approvedForMigration?: boolean;
+  approvedByUsername?: string;
+  approvedAt?: number;
+}
+
+export interface FeatureApproval {
+  approvedByUserId?: string | null;
+  approvedByUsername?: string | null;
+  approvedAt?: number | null;
+}
+
+export interface ItemApprovalState {
+  itemId: string;
+  itemApproved: boolean;
+  approvedByUserId?: string | null;
+  approvedByUsername?: string | null;
+  approvedAt?: number | null;
+  features: Record<string, FeatureApproval>;
 }
 
 export interface NewAttribute {

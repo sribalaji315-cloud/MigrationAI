@@ -1,7 +1,7 @@
 import { useEffect, useRef, useCallback } from 'react';
 
 export interface WsEvent {
-  type: 'lock_change' | 'mapping_update' | 'generation_progress' | 'data_sync';
+  type: 'lock_change' | 'mapping_update' | 'generation_progress' | 'data_sync' | 'approval_change' | 'ml_prediction_progress';
   payload: any;
   ts: number;
 }

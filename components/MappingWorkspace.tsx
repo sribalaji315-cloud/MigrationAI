@@ -1,6 +1,6 @@
 
 import React, { useState, useEffect, useMemo, useRef } from 'react';
-import { LegacyItem, NewClassification, GlobalMapping, LocalItemMappings, NewAttribute, ItemLock, User, FeatureFlags, MappingTypeConfig, MLPrediction } from '../types';
+import { LegacyItem, NewClassification, GlobalMapping, LocalItemMappings, NewAttribute, ItemLock, User, FeatureFlags, MappingTypeConfig, MLPrediction, ItemApprovalState } from '../types';
 import { dbService } from '../services/dbService';
 
 type Tone = 'mapped' | 'unmapped' | 'notRequired' | 'partial' | 'multiple';
@@ -732,6 +732,9 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
   const [valueStatusFilter, setValueStatusFilter] = useState('');
   const [expandedFeatures, setExpandedFeatures] = useState<Record<string, boolean>>({});
   const [unmappedTargetsExpanded, setUnmappedTargetsExpanded] = useState(true);
+  // Migration approval state (item-level flag + per-feature approvals)
+  const [approvalState, setApprovalState] = useState<ItemApprovalState | null>(null);
+  const approvalFetchRef = useRef<string | null>(null);
   const isEditingRef = useRef(false);
   const prevItemIdRef = useRef<string | null>(null);
   const previousClassIdRef = useRef<string | null>(null);
@@ -935,6 +938,60 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
       }
     } catch (e: any) {
       alert(`Revert failed: ${e.message}`);
+    }
+  };
+
+  // --- Migration approval --------------------------------------------------
+  // Fetch approval state whenever the selected item changes.
+  useEffect(() => {
+    if (!item) {
+      approvalFetchRef.current = null;
+      setApprovalState(null);
+      return;
+    }
+    const key = item.itemId;
+    approvalFetchRef.current = key;
+    dbService.fetchItemApprovalState(item.itemId)
+      .then(state => { if (approvalFetchRef.current === key) setApprovalState(state); })
+      .catch(() => { if (approvalFetchRef.current === key) setApprovalState(null); });
+  }, [item?.itemId]);
+
+  // Locally clear approval for an edited feature (and the item flag). The
+  // server performs the authoritative reset on save (PUT).
+  const clearApprovalForFeatureLocally = (featureId: string) => {
+    setApprovalState(prev => {
+      if (!prev) return prev;
+      if (!prev.features[featureId] && !prev.itemApproved) return prev;
+      const features = { ...prev.features };
+      delete features[featureId];
+      return { ...prev, itemApproved: false, approvedByUsername: null, approvedAt: null, features };
+    });
+  };
+
+  const handleToggleFeatureApproval = async (featureId: string) => {
+    if (!item || !isLockedByMe) return;
+    const currentlyApproved = !!approvalState?.features?.[featureId];
+    try {
+      const next = await dbService.setFeatureApproval(item.itemId, featureId, !currentlyApproved);
+      setApprovalState(next);
+    } catch (e: any) {
+      alert(`Approval failed: ${e.message}`);
+    }
+  };
+
+  const handleToggleItemApproval = async () => {
+    if (!item || !isLockedByMe) return;
+    const currentlyApproved = !!approvalState?.itemApproved;
+    try {
+      // Persist any pending edits first so approval reflects saved mappings
+      // (saving resets approval server-side, so this must precede approval).
+      if (!currentlyApproved && isEditingRef.current) {
+        await commitToSystem();
+      }
+      const next = await dbService.setItemApproval(item.itemId, !currentlyApproved);
+      setApprovalState(next);
+    } catch (e: any) {
+      alert(`Approval failed: ${e.message}`);
     }
   };
 
@@ -1306,6 +1363,7 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
     if (!canEdit) return;
     if (!item) return;
     isEditingRef.current = true;
+    clearApprovalForFeatureLocally(featureId);
 
     // Precompute feature values so we can auto-populate NOT REQUIRED mappings
     const feature = item.features.find(f => f.featureId === featureId);
@@ -1387,6 +1445,7 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
   const handleUpdateValue = (featureId: string, legacyVal: string, newVal: string) => {
     if (!canEdit) return;
     isEditingRef.current = true;
+    clearApprovalForFeatureLocally(featureId);
     setStagedLocalMappings(prev => {
       const next = [...prev];
       let idx = next.findIndex(m => m.legacyFeatureIds.includes(featureId));
@@ -1582,6 +1641,24 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
                     }`}
                   >
                     Save
+                  </button>
+                  <button
+                    type="button"
+                    disabled={isGenerationBlocked}
+                    onClick={() => handleToggleItemApproval().catch(e => console.error("Approval failed:", e))}
+                    title={approvalState?.itemApproved && approvalState?.approvedByUsername
+                      ? `Approved for migration by ${approvalState.approvedByUsername}${approvalState.approvedAt ? ' · ' + new Date(approvalState.approvedAt * 1000).toLocaleString() : ''} — click to revoke`
+                      : 'Approve this item for migration (approves all its features)'}
+                    className={`px-4 py-1.5 text-[9px] font-black rounded-lg transition-all shadow-md uppercase tracking-widest inline-flex items-center gap-1.5 ${
+                      isGenerationBlocked
+                        ? 'bg-slate-200 text-slate-500 cursor-not-allowed shadow-none'
+                        : approvalState?.itemApproved
+                          ? 'bg-emerald-500 text-white hover:bg-emerald-600 border border-emerald-300'
+                          : 'bg-emerald-600 text-white hover:bg-emerald-700 border border-emerald-400'
+                    }`}
+                  >
+                    <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={3} d="M5 13l4 4L19 7" /></svg>
+                    {approvalState?.itemApproved ? 'Approved' : 'Approve for Migration'}
                   </button>
                   <button type="button" onClick={() => handleExitSession().catch(e => console.error("Exit failed:", e))} className="px-4 py-1.5 bg-indigo-800 text-white text-[9px] font-black rounded-lg hover:bg-indigo-900 transition-all border border-indigo-400 uppercase tracking-widest">
                     Exit
@@ -1839,6 +1916,25 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
             const attributePalette = toneTheme[attributeTone];
             const isExpanded = !!expandedFeatures[f.featureId];
 
+            // Migration approval (feature level). Features whose values are all
+            // NOT REQUIRED / discontinued / infeasible are auto-satisfied and
+            // need no manual approval.
+            const featureValuesList = f.values || [];
+            const allValuesInactive = featureValuesList.length > 0 && featureValuesList.every(v => {
+              const vm = effectiveMapping?.valueMeta?.[v];
+              const vs = (vm?.valueStatus || '').toLowerCase();
+              const feas = (vm?.feasibility || '').toLowerCase();
+              return vs === 'discontinued' || vs === 'ignored' || vs === 'deprecated' || feas === 'no';
+            });
+            const isFeatureAutoSatisfied = attributeTone === 'notRequired' || allValuesInactive;
+            const featureApprover = approvalState?.features?.[f.featureId];
+            const isFeatureApproved = !!featureApprover;
+            const featureApprovalTitle = isFeatureApproved && featureApprover?.approvedByUsername
+              ? `Approved by ${featureApprover.approvedByUsername}${featureApprover.approvedAt ? ' · ' + new Date(featureApprover.approvedAt * 1000).toLocaleString() : ''}`
+              : isFeatureAutoSatisfied
+              ? 'Auto-satisfied (not required / discontinued) — counts as approved'
+              : 'Approve this feature for migration';
+
             return (
               <div
                 key={`${item.itemId}-${f.featureId}-${idx}`}
@@ -1887,6 +1983,31 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
 
                     <div className="flex flex-col items-end gap-1 min-w-[220px]">
                       <div className="flex flex-wrap items-center justify-end gap-2">
+                        {isFeatureAutoSatisfied ? (
+                          <span title={featureApprovalTitle} className="px-2 py-0.5 bg-slate-100 text-slate-500 text-[7px] font-black rounded-full uppercase tracking-wider inline-flex items-center gap-1">
+                            <svg className="w-2.5 h-2.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={3} d="M5 13l4 4L19 7" /></svg>
+                            Auto
+                          </span>
+                        ) : isLockedByMe ? (
+                          <button
+                            type="button"
+                            onClick={() => handleToggleFeatureApproval(f.featureId)}
+                            title={featureApprovalTitle}
+                            className={`px-2 py-0.5 text-[7px] font-black rounded-full uppercase tracking-wider inline-flex items-center gap-1 border transition-colors ${
+                              isFeatureApproved
+                                ? 'bg-emerald-600 border-emerald-500 text-white hover:bg-emerald-700'
+                                : 'bg-white border-emerald-300 text-emerald-700 hover:bg-emerald-50'
+                            }`}
+                          >
+                            <svg className="w-2.5 h-2.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={3} d="M5 13l4 4L19 7" /></svg>
+                            {isFeatureApproved ? 'Approved' : 'Approve'}
+                          </button>
+                        ) : isFeatureApproved ? (
+                          <span title={featureApprovalTitle} className="px-2 py-0.5 bg-emerald-100 text-emerald-700 text-[7px] font-black rounded-full uppercase tracking-wider inline-flex items-center gap-1">
+                            <svg className="w-2.5 h-2.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={3} d="M5 13l4 4L19 7" /></svg>
+                            Approved
+                          </span>
+                        ) : null}
                         {localOverride && localOverride.mappedFrom === 'local' && (
                           <span className="px-2 py-0.5 bg-purple-100 text-purple-700 text-[7px] font-black rounded-full uppercase tracking-wider">
                             Local

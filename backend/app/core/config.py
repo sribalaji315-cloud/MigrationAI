@@ -22,12 +22,18 @@ class Settings(BaseSettings):
     ML_USE_SYNONYM_ASSIST: bool = True
     ML_SYNONYM_THRESHOLD: float = 0.5
     ML_SYNONYM_WEIGHT: float = 0.35
+    # Comma-separated list of API keys that grant external (read-only) access
+    # to the public product-mapping API under /api/v1. Leave empty to disable.
+    PUBLIC_API_KEYS: str = ""
 
     class Config:
         env_file = ".env"
 
     def get_allowed_origins(self) -> List[str]:
         return [o.strip() for o in self.ALLOWED_ORIGINS.split(",") if o.strip()]
+
+    def get_public_api_keys(self) -> List[str]:
+        return [k.strip() for k in self.PUBLIC_API_KEYS.split(",") if k.strip()]
 
 settings = Settings()
 if not settings.SECRET_KEY or settings.SECRET_KEY == "change-me":

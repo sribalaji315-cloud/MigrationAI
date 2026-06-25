@@ -61,11 +61,22 @@ function SidebarRow({ index, style, filteredItems, locks, currentUserId, selecte
       >
         <div className="flex items-center justify-between">
           <p className={`text-xs font-black truncate tracking-tight ${palette ? palette.text : selectedId === item.itemId ? 'text-blue-900' : 'text-slate-900'}`}>{item.itemId}</p>
-          {lock && (
-            <div className={`flex items-center gap-1 px-1.5 py-0.5 rounded-[3px] text-[7px] font-black uppercase ${isLockedByMe ? 'bg-green-100 text-green-700' : 'bg-amber-100 text-amber-700'}`}>
-              {isLockedByMe ? 'DRAFT' : 'BUSY'}
-            </div>
-          )}
+          <div className="flex items-center gap-1">
+            {item.approvedForMigration && (
+              <div
+                className="flex items-center gap-1 px-1.5 py-0.5 rounded-[3px] text-[7px] font-black uppercase bg-emerald-100 text-emerald-700"
+                title={item.approvedByUsername ? `Approved for migration by ${item.approvedByUsername}` : 'Approved for migration'}
+              >
+                <svg className="w-2 h-2" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={3} d="M5 13l4 4L19 7" /></svg>
+                APPROVED
+              </div>
+            )}
+            {lock && (
+              <div className={`flex items-center gap-1 px-1.5 py-0.5 rounded-[3px] text-[7px] font-black uppercase ${isLockedByMe ? 'bg-green-100 text-green-700' : 'bg-amber-100 text-amber-700'}`}>
+                {isLockedByMe ? 'DRAFT' : 'BUSY'}
+              </div>
+            )}
+          </div>
         </div>
         <div className="flex items-center justify-between mt-0.5 gap-2">
           <p className="text-[10px] text-slate-400 line-clamp-1 font-medium flex-1">{item.description}</p>

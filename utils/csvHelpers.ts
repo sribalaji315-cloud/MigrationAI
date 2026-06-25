@@ -1,5 +1,12 @@
 export const buildCsv = (rows: string[][]): string => {
-  return rows.map(r => r.map(cell => cell.replace(/"/g, '""')).join(',')).join('\n');
+  const escapeCell = (cell: string): string => {
+    const value = cell ?? '';
+    if (/[",\r\n]/.test(value)) {
+      return `"${value.replace(/"/g, '""')}"`;
+    }
+    return value;
+  };
+  return rows.map(r => r.map(escapeCell).join(',')).join('\n');
 };
 
 export const splitCsvLine = (line: string): string[] => {

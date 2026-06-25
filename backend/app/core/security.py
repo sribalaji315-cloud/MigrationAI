@@ -1,10 +1,13 @@
 import time
 import uuid
+import hmac
+import hashlib
+import secrets
 from datetime import datetime, timedelta
 from typing import Optional
 
 from fastapi import Depends, HTTPException, status
-from fastapi.security import OAuth2PasswordBearer
+from fastapi.security import OAuth2PasswordBearer, APIKeyHeader
 from jose import jwt, JWTError
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -15,8 +18,24 @@ from ..db.session import get_db
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
 
+# External integrations authenticate by sending their key in the X-API-Key
+# header. auto_error=False lets us return a clearer error message ourselves.
+api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+
 ALGORITHM = "HS256"
 REFRESH_TOKEN_EXPIRE_DAYS = 7
+
+
+def hash_api_key(key: str) -> str:
+    """Return the SHA-256 hex digest used to store/look up an API key."""
+    return hashlib.sha256(key.encode("utf-8")).hexdigest()
+
+
+def generate_api_key() -> str:
+    """Generate a new random API key (URL-safe, high entropy)."""
+    return secrets.token_urlsafe(32)
+
+
 
 
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
@@ -63,6 +82,68 @@ def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(
     if user is None:
         raise credentials_exception
     return user
+
+
+def require_api_key(
+    api_key: Optional[str] = Depends(api_key_header),
+    db: Session = Depends(get_db),
+) -> str:
+    """Authenticate an external caller via the X-API-Key header.
+
+    Accepts keys from two sources:
+      1. Static keys in the ``PUBLIC_API_KEYS`` env setting (compared in
+         constant time).
+      2. Keys issued via the admin API and stored (hashed) in the ``api_keys``
+         table.
+
+    Returns the validated key on success. Raises 503 when the public API is
+    disabled (no static keys and no active stored keys) and 401 when the key is
+    missing or invalid.
+    """
+    configured = settings.get_public_api_keys()
+    has_db_keys = (
+        db.query(models.ApiKey).filter(models.ApiKey.revoked == 0).first() is not None
+    )
+    if not configured and not has_db_keys:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Public API is not enabled on this server.",
+        )
+    if not api_key:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing API key. Provide it in the 'X-API-Key' header.",
+            headers={"WWW-Authenticate": "X-API-Key"},
+        )
+
+    # 1. Static env keys (constant-time compare).
+    for valid in configured:
+        if hmac.compare_digest(api_key, valid):
+            return api_key
+
+    # 2. Stored keys (lookup by SHA-256 hash).
+    key_hash = hash_api_key(api_key)
+    record = (
+        db.query(models.ApiKey)
+        .filter(models.ApiKey.key_hash == key_hash, models.ApiKey.revoked == 0)
+        .first()
+    )
+    if record is not None:
+        now = time.time()
+        # Throttle last_used writes to at most once per minute per key.
+        if not record.last_used_at or (now - record.last_used_at) > 60:
+            record.last_used_at = now
+            try:
+                db.commit()
+            except Exception:
+                db.rollback()
+        return api_key
+
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Invalid API key.",
+        headers={"WWW-Authenticate": "X-API-Key"},
+    )
 
 
 def blacklist_token(token: str, db: Session) -> bool:

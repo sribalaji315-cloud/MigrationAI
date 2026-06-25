@@ -86,6 +86,11 @@ async def broadcast_mapping_update(item_id: str, actor_id: Optional[str] = None)
     await manager.broadcast("mapping_update", {"itemId": item_id}, exclude=actor_id)
 
 
+async def broadcast_approval_change(item_id: str, actor_id: Optional[str] = None):
+    """Notify clients that feature/item migration approval changed for an item."""
+    await manager.broadcast("approval_change", {"itemId": item_id}, exclude=actor_id)
+
+
 async def broadcast_generation_progress(progress: dict):
     """Broadcast mapping generation progress to all clients."""
     await manager.broadcast("generation_progress", progress)

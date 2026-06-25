@@ -9,7 +9,7 @@ from ..db import models
 from ..db.session import get_db, SessionLocal
 from ..schemas import StateIn, ClassAttributeValuesIn
 from ..core.security import get_current_user
-from .websocket import broadcast_lock_change, broadcast_mapping_update, broadcast_generation_progress, broadcast_sync
+from .websocket import broadcast_lock_change, broadcast_mapping_update, broadcast_generation_progress, broadcast_sync, broadcast_approval_change
 
 logger = logging.getLogger("erp_migrator")
 router = APIRouter(tags=["state"])
@@ -2413,8 +2413,188 @@ def put_workspace_mappings_for_item(
             ))
         rows_upserted += 1
 
+    # Reset-on-edit: any change to an item's mappings invalidates approval.
+    # Remove feature approvals for the features that were touched in this save,
+    # and always clear the item-level "approved for migration" flag.
+    touched_feature_ids = {
+        str(r.get("legacyFeatureId") or r.get("legacy_feature_id") or "").strip()
+        for r in rows_payload
+        if isinstance(r, dict)
+    }
+    touched_feature_ids.discard("")
+    if touched_feature_ids:
+        db.query(models.ItemFeatureApproval).filter(
+            models.ItemFeatureApproval.item_id == item_id,
+            models.ItemFeatureApproval.feature_id.in_(touched_feature_ids),
+        ).delete(synchronize_session=False)
+    bom_item = db.query(models.BomItem).filter(models.BomItem.item_id == item_id).first()
+    if bom_item and getattr(bom_item, "approved_for_migration", 0):
+        bom_item.approved_for_migration = 0
+        bom_item.approved_by_user_id = None
+        bom_item.approved_by_username = None
+        bom_item.approved_at = None
+
     db.commit()
     return {"ok": True, "rowsSaved": rows_upserted}
+
+
+def _approval_state_for_item(item_id: str, db: Session) -> Dict[str, Any]:
+    """Build the approval-state response for an item."""
+    bom_item = db.query(models.BomItem).filter(models.BomItem.item_id == item_id).first()
+    feature_rows = (
+        db.query(models.ItemFeatureApproval)
+        .filter(models.ItemFeatureApproval.item_id == item_id)
+        .all()
+    )
+    features: Dict[str, Any] = {}
+    for fr in feature_rows:
+        features[fr.feature_id] = {
+            "approvedByUserId": fr.approved_by_user_id,
+            "approvedByUsername": fr.approved_by_username,
+            "approvedAt": fr.approved_at,
+        }
+    return {
+        "itemId": item_id,
+        "itemApproved": bool(getattr(bom_item, "approved_for_migration", 0)) if bom_item else False,
+        "approvedByUserId": getattr(bom_item, "approved_by_user_id", None) if bom_item else None,
+        "approvedByUsername": getattr(bom_item, "approved_by_username", None) if bom_item else None,
+        "approvedAt": getattr(bom_item, "approved_at", None) if bom_item else None,
+        "features": features,
+    }
+
+
+def _require_item_lock(item_id: str, current_user: models.User, db: Session) -> str:
+    """Enforce that the current user owns the item lock (admins bypass).
+
+    Returns the namespaced current user id.
+    """
+    current_user_id = f"USR-{current_user.id}"
+    if getattr(current_user, "role", "user") != "admin":
+        lock_row = db.query(models.ItemLock).filter(models.ItemLock.item_id == item_id).first()
+        if not lock_row or lock_row.user_id != current_user_id:
+            raise HTTPException(status_code=403, detail="item must be signed on by current user")
+    return current_user_id
+
+
+@router.get("/bom/items/{item_id}/approval-state")
+def get_item_approval_state(
+    item_id: str,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """Return item-level and per-feature migration approval state."""
+    return _approval_state_for_item(item_id, db)
+
+
+@router.post("/workspace-mappings/{item_id}/feature-approval")
+async def set_feature_approval(
+    item_id: str,
+    payload: Dict[str, Any],
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """Approve or un-approve a single feature for an item (lock-holder only)."""
+    current_user_id = _require_item_lock(item_id, current_user, db)
+    feature_id = str(payload.get("featureId") or payload.get("feature_id") or "").strip()
+    if not feature_id:
+        raise HTTPException(status_code=400, detail="featureId is required")
+    approved = bool(payload.get("approved", True))
+
+    existing = (
+        db.query(models.ItemFeatureApproval)
+        .filter(
+            models.ItemFeatureApproval.item_id == item_id,
+            models.ItemFeatureApproval.feature_id == feature_id,
+        )
+        .first()
+    )
+    if approved:
+        if existing:
+            existing.approved_by_user_id = current_user_id
+            existing.approved_by_username = getattr(current_user, "username", None)
+            existing.approved_at = time.time()
+        else:
+            db.add(models.ItemFeatureApproval(
+                item_id=item_id,
+                feature_id=feature_id,
+                approved_by_user_id=current_user_id,
+                approved_by_username=getattr(current_user, "username", None),
+                approved_at=time.time(),
+            ))
+    else:
+        if existing:
+            db.delete(existing)
+        # Un-approving a feature also clears the item-level flag.
+        bom_item = db.query(models.BomItem).filter(models.BomItem.item_id == item_id).first()
+        if bom_item and getattr(bom_item, "approved_for_migration", 0):
+            bom_item.approved_for_migration = 0
+            bom_item.approved_by_user_id = None
+            bom_item.approved_by_username = None
+            bom_item.approved_at = None
+
+    db.commit()
+    await broadcast_approval_change(item_id, actor_id=current_user_id)
+    return _approval_state_for_item(item_id, db)
+
+
+@router.post("/bom/items/{item_id}/approval")
+async def set_item_approval(
+    item_id: str,
+    payload: Dict[str, Any],
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """Approve or un-approve an item for migration (lock-holder only).
+
+    Approving the item also approves every feature of the item in one action.
+    Un-approving only clears the item-level flag (feature approvals are kept).
+    """
+    current_user_id = _require_item_lock(item_id, current_user, db)
+    approved = bool(payload.get("approved", True))
+
+    bom_item = db.query(models.BomItem).filter(models.BomItem.item_id == item_id).first()
+    if not bom_item:
+        raise HTTPException(status_code=404, detail="item not found")
+
+    if approved:
+        now = time.time()
+        username = getattr(current_user, "username", None)
+        # Approve all features of the item (skip those already approved).
+        feature_ids = {
+            str(fid or "").strip()
+            for (fid,) in db.query(models.BomFeature.feature_id)
+            .filter(models.BomFeature.item_id == bom_item.id)
+            .all()
+        }
+        feature_ids.discard("")
+        existing_ids = {
+            fr.feature_id
+            for fr in db.query(models.ItemFeatureApproval)
+            .filter(models.ItemFeatureApproval.item_id == item_id)
+            .all()
+        }
+        for fid in feature_ids - existing_ids:
+            db.add(models.ItemFeatureApproval(
+                item_id=item_id,
+                feature_id=fid,
+                approved_by_user_id=current_user_id,
+                approved_by_username=username,
+                approved_at=now,
+            ))
+        bom_item.approved_for_migration = 1
+        bom_item.approved_by_user_id = current_user_id
+        bom_item.approved_by_username = username
+        bom_item.approved_at = now
+    else:
+        bom_item.approved_for_migration = 0
+        bom_item.approved_by_user_id = None
+        bom_item.approved_by_username = None
+        bom_item.approved_at = None
+
+    db.commit()
+    await broadcast_approval_change(item_id, actor_id=current_user_id)
+    return _approval_state_for_item(item_id, db)
+
 
 @router.get("/state")
 def get_state(
@@ -2971,6 +3151,9 @@ def _build_bom_payload(db_items: List[models.BomItem]) -> List[Dict[str, Any]]:
                 **({"priority": getattr(itm, "priority", None)} if getattr(itm, "priority", None) is not None else {}),
                 **({"classification": getattr(itm, "classification", None)} if getattr(itm, "classification", None) else {}),
                 **({"mlPredictions": getattr(itm, "ml_predictions", None)} if getattr(itm, "ml_predictions", None) else {}),
+                "approvedForMigration": bool(getattr(itm, "approved_for_migration", 0)),
+                **({"approvedByUsername": getattr(itm, "approved_by_username", None)} if getattr(itm, "approved_by_username", None) else {}),
+                **({"approvedAt": getattr(itm, "approved_at", None)} if getattr(itm, "approved_at", None) is not None else {}),
                 "features": features_payload,
             }
         )

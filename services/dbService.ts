@@ -1,5 +1,5 @@
 
-import { GlobalMapping, DatabaseState, User, ConnectionMode, NewAttribute, WorkspaceMappingRow, MappingGenerationProgress, ValueListGroup, ValueListRow, NewClassification, BomHierarchyItem, MLPrediction, MLSettings, FeatureCombinationJobProgress, FeatureCombinationRow, FeatureCombinationItem, ConsolidationAnalysis, SubsetMergeDetail, AttributeCombinationJobProgress, AttributeCombinationRow, AttributeCombinationItem, AttrComboConsolidationAnalysis, MigrationManifestRow, MigrationManifestFilters, MigrationManifestItemSummary, MigrationManifestAttributeGroup, MigrationManifestValueDetail, MergedWorkspaceMappingRow, MergeJob, ValuelistStrategyJob, TargetAttributeProfile, ValuelistDedupGroup, ValuelistMergeProposal, ValuelistApplyResult, GroupFeatureRow, GroupFeatureMappingJobProgress, GroupFeatureWhereUsedItem, GroupFeatureFilters, ApplyGroupFeatureProgress } from '../types';
+import { GlobalMapping, DatabaseState, User, ConnectionMode, NewAttribute, WorkspaceMappingRow, MappingGenerationProgress, ValueListGroup, ValueListRow, NewClassification, BomHierarchyItem, MLPrediction, MLSettings, FeatureCombinationJobProgress, FeatureCombinationRow, FeatureCombinationItem, ConsolidationAnalysis, SubsetMergeDetail, AttributeCombinationJobProgress, AttributeCombinationRow, AttributeCombinationItem, AttrComboConsolidationAnalysis, MigrationManifestRow, MigrationManifestFilters, MigrationManifestItemSummary, MigrationManifestAttributeGroup, MigrationManifestValueDetail, MergedWorkspaceMappingRow, MergeJob, ValuelistStrategyJob, TargetAttributeProfile, ValuelistDedupGroup, ValuelistMergeProposal, ValuelistApplyResult, GroupFeatureRow, GroupFeatureMappingJobProgress, GroupFeatureWhereUsedItem, GroupFeatureFilters, ApplyGroupFeatureProgress, ItemApprovalState } from '../types';
 
 export interface SaveAllResult {
   mode: ConnectionMode;
@@ -556,6 +556,55 @@ export const dbService = {
     if (!resp.ok) {
       const errText = await resp.text();
       throw new Error(`Failed to save workspace mappings: ${resp.status} ${errText}`);
+    }
+    this._invalidateCache();
+    return resp.json();
+  },
+
+  async fetchItemApprovalState(itemId: string): Promise<ItemApprovalState> {
+    if (!SQL_ENDPOINT) throw new Error('Database connection not available.');
+    const resp = await this._fetchWithRefresh(
+      `${SQL_ENDPOINT}/bom/items/${encodeURIComponent(itemId)}/approval-state`,
+      { headers: this._authHeaders() },
+    );
+    if (!resp.ok) {
+      const errText = await resp.text();
+      throw new Error(`Failed to fetch approval state: ${resp.status} ${errText}`);
+    }
+    return resp.json();
+  },
+
+  async setFeatureApproval(itemId: string, featureId: string, approved: boolean): Promise<ItemApprovalState> {
+    if (!SQL_ENDPOINT) throw new Error('Database connection not available.');
+    const resp = await this._fetchWithRefresh(
+      `${SQL_ENDPOINT}/workspace-mappings/${encodeURIComponent(itemId)}/feature-approval`,
+      {
+        method: 'POST',
+        headers: { ...this._authHeaders(), 'Content-Type': 'application/json' },
+        body: JSON.stringify({ featureId, approved }),
+      },
+    );
+    if (!resp.ok) {
+      const errText = await resp.text();
+      throw new Error(`Failed to set feature approval: ${resp.status} ${errText}`);
+    }
+    this._invalidateCache();
+    return resp.json();
+  },
+
+  async setItemApproval(itemId: string, approved: boolean): Promise<ItemApprovalState> {
+    if (!SQL_ENDPOINT) throw new Error('Database connection not available.');
+    const resp = await this._fetchWithRefresh(
+      `${SQL_ENDPOINT}/bom/items/${encodeURIComponent(itemId)}/approval`,
+      {
+        method: 'POST',
+        headers: { ...this._authHeaders(), 'Content-Type': 'application/json' },
+        body: JSON.stringify({ approved }),
+      },
+    );
+    if (!resp.ok) {
+      const errText = await resp.text();
+      throw new Error(`Failed to set item approval: ${resp.status} ${errText}`);
     }
     this._invalidateCache();
     return resp.json();

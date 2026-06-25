@@ -47,6 +47,12 @@ class BomItem(Base):
     priority = Column(Integer, index=True, nullable=True)
     classification = Column(String, index=True, nullable=True)
     ml_predictions = Column(JSON, nullable=True)
+    # Migration approval (item-level). Set only via the explicit "Approve for
+    # migration" action; reset to 0 whenever any mapping for the item changes.
+    approved_for_migration = Column(Integer, nullable=False, default=0, index=True)
+    approved_by_user_id = Column(String, nullable=True)
+    approved_by_username = Column(String, nullable=True)
+    approved_at = Column(Float, nullable=True)
 
     features = relationship("BomFeature", back_populates="item", cascade="all, delete-orphan")
 
@@ -69,6 +75,27 @@ class BomFeature(Base):
     values = Column("values_json", JSON, nullable=True)
 
     item = relationship("BomItem", back_populates="features")
+
+
+class ItemFeatureApproval(Base):
+    """Per (item, feature) migration approval record.
+
+    Presence of a row means the feature's mapping has been approved by the
+    user named in the row. Rows are deleted when the feature's mappings change
+    (reset-on-edit) or when a user un-approves the feature.
+    """
+
+    __tablename__ = "item_feature_approvals"
+    __table_args__ = (
+        UniqueConstraint("item_id", "feature_id", name="uq_item_feature_approval"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    item_id = Column(String, index=True, nullable=False)
+    feature_id = Column(String, index=True, nullable=False)
+    approved_by_user_id = Column(String, nullable=True)
+    approved_by_username = Column(String, nullable=True)
+    approved_at = Column(Float, nullable=True)
 
 
 class GlobalMapping(Base):
@@ -262,6 +289,26 @@ class TokenBlacklist(Base):
     id = Column(Integer, primary_key=True, index=True)
     jti = Column(String, unique=True, nullable=False, index=True)
     expires_at = Column(Float, nullable=False)
+
+
+class ApiKey(Base):
+    """API keys for external/public read-only access.
+
+    Only a SHA-256 hash of the key is stored; the plaintext is shown once at
+    creation time. ``prefix`` keeps the first few characters for display so
+    admins can identify a key without exposing it.
+    """
+
+    __tablename__ = "api_keys"
+
+    id = Column(Integer, primary_key=True, index=True)
+    key_hash = Column(String, unique=True, nullable=False, index=True)
+    prefix = Column(String, nullable=False)
+    label = Column(String, nullable=True)
+    created_by = Column(String, nullable=True)
+    created_at = Column(Float, nullable=False)
+    last_used_at = Column(Float, nullable=True)
+    revoked = Column(Integer, nullable=False, default=0)
 
 
 class BomHierarchy(Base):
