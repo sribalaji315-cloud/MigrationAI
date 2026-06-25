@@ -60,6 +60,11 @@ const ProductViewer: React.FC<ProductViewerProps> = ({ currentUser, onClose }) =
   const [isLoadingMappings, setIsLoadingMappings] = useState(false);
   const [statusMessage, setStatusMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
 
+  // Right pane: mapping-level filters
+  const [filterLegacyAttribute, setFilterLegacyAttribute] = useState('');
+  const [filterFeasibility, setFilterFeasibility] = useState('');
+  const [filterValueStatus, setFilterValueStatus] = useState('');
+
   const loadGenRef = useRef(0);
 
   // Load filter options once
@@ -110,6 +115,9 @@ const ProductViewer: React.FC<ProductViewerProps> = ({ currentUser, onClose }) =
   const handleSelectItem = useCallback(async (item: LegacyItem) => {
     setSelectedItem(item);
     setStatusMessage(null);
+    setFilterLegacyAttribute('');
+    setFilterFeasibility('');
+    setFilterValueStatus('');
     setIsLoadingMappings(true);
     setMappingRows([]);
     try {
@@ -123,6 +131,33 @@ const ProductViewer: React.FC<ProductViewerProps> = ({ currentUser, onClose }) =
     }
   }, []);
 
+  // Distinct option lists for the right-pane filters
+  const mappingFilterOptions = useMemo(() => {
+    const legacyAttributes = new Set<string>();
+    const feasibilities = new Set<string>();
+    const valueStatuses = new Set<string>();
+    for (const row of mappingRows) {
+      if (row.legacyFeatureId) legacyAttributes.add(row.legacyFeatureId);
+      if (row.feasibility) feasibilities.add(row.feasibility);
+      if (row.valueStatus) valueStatuses.add(row.valueStatus);
+    }
+    return {
+      legacyAttributes: Array.from(legacyAttributes).sort((a, b) => a.localeCompare(b)),
+      feasibilities: Array.from(feasibilities).sort((a, b) => a.localeCompare(b)),
+      valueStatuses: Array.from(valueStatuses).sort((a, b) => a.localeCompare(b)),
+    };
+  }, [mappingRows]);
+
+  // Apply the right-pane filters to the raw mapping rows
+  const filteredMappingRows = useMemo(() => {
+    return mappingRows.filter(row => {
+      if (filterLegacyAttribute && row.legacyFeatureId !== filterLegacyAttribute) return false;
+      if (filterFeasibility && (row.feasibility || '') !== filterFeasibility) return false;
+      if (filterValueStatus && (row.valueStatus || '') !== filterValueStatus) return false;
+      return true;
+    });
+  }, [mappingRows, filterLegacyAttribute, filterFeasibility, filterValueStatus]);
+
   // Group mapping rows by legacy feature for the right pane
   const featureGroups = useMemo<FeatureGroup[]>(() => {
     const descByFeature: Record<string, string> = {};
@@ -133,7 +168,7 @@ const ProductViewer: React.FC<ProductViewerProps> = ({ currentUser, onClose }) =
     }
     const order: string[] = [];
     const map: Record<string, WorkspaceMappingRow[]> = {};
-    for (const row of mappingRows) {
+    for (const row of filteredMappingRows) {
       if (!map[row.legacyFeatureId]) {
         map[row.legacyFeatureId] = [];
         order.push(row.legacyFeatureId);
@@ -145,7 +180,14 @@ const ProductViewer: React.FC<ProductViewerProps> = ({ currentUser, onClose }) =
       description: descByFeature[fid] || '',
       rows: map[fid],
     }));
-  }, [mappingRows, selectedItem]);
+  }, [filteredMappingRows, selectedItem]);
+
+  const hasMappingFilters = !!(filterLegacyAttribute || filterFeasibility || filterValueStatus);
+  const clearMappingFilters = () => {
+    setFilterLegacyAttribute('');
+    setFilterFeasibility('');
+    setFilterValueStatus('');
+  };
 
   const totalPages = Math.max(1, Math.ceil(totalCount / PAGE_SIZE));
 
@@ -375,6 +417,45 @@ const ProductViewer: React.FC<ProductViewerProps> = ({ currentUser, onClose }) =
                   )}
                 </div>
                 <p className="text-[11px] text-slate-500 font-medium mt-0.5">{selectedItem.description}</p>
+
+                <div className="flex flex-wrap items-center gap-1.5 mt-2.5">
+                  <select
+                    value={filterLegacyAttribute}
+                    onChange={e => setFilterLegacyAttribute(e.target.value)}
+                    className="px-2 py-1 border border-slate-200 rounded-md text-[10px] bg-white focus:ring-1 focus:ring-sky-400 outline-none"
+                  >
+                    <option value="">All Legacy Attributes</option>
+                    {mappingFilterOptions.legacyAttributes.map(a => <option key={a} value={a}>{a}</option>)}
+                  </select>
+                  <select
+                    value={filterFeasibility}
+                    onChange={e => setFilterFeasibility(e.target.value)}
+                    className="px-2 py-1 border border-slate-200 rounded-md text-[10px] bg-white focus:ring-1 focus:ring-sky-400 outline-none"
+                  >
+                    <option value="">All Feasibility</option>
+                    {mappingFilterOptions.feasibilities.map(f => <option key={f} value={f}>{f}</option>)}
+                  </select>
+                  <select
+                    value={filterValueStatus}
+                    onChange={e => setFilterValueStatus(e.target.value)}
+                    className="px-2 py-1 border border-slate-200 rounded-md text-[10px] bg-white focus:ring-1 focus:ring-sky-400 outline-none"
+                  >
+                    <option value="">All Value Status</option>
+                    {mappingFilterOptions.valueStatuses.map(s => <option key={s} value={s}>{s}</option>)}
+                  </select>
+                  {hasMappingFilters && (
+                    <button
+                      type="button"
+                      onClick={clearMappingFilters}
+                      className="px-2 py-1 rounded-md text-[9px] font-black uppercase tracking-wider bg-slate-100 text-slate-500 hover:bg-slate-200 transition-colors"
+                    >
+                      Clear
+                    </button>
+                  )}
+                  <span className="ml-auto text-[9px] font-black text-slate-400 uppercase tracking-widest">
+                    {filteredMappingRows.length} of {mappingRows.length} row{mappingRows.length === 1 ? '' : 's'}
+                  </span>
+                </div>
               </div>
 
               <div className="flex-1 overflow-y-auto p-4">
@@ -383,7 +464,9 @@ const ProductViewer: React.FC<ProductViewerProps> = ({ currentUser, onClose }) =
                     <div className="w-6 h-6 border-2 border-sky-600 border-t-transparent rounded-full animate-spin" />
                   </div>
                 ) : featureGroups.length === 0 ? (
-                  <div className="text-center py-16 text-[11px] text-slate-400 font-medium">No mappings found for this product.</div>
+                  <div className="text-center py-16 text-[11px] text-slate-400 font-medium">
+                    {hasMappingFilters ? 'No mappings match the selected filters.' : 'No mappings found for this product.'}
+                  </div>
                 ) : (
                   <div className="space-y-3">
                     {featureGroups.map(group => (
@@ -397,30 +480,30 @@ const ProductViewer: React.FC<ProductViewerProps> = ({ currentUser, onClose }) =
                           </div>
                           {group.description && <p className="text-[10px] text-slate-400 font-medium mt-0.5">{group.description}</p>}
                         </div>
-                        <table className="w-full text-[11px]">
+                        <table className="w-full table-fixed text-[11px]">
                           <thead>
                             <tr className="text-left text-[8px] font-black uppercase tracking-widest text-slate-400 border-b border-slate-100">
-                              <th className="px-4 py-1.5 font-black">Source Value</th>
-                              <th className="px-3 py-1.5 font-black">Target Attribute</th>
-                              <th className="px-3 py-1.5 font-black">Target Value</th>
-                              <th className="px-3 py-1.5 font-black">Condition</th>
-                              <th className="px-3 py-1.5 font-black">Feasibility</th>
-                              <th className="px-3 py-1.5 font-black">Status</th>
+                              <th className="w-1/6 px-4 py-1.5 font-black">Source Value</th>
+                              <th className="w-1/6 px-3 py-1.5 font-black">Target Attribute</th>
+                              <th className="w-1/6 px-3 py-1.5 font-black">Target Value</th>
+                              <th className="w-1/6 px-3 py-1.5 font-black">Condition</th>
+                              <th className="w-1/6 px-3 py-1.5 font-black">Feasibility</th>
+                              <th className="w-1/6 px-3 py-1.5 font-black">Status</th>
                             </tr>
                           </thead>
                           <tbody>
                             {group.rows.map((row, idx) => (
                               <tr key={`${row.legacyValue}-${idx}`} className="border-b border-slate-50 last:border-b-0">
-                                <td className="px-4 py-1.5 font-bold text-slate-700">{row.legacyValue || <span className="text-slate-300">—</span>}</td>
-                                <td className="px-3 py-1.5 text-slate-600">{row.newAttributeId || <span className="text-slate-300">—</span>}</td>
-                                <td className="px-3 py-1.5 text-slate-600">{row.newValue || <span className="text-slate-300">—</span>}</td>
-                                <td className="px-3 py-1.5 text-slate-500">{row.condition || <span className="text-slate-300">—</span>}</td>
-                                <td className="px-3 py-1.5">
+                                <td className="w-1/6 px-4 py-1.5 font-bold text-slate-700 break-words">{row.legacyValue || <span className="text-slate-300">—</span>}</td>
+                                <td className="w-1/6 px-3 py-1.5 text-slate-600 break-words">{row.newAttributeId || <span className="text-slate-300">—</span>}</td>
+                                <td className="w-1/6 px-3 py-1.5 text-slate-600 break-words">{row.newValue || <span className="text-slate-300">—</span>}</td>
+                                <td className="w-1/6 px-3 py-1.5 text-slate-500 break-words">{row.condition || <span className="text-slate-300">—</span>}</td>
+                                <td className="w-1/6 px-3 py-1.5">
                                   {row.feasibility ? (
                                     <span className={`px-1.5 py-0.5 rounded-[3px] text-[8px] font-black uppercase border ${feasibilityTone(row.feasibility)}`}>{row.feasibility}</span>
                                   ) : <span className="text-slate-300">—</span>}
                                 </td>
-                                <td className="px-3 py-1.5">
+                                <td className="w-1/6 px-3 py-1.5">
                                   {row.valueStatus ? (
                                     <span className={`px-1.5 py-0.5 rounded-[3px] text-[8px] font-black uppercase border ${valueStatusTone(row.valueStatus)}`}>{row.valueStatus}</span>
                                   ) : <span className="text-slate-300">—</span>}

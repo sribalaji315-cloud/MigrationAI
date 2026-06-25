@@ -99,6 +99,119 @@ can be granted without editing environment variables or restarting the server.
 Obtain a bearer token by logging in through the normal auth endpoint, then send
 it as `Authorization: Bearer <token>`.
 
+### Example: getting a key when running locally
+
+This walks through the full flow against a backend started locally on
+`http://localhost:8000` (see [backend/README.md](README.md):
+`uvicorn app.main:app --reload --host 0.0.0.0 --port 8000`).
+
+**1. Log in as an admin to get a JWT.** The login endpoint expects form fields
+`username` and `password`:
+
+PowerShell (Windows):
+
+```powershell
+$login = Invoke-RestMethod -Uri "http://localhost:8000/auth/login" -Method Post `
+  -Body @{ username = "admin@example.com"; password = "your-admin-password" }
+$jwt = $login.access_token
+```
+
+bash / curl:
+
+```bash
+JWT=$(curl -s -X POST "http://localhost:8000/auth/login" \
+  -d "username=admin@example.com" \
+  -d "password=your-admin-password" | jq -r .access_token)
+```
+
+**2. Issue an API key.** The plaintext `key` is returned only once:
+
+PowerShell:
+
+```powershell
+$created = Invoke-RestMethod -Uri "http://localhost:8000/api/v1/admin/api-keys" -Method Post `
+  -Headers @{ Authorization = "Bearer $jwt" } `
+  -ContentType "application/json" `
+  -Body (@{ label = "local-test" } | ConvertTo-Json)
+$apiKey = $created.key
+$apiKey   # copy this — it cannot be retrieved again
+```
+
+bash / curl:
+
+```bash
+API_KEY=$(curl -s -X POST "http://localhost:8000/api/v1/admin/api-keys" \
+  -H "Authorization: Bearer $JWT" \
+  -H "Content-Type: application/json" \
+  -d '{"label": "local-test"}' | jq -r .key)
+echo "$API_KEY"   # copy this — it cannot be retrieved again
+```
+
+**3. Use the key to call a data endpoint:**
+
+PowerShell:
+
+```powershell
+Invoke-RestMethod -Uri "http://localhost:8000/api/v1/products?limit=1" `
+  -Headers @{ "X-API-Key" = $apiKey }
+```
+
+bash / curl:
+
+```bash
+curl -H "X-API-Key: $API_KEY" "http://localhost:8000/api/v1/products?limit=1"
+```
+
+> No environment configuration or server restart is required — a key issued this
+> way is active immediately.
+
+### Example: getting a key with Postman
+
+The same flow using the Postman app against a local backend
+(`http://localhost:8000`):
+
+**1. Log in to get a JWT.**
+
+- Method: `POST`, URL: `http://localhost:8000/auth/login`
+- Go to the **Body** tab → select **x-www-form-urlencoded** and add two keys:
+  | Key | Value |
+  |-----|-------|
+  | `username` | `admin@example.com` |
+  | `password` | `your-admin-password` |
+- Click **Send**. Copy the `access_token` value from the JSON response.
+
+> Tip: to avoid copy/pasting, add this to the request's **Tests** tab so the
+> token is saved into a Postman variable automatically:
+> ```javascript
+> pm.collectionVariables.set("jwt", pm.response.json().access_token);
+> ```
+
+**2. Issue an API key.**
+
+- Method: `POST`, URL: `http://localhost:8000/api/v1/admin/api-keys`
+- **Authorization** tab → Type **Bearer Token** → paste the token (or use
+  `{{jwt}}` if you saved it above).
+- **Body** tab → select **raw** → **JSON**, and enter:
+  ```json
+  { "label": "local-test" }
+  ```
+- Click **Send**. Copy the `key` value from the response — it is shown **only
+  once**.
+
+> Tip: save the key automatically with this in the **Tests** tab:
+> ```javascript
+> pm.collectionVariables.set("apiKey", pm.response.json().key);
+> ```
+
+**3. Call a data endpoint with the key.**
+
+- Method: `GET`, URL: `http://localhost:8000/api/v1/products?limit=1`
+- **Headers** tab → add a header:
+  | Key | Value |
+  |-----|-------|
+  | `X-API-Key` | *(the key from step 2, or `{{apiKey}}`)* |
+- Click **Send** to see the product list.
+
 ### Issue a new key — `POST /api/v1/admin/api-keys`
 
 Request body (JSON):
