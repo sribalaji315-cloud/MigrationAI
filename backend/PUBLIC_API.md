@@ -290,6 +290,234 @@ curl -X DELETE "https://your-server/api/v1/admin/api-keys/1" \
 
 ---
 
+## Complete Postman walkthrough (step by step)
+
+This is a full, click-by-click guide that takes you from nothing to fetching a
+product and its mappings in Postman. It assumes the backend is running locally
+at `http://localhost:8000`. If your server runs elsewhere, replace that base URL
+everywhere below.
+
+> **Two different credentials are involved — don't mix them up:**
+> - **Admin JWT (Bearer token):** used *only* to create/list/revoke API keys.
+>   You get it by logging in with an admin username + password.
+> - **API key (`X-API-Key`):** used to call the actual data endpoints
+>   (products, mappings). You get it from step 2 below.
+
+### Step 0 — One-time Postman setup (recommended)
+
+Doing this once means you never have to copy/paste tokens between requests.
+
+1. Open Postman → click **Collections** in the left sidebar → **+ Create
+   Collection**. Name it `Product Mapping API`.
+2. Select the collection → open the **Variables** tab → add these rows, then
+   click **Save**:
+
+   | Variable | Initial value | Current value |
+   |----------|---------------|---------------|
+   | `baseUrl` | `http://localhost:8000` | `http://localhost:8000` |
+   | `jwt` | *(leave blank)* | *(leave blank)* |
+   | `apiKey` | *(leave blank)* | *(leave blank)* |
+
+   The scripts in the next steps will fill `jwt` and `apiKey` automatically.
+
+### Step 1 — Log in as an admin to get a JWT
+
+1. In the collection, click **Add a request**. Name it `1. Login (get JWT)`.
+2. Set the method to **POST** and the URL to:
+   ```
+   {{baseUrl}}/auth/login
+   ```
+3. Open the **Body** tab → select **x-www-form-urlencoded** → add two rows:
+
+   | Key | Value |
+   |-----|-------|
+   | `username` | your admin username (e.g. `admin@example.com`) |
+   | `password` | your admin password |
+
+   > The login endpoint uses form fields, **not** JSON. Make sure
+   > **x-www-form-urlencoded** is selected (not **raw**).
+
+4. Open the **Scripts** tab (older Postman: **Tests** tab) and paste this so the
+   token is saved into the `jwt` variable automatically:
+   ```javascript
+   pm.collectionVariables.set("jwt", pm.response.json().access_token);
+   ```
+5. Click **Send**. You should get `200 OK` and a response like:
+   ```json
+   {
+     "access_token": "eyJhbGciOi...",
+     "token_type": "bearer",
+     "refresh_token": "eyJhbGciOi..."
+   }
+   ```
+   The `jwt` collection variable is now set.
+
+   - `401 Invalid credentials` → wrong username/password.
+   - `403 Account pending admin approval` / `rejected` → the account isn't an
+     approved admin; use a different account.
+
+### Step 2 — Issue (create) an API key
+
+1. Add a new request named `2. Create API key`.
+2. Method **POST**, URL:
+   ```
+   {{baseUrl}}/api/v1/admin/api-keys
+   ```
+3. Open the **Authorization** tab → **Type** = **Bearer Token** → in the
+   **Token** field enter:
+   ```
+   {{jwt}}
+   ```
+4. Open the **Body** tab → select **raw** → choose **JSON** from the dropdown →
+   enter a label so you can recognize the key later:
+   ```json
+   { "label": "postman-test" }
+   ```
+5. (Optional) **Scripts**/**Tests** tab — auto-save the key:
+   ```javascript
+   pm.collectionVariables.set("apiKey", pm.response.json().key);
+   ```
+6. Click **Send**. You'll get `200 OK` with the **plaintext key shown only once**:
+   ```json
+   {
+     "id": 3,
+     "prefix": "BW4bjmji",
+     "label": "postman-test",
+     "createdBy": "admin@example.com",
+     "createdAt": 1750000000.0,
+     "lastUsedAt": null,
+     "revoked": false,
+     "key": "BW4bjmji-the-full-secret-shown-only-once"
+   }
+   ```
+   **Copy the `key` value now** and store it somewhere safe — it cannot be
+   retrieved again. (If you used the script in step 5, it's already saved in the
+   `apiKey` variable.)
+
+   - `403 admin role required` → the logged-in account is not an admin.
+   - `401 Unauthorized` → the `jwt` variable is empty/expired; re-run Step 1.
+
+### Step 3 — List products (find an item id)
+
+1. Add a new request named `3. List products`.
+2. Method **GET**, URL (the query params page the results):
+   ```
+   {{baseUrl}}/api/v1/products?limit=10&offset=0
+   ```
+   You can also search, e.g. `...&search=panel`.
+3. Open the **Headers** tab → add a header:
+
+   | Key | Value |
+   |-----|-------|
+   | `X-API-Key` | `{{apiKey}}` |
+
+   > Use the `{{apiKey}}` variable, or paste the raw key string from Step 2. Do
+   > **not** use the Bearer token here — data endpoints only accept `X-API-Key`.
+
+4. Click **Send**. Example `200 OK`:
+   ```json
+   {
+     "items": [
+       {
+         "itemId": "ASYCB3S0",
+         "description": "50THK segmented panel",
+         "category": "PANELS",
+         "productType": "WALL",
+         "priority": 1,
+         "classification": "PANEL_50"
+       }
+     ],
+     "total": 4743,
+     "limit": 10,
+     "offset": 0
+   }
+   ```
+   Pick an `itemId` from the `items` array — you'll use it in Step 4.
+
+   - `401 Unauthorized` → missing/invalid `X-API-Key` header.
+   - `503 Service Unavailable` → no API keys exist yet on the server; complete
+     Step 2 first.
+
+### Step 4 — Get a product's mappings (JSON)
+
+1. Add a new request named `4. Product mappings (JSON)`.
+2. Method **GET**, URL (replace `ASYCB3S0` with the id from Step 3):
+   ```
+   {{baseUrl}}/api/v1/products/ASYCB3S0/mappings
+   ```
+3. **Headers** tab → add the same header:
+
+   | Key | Value |
+   |-----|-------|
+   | `X-API-Key` | `{{apiKey}}` |
+
+4. Click **Send**. You'll get the product with its source → target mappings
+   grouped by legacy feature (condition, feasibility and value status included).
+   See [Endpoint 2](#2-get-product-mappings-json) below for the full field
+   reference. Example:
+   ```json
+   {
+     "itemId": "ASYCB3S0",
+     "description": "50THK segmented panel",
+     "features": [
+       {
+         "legacyFeatureId": "ABLC",
+         "description": "Anchor bracket location code",
+         "attributeType": "engineering",
+         "mappings": [
+           {
+             "legacyValue": "FF",
+             "targetAttribute": "",
+             "targetValue": "",
+             "condition": "(( .#MMH <= 1400 LM0 ))",
+             "feasibility": "Review",
+             "valueStatus": null
+           }
+         ]
+       }
+     ]
+   }
+   ```
+
+   - `404 Not Found` → no product with that `item_id`; double-check the id from
+     Step 3 (ids are case-sensitive).
+
+### Step 5 — Download the mappings as CSV (optional)
+
+1. Add a new request named `5. Product mappings (CSV)`.
+2. Method **GET**, URL:
+   ```
+   {{baseUrl}}/api/v1/products/ASYCB3S0/mappings.csv
+   ```
+3. **Headers** tab → add `X-API-Key` = `{{apiKey}}` as before.
+4. Click **Send**. The response body is CSV text. To save it as a file, click
+   the **Save Response** dropdown (top-right of the response pane) → **Save to a
+   file** → choose a `.csv` filename.
+
+### Quick reference — what goes where
+
+| Request | Method | URL | Auth header |
+|---------|--------|-----|-------------|
+| Login | POST | `/auth/login` | *(none — form body)* |
+| Create key | POST | `/api/v1/admin/api-keys` | `Authorization: Bearer {{jwt}}` |
+| List products | GET | `/api/v1/products` | `X-API-Key: {{apiKey}}` |
+| Product mappings (JSON) | GET | `/api/v1/products/{id}/mappings` | `X-API-Key: {{apiKey}}` |
+| Product mappings (CSV) | GET | `/api/v1/products/{id}/mappings.csv` | `X-API-Key: {{apiKey}}` |
+
+### Postman troubleshooting
+
+| Symptom | Likely cause / fix |
+|---------|--------------------|
+| `503 Service Unavailable` on a data endpoint | No API key exists on the server yet. Do Step 2 (create a key) first. |
+| `401 Unauthorized` on a data endpoint | `X-API-Key` header is missing, misspelled, or the key was revoked. Re-check the header name and value. |
+| `401` when creating a key | The `jwt` variable is empty or expired. Re-run Step 1 to refresh it. |
+| `403 admin role required` | You logged in with a non-admin account. Use an admin account. |
+| `404 Not Found` on mappings | The `item_id` is wrong or doesn't exist. Get a valid id from Step 3. Ids are case-sensitive. |
+| Login returns `422` | Body type is wrong — it must be **x-www-form-urlencoded** with `username` and `password`, not raw JSON. |
+| Can't connect / `ECONNREFUSED` | The backend isn't running, or `baseUrl` is wrong. Confirm it's up at `http://localhost:8000/docs`. |
+
+---
+
 ## Endpoints
 
 ### 1. List / search products
@@ -460,6 +688,210 @@ ASYCB3S0,50THK segmented panel,ABLC,FFF,,NOT REQUIRED,engineering,,No,discontinu
 | Status | Meaning |
 |--------|---------|
 | `404 Not Found` | No product exists with the given `item_id`. |
+
+---
+
+## Response schemas (JSON Schema)
+
+Formal [JSON Schema](https://json-schema.org/) (draft 2020-12) definitions for
+each JSON response body. Use these to validate payloads or to generate client
+models. The live machine-readable contract is also published by the server at
+`/openapi.json` (and rendered at `/docs`).
+
+### `GET /api/v1/products` — product list
+
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ProductList",
+  "type": "object",
+  "required": ["items", "total", "limit", "offset"],
+  "additionalProperties": false,
+  "properties": {
+    "items": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/ProductSummary" }
+    },
+    "total": { "type": "integer", "minimum": 0, "description": "Total matches across all pages." },
+    "limit": { "type": "integer", "minimum": 1, "maximum": 500 },
+    "offset": { "type": "integer", "minimum": 0 }
+  },
+  "$defs": {
+    "ProductSummary": {
+      "type": "object",
+      "required": ["itemId", "description", "category", "productType", "priority", "classification"],
+      "additionalProperties": false,
+      "properties": {
+        "itemId": { "type": "string" },
+        "description": { "type": "string", "description": "Empty string when unset." },
+        "category": { "type": "string", "description": "Empty string when unset." },
+        "productType": { "type": "string", "description": "Empty string when unset." },
+        "priority": { "type": ["integer", "null"] },
+        "classification": { "type": "string", "description": "Empty string when unset." }
+      }
+    }
+  }
+}
+```
+
+### `GET /api/v1/products/{item_id}/mappings` — product mappings
+
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ProductMappings",
+  "type": "object",
+  "required": ["itemId", "description", "category", "productType", "priority", "classification", "features"],
+  "additionalProperties": false,
+  "properties": {
+    "itemId": { "type": "string" },
+    "description": { "type": "string" },
+    "category": { "type": "string" },
+    "productType": { "type": "string" },
+    "priority": { "type": ["integer", "null"] },
+    "classification": { "type": "string" },
+    "features": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/Feature" }
+    }
+  },
+  "$defs": {
+    "Feature": {
+      "type": "object",
+      "required": ["legacyFeatureId", "description", "attributeType", "mappings"],
+      "additionalProperties": false,
+      "properties": {
+        "legacyFeatureId": { "type": "string", "description": "Source (legacy) attribute id." },
+        "description": { "type": "string", "description": "Source attribute description (empty string when unset)." },
+        "attributeType": { "type": "string", "description": "e.g. engineering, logistics, finance." },
+        "mappings": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/Mapping" }
+        }
+      }
+    },
+    "Mapping": {
+      "type": "object",
+      "required": ["legacyValue", "targetAttribute", "targetValue", "condition", "feasibility", "valueStatus"],
+      "additionalProperties": false,
+      "properties": {
+        "legacyValue": { "type": "string", "description": "Source value; empty string when the feature has no values." },
+        "targetAttribute": { "type": "string", "description": "Target PLM attribute id; empty string if unmapped." },
+        "targetValue": { "type": "string", "description": "Target value; empty string if unmapped." },
+        "condition": { "type": ["string", "null"], "description": "Applicability condition, if any." },
+        "feasibility": {
+          "type": ["string", "null"],
+          "description": "Typical values: Yes, No, Review, Conditional."
+        },
+        "valueStatus": {
+          "type": ["string", "null"],
+          "enum": ["discontinued", "deprecated", "ignored", null]
+        }
+      }
+    }
+  }
+}
+```
+
+### `POST /api/v1/admin/api-keys` — issued key
+
+The create response is the key metadata plus the one-time plaintext `key`.
+
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ApiKeyCreated",
+  "type": "object",
+  "required": ["id", "prefix", "label", "createdBy", "createdAt", "lastUsedAt", "revoked", "key"],
+  "additionalProperties": false,
+  "properties": {
+    "id": { "type": "integer" },
+    "prefix": { "type": "string", "description": "First 8 characters of the key, for display." },
+    "label": { "type": "string", "description": "Empty string when unset." },
+    "createdBy": { "type": ["string", "null"] },
+    "createdAt": { "type": "number", "description": "Unix epoch seconds." },
+    "lastUsedAt": { "type": ["number", "null"], "description": "Unix epoch seconds, or null if never used." },
+    "revoked": { "type": "boolean" },
+    "key": { "type": "string", "description": "Plaintext secret — returned ONCE at creation only." }
+  }
+}
+```
+
+### `GET /api/v1/admin/api-keys` — key list
+
+Identical to the create response but **without** the `key` field (the secret is
+never returned again).
+
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ApiKeyList",
+  "type": "object",
+  "required": ["items"],
+  "additionalProperties": false,
+  "properties": {
+    "items": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/ApiKey" }
+    }
+  },
+  "$defs": {
+    "ApiKey": {
+      "type": "object",
+      "required": ["id", "prefix", "label", "createdBy", "createdAt", "lastUsedAt", "revoked"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": "integer" },
+        "prefix": { "type": "string" },
+        "label": { "type": "string" },
+        "createdBy": { "type": ["string", "null"] },
+        "createdAt": { "type": "number" },
+        "lastUsedAt": { "type": ["number", "null"] },
+        "revoked": { "type": "boolean" }
+      }
+    }
+  }
+}
+```
+
+### `DELETE /api/v1/admin/api-keys/{id}` — revoke result
+
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ApiKeyRevoked",
+  "type": "object",
+  "required": ["ok", "id", "revoked"],
+  "additionalProperties": false,
+  "properties": {
+    "ok": { "type": "boolean" },
+    "id": { "type": "integer" },
+    "revoked": { "type": "boolean" }
+  }
+}
+```
+
+### Error response
+
+All `4xx`/`5xx` responses use FastAPI's standard error envelope:
+
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Error",
+  "type": "object",
+  "required": ["detail"],
+  "properties": {
+    "detail": {
+      "description": "Human-readable message, or a list of validation errors.",
+      "oneOf": [
+        { "type": "string" },
+        { "type": "array", "items": { "type": "object" } }
+      ]
+    }
+  }
+}
+```
 
 ---
 
