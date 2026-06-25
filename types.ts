@@ -175,6 +175,19 @@ export interface MappingGenerationProgress {
   error?: string | null;
 }
 
+export interface ApplyGroupFeatureProgress {
+  id?: number;
+  status: 'idle' | 'queued' | 'running' | 'completed' | 'failed';
+  isActive: boolean;
+  progress: number;
+  totalFeatures: number;
+  processedFeatures: number;
+  generatedRows: number;
+  startedAt?: number | null;
+  finishedAt?: number | null;
+  error?: string | null;
+}
+
 export interface BomHierarchyItem {
   id?: number;
   level?: number;

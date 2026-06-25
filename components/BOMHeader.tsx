@@ -1,6 +1,6 @@
 
 import React, { useState, useEffect, useRef } from 'react';
-import { DataCategory, User, MappingGenerationProgress, MLSettings } from '../types';
+import { DataCategory, User, MappingGenerationProgress, ApplyGroupFeatureProgress, MLSettings } from '../types';
 import { dbService } from '../services/dbService';
 
 interface BOMHeaderProps {
@@ -22,11 +22,14 @@ interface BOMHeaderProps {
   onRetriggerGeneration?: () => void;
   onRevertAllToGlobal?: () => void;
   isMappingGenerationActive?: boolean;
+  applyGroupFeatureProgress?: ApplyGroupFeatureProgress | null;
+  onApplyGroupFeatures?: () => void;
+  isApplyGroupFeatureActive?: boolean;
   onPredictAll?: () => void;
   mlPredictionProgress?: { status: string; progress: number; total: number; processed: number } | null;
 }
 
-const BOMHeader: React.FC<BOMHeaderProps> = ({ onRegenerate, isRefreshing, onInspectData, onCommit, currentUser, onLogout, onClearCache, onExportBomCsv, onOpenDashboard, onOpenHierarchy, onOpenFeatureCombinations, onOpenAttributeCombinations, onOpenMigrationManifest, onOpenGroupFeatures, mappingGenerationProgress, onRetriggerGeneration, onRevertAllToGlobal, isMappingGenerationActive, onPredictAll, mlPredictionProgress }) => {
+const BOMHeader: React.FC<BOMHeaderProps> = ({ onRegenerate, isRefreshing, onInspectData, onCommit, currentUser, onLogout, onClearCache, onExportBomCsv, onOpenDashboard, onOpenHierarchy, onOpenFeatureCombinations, onOpenAttributeCombinations, onOpenMigrationManifest, onOpenGroupFeatures, mappingGenerationProgress, onRetriggerGeneration, onRevertAllToGlobal, isMappingGenerationActive, applyGroupFeatureProgress, onApplyGroupFeatures, isApplyGroupFeatureActive, onPredictAll, mlPredictionProgress }) => {
   const uploadOptions: { label: string; id: DataCategory; icon: string; adminOnly?: boolean }[] = [
     { label: 'Global Mapping', id: 'mapping', icon: 'M8 7v8a2 2 0 002 2h6M8 7V5a2 2 0 012-2h4.586a1 1 0 01.707.293l4.414 4.414a1 1 0 01.293.707V15a2 2 0 01-2 2h-2' },
     { label: 'Classifications', id: 'classification', icon: 'M4 6h16M4 10h16M4 14h16M4 18h16' },
@@ -141,6 +144,30 @@ const BOMHeader: React.FC<BOMHeaderProps> = ({ onRegenerate, isRefreshing, onIns
                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M3 10h10a8 8 0 018 8v2M3 10l6 6m-6-6l6-6" />
                   </svg>
                   Revert All to Global
+                </button>
+              )}
+              {applyGroupFeatureProgress && applyGroupFeatureProgress.status !== 'idle' && isApplyGroupFeatureActive && (
+                <div className="ml-2 inline-flex items-center gap-1 px-2 py-0.5 border rounded-full text-[8px] font-black uppercase tracking-widest bg-teal-50 border-teal-200 text-teal-700">
+                  <span>Group Apply</span>
+                  <span>{Math.round((applyGroupFeatureProgress.progress || 0) * 100)}%</span>
+                </div>
+              )}
+              {currentUser.role === 'admin' && onApplyGroupFeatures && (
+                <button
+                  type="button"
+                  onClick={onApplyGroupFeatures}
+                  disabled={isApplyGroupFeatureActive || isMappingGenerationActive}
+                  className={`ml-1 inline-flex items-center gap-1 px-2 py-0.5 border rounded-full text-[8px] font-black uppercase tracking-widest transition-colors ${
+                    isApplyGroupFeatureActive || isMappingGenerationActive
+                      ? 'bg-slate-50 border-slate-200 text-slate-300 cursor-not-allowed'
+                      : 'bg-teal-50 border-teal-200 text-teal-700 hover:bg-teal-100'
+                  }`}
+                  title="Apply group feature mappings onto workspace mappings (intersection of group feature + sub-feature present in the item)"
+                >
+                  <svg className="w-2.5 h-2.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M17 20h5v-2a4 4 0 00-3-3.87M9 20H4v-2a4 4 0 013-3.87m6-3.13a4 4 0 10-4 0M12 4a4 4 0 014 4" />
+                  </svg>
+                  {isApplyGroupFeatureActive ? 'Applying…' : 'Apply Group Feature'}
                 </button>
               )}
               {currentUser.role === 'admin' && onPredictAll && (

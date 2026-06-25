@@ -57,6 +57,7 @@ _metrics_cache_fingerprint: Dict[str, str] = {}
 _generation_lock = asyncio.Lock()
 _group_feature_mapping_lock = asyncio.Lock()
 _group_feature_suggest_lock = asyncio.Lock()
+_apply_group_feature_lock = asyncio.Lock()
 GENERATION_STALE_TIMEOUT_SECONDS = 15 * 60
 GENERATION_INSERT_BATCH_SIZE = 1500
 GENERATION_INSERT_MAX_RETRIES = 5
@@ -8013,6 +8014,240 @@ def get_group_feature_mapping_progress(
     job = (
         db.query(models.GroupFeatureMappingJob)
         .order_by(models.GroupFeatureMappingJob.id.desc())
+        .first()
+    )
+    if not job:
+        return {"status": "idle", "isActive": False, "progress": 0, "totalFeatures": 0, "processedFeatures": 0, "generatedRows": 0}
+    is_active = job.status in ("queued", "running")
+    progress = (job.processed_features / job.total_features) if job.total_features > 0 else (1.0 if job.status == "completed" else 0)
+    return {
+        "id": int(job.id),
+        "status": job.status,
+        "isActive": is_active,
+        "progress": progress,
+        "totalFeatures": job.total_features,
+        "processedFeatures": job.processed_features,
+        "generatedRows": job.generated_rows,
+        "startedAt": job.started_at,
+        "finishedAt": job.finished_at,
+        "error": job.error_message,
+    }
+
+
+@router.post("/workspace-mappings/apply-group-features")
+def trigger_apply_group_features(
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """Trigger a batch job that applies group_features mappings onto WorkspaceMapping rows."""
+    if getattr(current_user, "role", "") != "admin":
+        raise HTTPException(status_code=403, detail="Admin access required")
+
+    active = (
+        db.query(models.ApplyGroupFeatureJob)
+        .filter(models.ApplyGroupFeatureJob.status.in_(["queued", "running"]))
+        .first()
+    )
+    if active:
+        return {"ok": True, "jobId": int(active.id)}
+
+    job = models.ApplyGroupFeatureJob(
+        status="queued",
+        triggered_by_user_id=str(getattr(current_user, "id", "")),
+        triggered_by_username=getattr(current_user, "username", ""),
+        updated_at=time.time(),
+    )
+    db.add(job)
+    db.commit()
+    db.refresh(job)
+
+    _start_apply_group_feature_job(int(job.id), background_tasks=background_tasks)
+    return {"ok": True, "jobId": int(job.id)}
+
+
+def _start_apply_group_feature_job(job_id: int, background_tasks: Optional["BackgroundTasks"] = None):
+    if background_tasks is not None:
+        background_tasks.add_task(_run_apply_group_feature_async, job_id)
+    else:
+        loop = asyncio.get_running_loop()
+        loop.create_task(_run_apply_group_feature_async(job_id))
+
+
+async def _run_apply_group_feature_async(job_id: int):
+    async with _apply_group_feature_lock:
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, _run_apply_group_feature_job, job_id)
+
+
+def _global_baseline_for_row(
+    feature_id: str,
+    legacy_value: str,
+    mapping_by_feature: Dict[str, "models.GlobalMapping"],
+    candidates_by_feature: Dict[str, List[str]],
+):
+    """Re-derive the global-mapping baseline (attr, value, attr_type, mapped_from) for a row.
+
+    Mirrors the core resolution used by the mapping-generation job so a previously
+    group-applied row can be reverted to its global state before re-applying group
+    features. Exclusion/NOT-REQUIRED nuances are intentionally left to the value_status
+    column (untouched here).
+    """
+    candidates = candidates_by_feature.get(feature_id, [])
+    # Single global target -> confirmed; zero or ambiguous -> blank confirmed target.
+    target_attr = candidates[0] if len(candidates) == 1 else ""
+    mapping = mapping_by_feature.get(feature_id)
+    attr_type = (getattr(mapping, "attribute_type", "") or "").strip() if mapping else ""
+    value_mappings = getattr(mapping, "value_mappings", {}) if mapping else {}
+    resolved = _resolve_value_mapping(value_mappings, legacy_value) if value_mappings else None
+    new_value = resolved or ""
+    mapped_from = "global" if resolved else ""
+    return target_attr, new_value, attr_type, mapped_from
+
+
+def _run_apply_group_feature_job(job_id: int):
+    """Apply group_features mappings onto WorkspaceMapping rows.
+
+    Matching rule (per item): a group_features row (feature_group, feature_id, option,
+    target_attribute, target_value) applies only when the item has BOTH
+      (a) a WorkspaceMapping row with legacy_feature_id == feature_group (group presence), AND
+      (b) a WorkspaceMapping row with legacy_feature_id == feature_id AND legacy_value == option.
+    The target is written onto the sub-feature row (b): new_attribute_id/new_value come from
+    the group row and mapped_from='group'. Rows with mapped_from='local' are never touched.
+    Group rows with an empty target_attribute are skipped.
+    """
+    db = SessionLocal()
+    try:
+        job = db.query(models.ApplyGroupFeatureJob).filter(models.ApplyGroupFeatureJob.id == job_id).first()
+        if not job:
+            return
+
+        now_ts = time.time()
+        job.status = "running"
+        if not job.started_at:
+            job.started_at = now_ts
+        job.updated_at = now_ts
+        db.commit()
+
+        # Build global mapping indexes once (used to revert prior group rows to baseline).
+        all_gm = db.query(models.GlobalMapping).filter(models.GlobalMapping.status == "active").all()
+        mapping_by_feature = _build_latest_mapping_by_feature(all_gm)
+        candidates_by_feature = _build_all_candidates_by_feature(all_gm)
+
+        # Step 1 — revert previously applied group rows to their global baseline so a re-run
+        # reflects the current group_features (stale group mappings are undone). Local rows
+        # are excluded by construction (they are never mapped_from='group').
+        prior_group_rows = (
+            db.query(models.WorkspaceMapping)
+            .filter(models.WorkspaceMapping.mapped_from == "group")
+            .all()
+        )
+        for row in prior_group_rows:
+            target_attr, new_value, attr_type, mapped_from = _global_baseline_for_row(
+                str(row.legacy_feature_id or "").strip(),
+                str(row.legacy_value or ""),
+                mapping_by_feature,
+                candidates_by_feature,
+            )
+            row.new_attribute_id = target_attr
+            row.new_value = new_value
+            row.attribute_type = attr_type
+            row.mapped_from = mapped_from
+            row.updated_at = time.time()
+        db.commit()
+
+        # Step 2 — apply current group_features mappings.
+        gf_rows = db.query(models.GroupFeature).all()
+
+        # Distinct feature_group names -> set of items that contain that group
+        # (presence only; the group row's value is irrelevant).
+        feature_groups = sorted(
+            {str(gf.feature_group or "").strip() for gf in gf_rows if (gf.feature_group or "").strip()}
+        )
+        items_by_group: Dict[str, Set[str]] = {}
+        for fg in feature_groups:
+            item_ids = (
+                db.query(models.WorkspaceMapping.legacy_item_id)
+                .filter(models.WorkspaceMapping.legacy_feature_id == fg)
+                .distinct()
+                .all()
+            )
+            items_by_group[fg] = {r[0] for r in item_ids}
+
+        job.total_features = len(gf_rows)
+        db.commit()
+
+        generated_rows = 0
+        IN_CHUNK = 500
+        for i, gf in enumerate(gf_rows):
+            fg = str(gf.feature_group or "").strip()
+            sub_feature = str(gf.feature_id or "").strip()
+            option = str(gf.option or "")
+            target_attr = (gf.target_attribute or "").strip()
+
+            item_ids = items_by_group.get(fg) if (fg and sub_feature and target_attr) else None
+            if item_ids:
+                item_list = list(item_ids)
+                matched_rows: List[models.WorkspaceMapping] = []
+                for start in range(0, len(item_list), IN_CHUNK):
+                    chunk = item_list[start:start + IN_CHUNK]
+                    matched_rows.extend(
+                        db.query(models.WorkspaceMapping)
+                        .filter(models.WorkspaceMapping.legacy_item_id.in_(chunk))
+                        .filter(models.WorkspaceMapping.legacy_feature_id == sub_feature)
+                        .filter(models.WorkspaceMapping.legacy_value == option)
+                        .filter(models.WorkspaceMapping.mapped_from != "local")
+                        .all()
+                    )
+                for row in matched_rows:
+                    row.new_attribute_id = target_attr
+                    row.new_value = (gf.target_value or "")
+                    row.mapped_from = "group"
+                    row.modified_by = "apply_group_feature"
+                    row.modified_at = time.time()
+                    row.updated_at = time.time()
+                    generated_rows += 1
+
+            job.processed_features = i + 1
+            job.generated_rows = generated_rows
+            job.updated_at = time.time()
+            if (i + 1) % 50 == 0:
+                db.commit()
+
+        job.status = "completed"
+        job.finished_at = time.time()
+        job.updated_at = time.time()
+        job.generated_rows = generated_rows
+        db.commit()
+
+    except Exception as exc:
+        try:
+            job_row = (
+                db.query(models.ApplyGroupFeatureJob)
+                .filter(models.ApplyGroupFeatureJob.id == job_id)
+                .first()
+            )
+            if job_row:
+                job_row.status = "failed"
+                job_row.error_message = str(exc)[:500]
+                job_row.finished_at = time.time()
+                job_row.updated_at = time.time()
+                db.commit()
+        except Exception:
+            pass
+        logger.exception("Apply group feature job %s failed", job_id)
+    finally:
+        db.close()
+
+
+@router.get("/workspace-mappings/apply-group-features/progress")
+def get_apply_group_feature_progress(
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    job = (
+        db.query(models.ApplyGroupFeatureJob)
+        .order_by(models.ApplyGroupFeatureJob.id.desc())
         .first()
     )
     if not job:

@@ -4,7 +4,7 @@ import BOMHeader from './components/BOMHeader';
 import ItemSidebar from './components/ItemSidebar';
 import LoginSignUp from './components/LoginSignUp';
 import { dbService } from './services/dbService';
-import { GlobalMapping, DataCategory, DatabaseState, User, ConnectionMode, LocalItemMappings, FeatureFlags, MappingTypeConfig, MappingGenerationProgress, WorkspaceMappingRow } from './types';
+import { GlobalMapping, DataCategory, DatabaseState, User, ConnectionMode, LocalItemMappings, FeatureFlags, MappingTypeConfig, MappingGenerationProgress, ApplyGroupFeatureProgress, WorkspaceMappingRow } from './types';
 import { useBomPagination } from './hooks/useBomPagination';
 import { useLocking } from './hooks/useLocking';
 import { useItemStatusTracking } from './hooks/useItemStatusTracking';
@@ -67,6 +67,7 @@ const App: React.FC = () => {
     useNewClassTargetMapping: import.meta.env.VITE_USE_NEW_CLASS_TARGET_MAPPING === 'true',
   }));
   const [mappingGenerationProgress, setMappingGenerationProgress] = useState<MappingGenerationProgress | null>(null);
+  const [applyGroupFeatureProgress, setApplyGroupFeatureProgress] = useState<ApplyGroupFeatureProgress | null>(null);
   const [mlPredictionProgress, setMlPredictionProgress] = useState<{ status: string; progress: number; total: number; processed: number } | null>(null);
   const [mappingTotalCount, setMappingTotalCount] = useState(0);
   const [classificationTotalCount, setClassificationTotalCount] = useState(0);
@@ -354,6 +355,50 @@ const App: React.FC = () => {
     };
   }, [currentUser]);
 
+  useEffect(() => {
+    if (!currentUser) return;
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+
+    const pollProgress = async () => {
+      if (document.hidden) {
+        timer = setTimeout(pollProgress, 30000);
+        return;
+      }
+      try {
+        const progress = await dbService.fetchApplyGroupFeatureProgress();
+        if (!cancelled) {
+          setApplyGroupFeatureProgress(progress);
+        }
+        const isActive = progress.status === 'queued' || progress.status === 'running';
+        const waitMs = isActive ? 2000 : 15000;
+        if (!cancelled) {
+          timer = setTimeout(pollProgress, waitMs);
+        }
+      } catch {
+        if (!cancelled) {
+          timer = setTimeout(pollProgress, 15000);
+        }
+      }
+    };
+
+    const handleVisibilityChange = () => {
+      if (!document.hidden && !cancelled) {
+        if (timer) clearTimeout(timer);
+        pollProgress();
+      }
+    };
+
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    pollProgress();
+
+    return () => {
+      cancelled = true;
+      if (timer) clearTimeout(timer);
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+    };
+  }, [currentUser]);
+
   const handleSaveWorkspaceChanges = async (updates: {
     localMappings?: LocalItemMappings;
     itemClassifications?: Record<string, string>;
@@ -569,6 +614,32 @@ const App: React.FC = () => {
     }
   };
 
+  const isApplyGroupFeatureActive =
+    applyGroupFeatureProgress?.status === 'queued' || applyGroupFeatureProgress?.status === 'running';
+
+  const handleApplyGroupFeatures = async () => {
+    if (!confirm('Apply group feature mappings onto workspace mappings? This refreshes all group-sourced rows from the current group features.')) return;
+    try {
+      const result = await dbService.triggerApplyGroupFeatures();
+      if (result.jobId) {
+        setApplyGroupFeatureProgress(prev => ({
+          id: result.jobId ?? undefined,
+          status: 'queued',
+          isActive: true,
+          progress: 0,
+          totalFeatures: prev?.totalFeatures || 0,
+          processedFeatures: 0,
+          generatedRows: 0,
+          startedAt: null,
+          finishedAt: null,
+          error: null,
+        }));
+      }
+    } catch (err: any) {
+      alert(`Failed to apply group features: ${err?.message || String(err)}`);
+    }
+  };
+
   const handlePredictAll = async () => {
     if (!confirm('Run ML classification prediction on all BOM items? This may take a while.')) return;
     try {
@@ -731,6 +802,9 @@ const App: React.FC = () => {
         onRetriggerGeneration={handleRetriggerGeneration}
         onRevertAllToGlobal={handleRevertAllToGlobal}
         isMappingGenerationActive={isMappingGenerationActive}
+        applyGroupFeatureProgress={applyGroupFeatureProgress}
+        onApplyGroupFeatures={handleApplyGroupFeatures}
+        isApplyGroupFeatureActive={isApplyGroupFeatureActive}
         onPredictAll={handlePredictAll}
         mlPredictionProgress={mlPredictionProgress}
       />

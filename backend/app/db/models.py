@@ -236,6 +236,24 @@ class GroupFeatureMappingJob(Base):
     error_message = Column(String, nullable=True)
 
 
+class ApplyGroupFeatureJob(Base):
+    """Tracks background job that applies group_features mappings onto WorkspaceMapping rows."""
+
+    __tablename__ = "apply_group_feature_jobs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    status = Column(String, index=True, nullable=False)  # queued|running|completed|failed
+    triggered_by_user_id = Column(String, nullable=True)
+    triggered_by_username = Column(String, nullable=True)
+    total_features = Column(Integer, nullable=False, default=0)
+    processed_features = Column(Integer, nullable=False, default=0)
+    generated_rows = Column(Integer, nullable=False, default=0)
+    started_at = Column(Float, nullable=True)
+    finished_at = Column(Float, nullable=True)
+    updated_at = Column(Float, nullable=False, default=0)
+    error_message = Column(String, nullable=True)
+
+
 class TokenBlacklist(Base):
     """Revoked JWT tokens (jti claim). Checked on every authenticated request."""
 
