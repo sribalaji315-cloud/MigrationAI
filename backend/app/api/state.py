@@ -3,7 +3,7 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session, selectinload
 from sqlalchemy import func, or_, cast, case, String, literal_column, text as sa_text
 from sqlalchemy.exc import IntegrityError, OperationalError
-from typing import Dict, List, Any, Optional, Set
+from typing import Dict, List, Any, Optional, Set, Tuple
 import io, csv, re, time, hashlib, asyncio, logging, json
 from ..db import models
 from ..db.session import get_db, SessionLocal
@@ -354,6 +354,64 @@ def _start_generation_job(job_id: int, background_tasks: Optional["BackgroundTas
         loop.create_task(_run_mapping_generation_async(job_id))
 
 
+WorkspaceMetadataKey = Tuple[str, str, str]
+WorkspaceRevertMetadata = Dict[str, Optional[str]]
+
+
+def _workspace_metadata_key(item_id: Any, feature_id: Any, legacy_value: Any) -> WorkspaceMetadataKey:
+    return (
+        str(item_id or "").strip(),
+        str(feature_id or "").strip(),
+        "" if legacy_value is None else str(legacy_value),
+    )
+
+
+def _snapshot_workspace_revert_metadata(
+    db: Session,
+    item_id: Optional[str] = None,
+    include_local: bool = True,
+) -> Dict[WorkspaceMetadataKey, WorkspaceRevertMetadata]:
+    query = db.query(
+        models.WorkspaceMapping.legacy_item_id,
+        models.WorkspaceMapping.legacy_feature_id,
+        models.WorkspaceMapping.legacy_value,
+        models.WorkspaceMapping.feasibility,
+        models.WorkspaceMapping.condition,
+        models.WorkspaceMapping.value_status,
+    )
+    if item_id is not None:
+        query = query.filter(models.WorkspaceMapping.legacy_item_id == item_id)
+    if not include_local:
+        query = query.filter(models.WorkspaceMapping.mapped_from != "local")
+
+    return {
+        _workspace_metadata_key(row.legacy_item_id, row.legacy_feature_id, row.legacy_value): {
+            "feasibility": row.feasibility,
+            "condition": row.condition,
+            "value_status": row.value_status,
+        }
+        for row in query.all()
+    }
+
+
+def _resolve_workspace_revert_metadata(
+    preserved_metadata: Dict[WorkspaceMetadataKey, WorkspaceRevertMetadata],
+    item_id: Any,
+    feature_id: Any,
+    legacy_value: Any,
+    default_condition: Optional[str],
+    default_value_status: Optional[str],
+) -> WorkspaceRevertMetadata:
+    preserved = preserved_metadata.get(_workspace_metadata_key(item_id, feature_id, legacy_value))
+    if preserved is not None:
+        return preserved
+    return {
+        "feasibility": None,
+        "condition": default_condition,
+        "value_status": default_value_status,
+    }
+
+
 async def _run_mapping_generation_async(job_id: int):
     """Acquire async lock and run the CPU-bound generation in a thread pool executor."""
     async with _generation_lock:
@@ -390,6 +448,7 @@ def _run_mapping_generation_job(job_id: int):
         # Full regeneration keeps the workspace mapping source aligned with
         # latest BOM uploads and global mapping rules.
         # Preserve rows that were manually overridden (mapped_from == 'local').
+        preserved_revert_metadata = _snapshot_workspace_revert_metadata(db, include_local=False)
         db.query(models.WorkspaceMapping).filter(
             models.WorkspaceMapping.mapped_from != "local"
         ).delete(synchronize_session=False)
@@ -523,6 +582,14 @@ def _run_mapping_generation_job(job_id: int):
 
             signed_ts = job.started_at or time.time()
             if not values:
+                row_metadata = _resolve_workspace_revert_metadata(
+                    preserved_revert_metadata,
+                    legacy_item_id,
+                    feat_feature_id,
+                    "",
+                    feat_condition,
+                    feature_gm_status,
+                )
                 append_row(
                     {
                         "legacy_item_id": legacy_item_id,
@@ -531,10 +598,11 @@ def _run_mapping_generation_job(job_id: int):
                         "new_attribute_id": target_attr,
                         "new_value": "",
                         "attribute_type": attr_type,
-                        "condition": feat_condition,
+                        "condition": row_metadata["condition"],
                         "formula": feat_formula,
                         "mapped_from": "global",
-                        "value_status": feature_gm_status,
+                        "value_status": row_metadata["value_status"],
+                        "feasibility": row_metadata["feasibility"],
                         "signed_on_by_user_id": job.triggered_by_user_id,
                         "signed_on_by_username": job.triggered_by_username,
                         "signed_on_at": signed_ts,
@@ -557,7 +625,17 @@ def _run_mapping_generation_job(job_id: int):
                         if td_str and str(td_str).strip():
                             val_status = "discontinued"
 
-                    if val_status:
+                    row_metadata = _resolve_workspace_revert_metadata(
+                        preserved_revert_metadata,
+                        legacy_item_id,
+                        feat_feature_id,
+                        legacy_value,
+                        feat_condition,
+                        val_status,
+                    )
+                    effective_value_status = row_metadata["value_status"]
+
+                    if effective_value_status:
                         # Excluded row: keep target attr, set value to NOT REQUIRED
                         append_row(
                             {
@@ -567,10 +645,11 @@ def _run_mapping_generation_job(job_id: int):
                                 "new_attribute_id": target_attr,
                                 "new_value": "NOT REQUIRED",
                                 "attribute_type": attr_type,
-                                "condition": feat_condition,
+                                "condition": row_metadata["condition"],
                                 "formula": feat_formula,
                                 "mapped_from": "global",
-                                "value_status": val_status,
+                                "value_status": effective_value_status,
+                                "feasibility": row_metadata["feasibility"],
                                 "signed_on_by_user_id": job.triggered_by_user_id,
                                 "signed_on_by_username": job.triggered_by_username,
                                 "signed_on_at": signed_ts,
@@ -588,10 +667,11 @@ def _run_mapping_generation_job(job_id: int):
                                 "new_attribute_id": target_attr,
                                 "new_value": (resolved or ""),
                                 "attribute_type": attr_type,
-                                "condition": feat_condition,
+                                "condition": row_metadata["condition"],
                                 "formula": feat_formula,
                                 "mapped_from": "global" if resolved else "",
-                                "value_status": None,
+                                "value_status": effective_value_status,
+                                "feasibility": row_metadata["feasibility"],
                                 "signed_on_by_user_id": job.triggered_by_user_id,
                                 "signed_on_by_username": job.triggered_by_username,
                                 "signed_on_at": signed_ts,
@@ -2114,6 +2194,7 @@ def get_workspace_mappings_for_item(
 
 def _regenerate_item_from_global(item_id: str, user_id: str, username: str, db: Session):
     """Delete ALL workspace_mapping rows for an item and regenerate from global mappings."""
+    preserved_revert_metadata = _snapshot_workspace_revert_metadata(db, item_id=item_id)
     deleted = (
         db.query(models.WorkspaceMapping)
         .filter(models.WorkspaceMapping.legacy_item_id == item_id)
@@ -2180,6 +2261,14 @@ def _regenerate_item_from_global(item_id: str, user_id: str, username: str, db: 
             values = []
 
         if not values:
+            row_metadata = _resolve_workspace_revert_metadata(
+                preserved_revert_metadata,
+                item_id,
+                feat_feature_id,
+                "",
+                feat_condition,
+                feature_gm_status,
+            )
             db.add(models.WorkspaceMapping(
                 legacy_item_id=item_id,
                 legacy_feature_id=feat_feature_id,
@@ -2187,10 +2276,11 @@ def _regenerate_item_from_global(item_id: str, user_id: str, username: str, db: 
                 new_attribute_id=target_attr,
                 new_value="",
                 attribute_type=attr_type,
-                condition=feat_condition,
+                condition=row_metadata["condition"],
                 formula=feat_formula,
                 mapped_from="global",
-                value_status=feature_gm_status,
+                value_status=row_metadata["value_status"],
+                feasibility=row_metadata["feasibility"],
                 signed_on_by_user_id=user_id,
                 signed_on_by_username=username,
                 signed_on_at=signed_ts,
@@ -2214,7 +2304,17 @@ def _regenerate_item_from_global(item_id: str, user_id: str, username: str, db: 
                     if td_str and str(td_str).strip():
                         val_status = "discontinued"
 
-                if val_status:
+                row_metadata = _resolve_workspace_revert_metadata(
+                    preserved_revert_metadata,
+                    item_id,
+                    feat_feature_id,
+                    legacy_value,
+                    feat_condition,
+                    val_status,
+                )
+                effective_value_status = row_metadata["value_status"]
+
+                if effective_value_status:
                     db.add(models.WorkspaceMapping(
                         legacy_item_id=item_id,
                         legacy_feature_id=feat_feature_id,
@@ -2222,10 +2322,11 @@ def _regenerate_item_from_global(item_id: str, user_id: str, username: str, db: 
                         new_attribute_id=target_attr,
                         new_value="NOT REQUIRED",
                         attribute_type=attr_type,
-                        condition=feat_condition,
+                        condition=row_metadata["condition"],
                         formula=feat_formula,
                         mapped_from="global",
-                        value_status=val_status,
+                        value_status=effective_value_status,
+                        feasibility=row_metadata["feasibility"],
                         signed_on_by_user_id=user_id,
                         signed_on_by_username=username,
                         signed_on_at=signed_ts,
@@ -2245,10 +2346,11 @@ def _regenerate_item_from_global(item_id: str, user_id: str, username: str, db: 
                         new_attribute_id=target_attr,
                         new_value=(resolved or ""),
                         attribute_type=attr_type,
-                        condition=feat_condition,
+                        condition=row_metadata["condition"],
                         formula=feat_formula,
                         mapped_from="global" if resolved else "",
-                        value_status=None,
+                        value_status=effective_value_status,
+                        feasibility=row_metadata["feasibility"],
                         signed_on_by_user_id=user_id,
                         signed_on_by_username=username,
                         signed_on_at=signed_ts,
@@ -8587,6 +8689,7 @@ def list_group_features(
             "targetAttribute": r.target_attribute,
             "targetValue": r.target_value,
             "valueStatus": r.value_status,
+            "comments": r.comments,
             "valuelistId": r.valuelist_id,
             "whereUsedCount": where_used_counts.get(r.feature_group, 0),
             "suggestedAttributes": r.suggested_attributes,
@@ -8999,6 +9102,8 @@ def update_group_feature_row(
         if new_status not in GROUP_FEATURE_VALUE_STATUSES:
             raise HTTPException(status_code=400, detail="Invalid status")
         row.value_status = new_status
+    if "comments" in payload:
+        row.comments = (str(payload["comments"]).strip() or None) if payload["comments"] else None
 
     db.commit()
     db.refresh(row)
@@ -9008,6 +9113,7 @@ def update_group_feature_row(
         "targetAttribute": row.target_attribute,
         "targetValue": row.target_value,
         "valueStatus": row.value_status,
+        "comments": row.comments,
     }
 
 

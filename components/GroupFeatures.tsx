@@ -181,6 +181,53 @@ const statusColor = (s: string) => {
 
 const STATUS_OPTIONS = ['in_progress', 'review', 'approved', 'discontinued', 'ignored'];
 
+/* ---------- Inline text editor ---------- */
+interface InlineTextInputProps {
+  value: string | null;
+  onSave: (val: string | null) => void;
+  placeholder?: string;
+}
+
+const InlineTextInput: React.FC<InlineTextInputProps> = ({ value, onSave, placeholder }) => {
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState(value || '');
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => { if (editing) setTimeout(() => inputRef.current?.focus(), 30); }, [editing]);
+
+  const commit = useCallback(() => {
+    const trimmed = draft.trim();
+    if (trimmed !== (value || '')) onSave(trimmed || null);
+    setEditing(false);
+  }, [draft, value, onSave]);
+
+  if (!editing) {
+    return (
+      <span
+        onClick={(e) => { e.stopPropagation(); setDraft(value || ''); setEditing(true); }}
+        className={`cursor-pointer px-1 py-0.5 rounded text-xs hover:ring-1 hover:ring-blue-400 inline-block min-w-[40px] max-w-[160px] truncate ${value ? 'text-slate-600' : 'text-slate-300'}`}
+        title={value || 'Click to add comment'}
+      >
+        {value || placeholder || '—'}
+      </span>
+    );
+  }
+
+  return (
+    <input
+      ref={inputRef}
+      type="text"
+      value={draft}
+      onClick={e => e.stopPropagation()}
+      onChange={e => setDraft(e.target.value)}
+      onBlur={commit}
+      onKeyDown={e => { if (e.key === 'Enter') commit(); else if (e.key === 'Escape') setEditing(false); }}
+      placeholder={placeholder || 'Comment…'}
+      className="w-full px-1.5 py-0.5 border border-blue-400 rounded text-xs focus:outline-none focus:ring-1 focus:ring-blue-500 min-w-[120px]"
+    />
+  );
+};
+
 /* ---------- Inline searchable dropdown ---------- */
 interface InlineDropdownProps {
   value: string | null;
@@ -380,7 +427,7 @@ interface ColDef {
 }
 
 interface ColumnCallbacks {
-  onUpdateRow: (id: number, updates: { targetAttribute?: string | null; targetValue?: string | null; valueStatus?: string }) => void;
+  onUpdateRow: (id: number, updates: { targetAttribute?: string | null; targetValue?: string | null; valueStatus?: string; comments?: string | null }) => void;
   fetchAttrOptions: (search: string) => Promise<{ label: string; description?: string }[]>;
   fetchValOptions: (attributeId: string, search: string) => Promise<{ label: string; description?: string }[]>;
   isAdmin: boolean;
@@ -440,6 +487,9 @@ const ALL_COLUMNS: ColDef[] = [
     return <InlineStatusDropdown value={r.valueStatus} onSave={(val) => cb.onUpdateRow(r.id, { valueStatus: val })} />;
   }},
   { key: 'valueList', label: 'Value List', render: r => <span className="text-slate-400 whitespace-nowrap">{r.valuelistId || '—'}</span> },
+  { key: 'comments', label: 'Comments', render: (r, cb) => (
+    <InlineTextInput value={r.comments} onSave={(val) => cb?.onUpdateRow(r.id, { comments: val })} placeholder="Add comment" />
+  ) },
   { key: 'suggestedAttrs', label: 'Suggested Attrs', defaultVisible: false, render: r => {
     const sa = r.suggestedAttributes;
     if (!sa || sa.length === 0) return <span className="text-slate-300">—</span>;
@@ -603,7 +653,7 @@ const GroupFeatures: React.FC<GroupFeaturesProps> = ({ currentUser, onClose }) =
   useEffect(() => { fetchStats(); }, [fetchStats]);
 
   // --- Inline editing callbacks ---
-  const handleUpdateRow = useCallback(async (id: number, updates: { targetAttribute?: string | null; targetValue?: string | null; valueStatus?: string }) => {
+  const handleUpdateRow = useCallback(async (id: number, updates: { targetAttribute?: string | null; targetValue?: string | null; valueStatus?: string; comments?: string | null }) => {
     try {
       const result = await dbService.updateGroupFeatureRow(id, updates);
       setRows(prev => prev.map(r => r.id === id ? {
@@ -611,12 +661,14 @@ const GroupFeatures: React.FC<GroupFeaturesProps> = ({ currentUser, onClose }) =
         targetAttribute: result.targetAttribute,
         targetValue: result.targetValue,
         valueStatus: result.valueStatus,
+        comments: result.comments,
       } : r));
       setSubFeatures(prev => prev.map(r => r.id === id ? {
         ...r,
         targetAttribute: result.targetAttribute,
         targetValue: result.targetValue,
         valueStatus: result.valueStatus,
+        comments: result.comments,
       } : r));
       fetchStats();
     } catch (err: any) {

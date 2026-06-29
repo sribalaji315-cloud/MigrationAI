@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
-import { LegacyItem, User, WorkspaceMappingRow } from '../types';
+import { LegacyItem, User, WorkspaceMappingRow, ItemApprovalState } from '../types';
 import { dbService } from '../services/dbService';
 import { buildCsv } from '../utils/csvHelpers';
 
@@ -25,6 +25,90 @@ const valueStatusTone = (raw?: string | null): string => {
   if (v === 'deprecated') return 'bg-orange-100 text-orange-700 border-orange-200';
   if (v === 'ignored') return 'bg-slate-100 text-slate-600 border-slate-200';
   return 'bg-slate-100 text-slate-600 border-slate-200';
+};
+
+const formatApprovalTitle = (by?: string | null, at?: number | null): string | undefined => {
+  if (!by && !at) return undefined;
+  const parts: string[] = [];
+  if (by) parts.push(`Approved by ${by}`);
+  if (at) parts.push(new Date(at < 1e12 ? at * 1000 : at).toLocaleString());
+  return parts.join(' • ');
+};
+
+interface MultiSelectFilterProps {
+  label: string;
+  options: string[];
+  selected: string[];
+  onChange: (next: string[]) => void;
+}
+
+const MultiSelectFilter: React.FC<MultiSelectFilterProps> = ({ label, options, selected, onChange }) => {
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    const handler = (e: MouseEvent) => {
+      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
+    };
+    document.addEventListener('mousedown', handler);
+    return () => document.removeEventListener('mousedown', handler);
+  }, [open]);
+
+  const toggle = (opt: string) => {
+    if (selected.includes(opt)) onChange(selected.filter(o => o !== opt));
+    else onChange([...selected, opt]);
+  };
+
+  const active = selected.length > 0;
+  const summary = active ? `${label} (${selected.length})` : label;
+
+  return (
+    <div className="relative" ref={ref}>
+      <button
+        type="button"
+        onClick={() => setOpen(o => !o)}
+        className={`flex items-center gap-1 px-2 py-1 border rounded-md text-[10px] font-bold outline-none transition-colors ${
+          active ? 'border-sky-400 bg-sky-50 text-sky-700' : 'border-slate-200 bg-white text-slate-600 hover:bg-slate-50'
+        }`}
+      >
+        <span>{summary}</span>
+        <svg className={`w-3 h-3 transition-transform ${open ? 'rotate-180' : ''}`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M19 9l-7 7-7-7" />
+        </svg>
+      </button>
+      {open && (
+        <div className="absolute left-0 z-20 mt-1 w-52 max-h-64 overflow-y-auto bg-white border border-slate-200 rounded-md shadow-lg py-1">
+          {options.length === 0 ? (
+            <div className="px-3 py-2 text-[10px] text-slate-400 font-medium">No options</div>
+          ) : (
+            <>
+              {active && (
+                <button
+                  type="button"
+                  onClick={() => onChange([])}
+                  className="w-full text-left px-3 py-1.5 text-[9px] font-black uppercase tracking-wider text-slate-400 hover:bg-slate-50 border-b border-slate-100"
+                >
+                  Clear selection
+                </button>
+              )}
+              {options.map(opt => (
+                <label key={opt} className="flex items-center gap-2 px-3 py-1.5 text-[10px] text-slate-600 hover:bg-slate-50 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={selected.includes(opt)}
+                    onChange={() => toggle(opt)}
+                    className="w-3 h-3 rounded border-slate-300 text-sky-600 focus:ring-sky-400"
+                  />
+                  <span className="truncate font-medium">{opt}</span>
+                </label>
+              ))}
+            </>
+          )}
+        </div>
+      )}
+    </div>
+  );
 };
 
 interface FeatureGroup {
@@ -59,11 +143,13 @@ const ProductViewer: React.FC<ProductViewerProps> = ({ currentUser, onClose }) =
   const [mappingRows, setMappingRows] = useState<WorkspaceMappingRow[]>([]);
   const [isLoadingMappings, setIsLoadingMappings] = useState(false);
   const [statusMessage, setStatusMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
+  const [approvalState, setApprovalState] = useState<ItemApprovalState | null>(null);
 
-  // Right pane: mapping-level filters
-  const [filterLegacyAttribute, setFilterLegacyAttribute] = useState('');
-  const [filterFeasibility, setFilterFeasibility] = useState('');
-  const [filterValueStatus, setFilterValueStatus] = useState('');
+  // Right pane: mapping-level filters (multi-select)
+  const [filterLegacyAttributes, setFilterLegacyAttributes] = useState<string[]>([]);
+  const [filterAttributeTypes, setFilterAttributeTypes] = useState<string[]>([]);
+  const [filterFeasibilities, setFilterFeasibilities] = useState<string[]>([]);
+  const [filterValueStatuses, setFilterValueStatuses] = useState<string[]>([]);
 
   const loadGenRef = useRef(0);
 
@@ -115,14 +201,23 @@ const ProductViewer: React.FC<ProductViewerProps> = ({ currentUser, onClose }) =
   const handleSelectItem = useCallback(async (item: LegacyItem) => {
     setSelectedItem(item);
     setStatusMessage(null);
-    setFilterLegacyAttribute('');
-    setFilterFeasibility('');
-    setFilterValueStatus('');
+    setFilterLegacyAttributes([]);
+    setFilterAttributeTypes([]);
+    setFilterFeasibilities([]);
+    setFilterValueStatuses([]);
+    setApprovalState(null);
     setIsLoadingMappings(true);
     setMappingRows([]);
     try {
-      const rows = await dbService.fetchWorkspaceMappings(item.itemId);
+      const [rows, approval] = await Promise.all([
+        dbService.fetchWorkspaceMappings(item.itemId),
+        dbService.fetchItemApprovalState(item.itemId).catch(err => {
+          console.warn('Failed to load approval state for', item.itemId, err);
+          return null;
+        }),
+      ]);
       setMappingRows(rows);
+      setApprovalState(approval);
     } catch (err) {
       console.warn('Failed to load mappings for', item.itemId, err);
       setStatusMessage({ type: 'error', text: 'Failed to load mappings for this product.' });
@@ -134,15 +229,18 @@ const ProductViewer: React.FC<ProductViewerProps> = ({ currentUser, onClose }) =
   // Distinct option lists for the right-pane filters
   const mappingFilterOptions = useMemo(() => {
     const legacyAttributes = new Set<string>();
+    const attributeTypes = new Set<string>();
     const feasibilities = new Set<string>();
     const valueStatuses = new Set<string>();
     for (const row of mappingRows) {
       if (row.legacyFeatureId) legacyAttributes.add(row.legacyFeatureId);
+      if (row.attributeType) attributeTypes.add(row.attributeType);
       if (row.feasibility) feasibilities.add(row.feasibility);
       if (row.valueStatus) valueStatuses.add(row.valueStatus);
     }
     return {
       legacyAttributes: Array.from(legacyAttributes).sort((a, b) => a.localeCompare(b)),
+      attributeTypes: Array.from(attributeTypes).sort((a, b) => a.localeCompare(b)),
       feasibilities: Array.from(feasibilities).sort((a, b) => a.localeCompare(b)),
       valueStatuses: Array.from(valueStatuses).sort((a, b) => a.localeCompare(b)),
     };
@@ -151,12 +249,13 @@ const ProductViewer: React.FC<ProductViewerProps> = ({ currentUser, onClose }) =
   // Apply the right-pane filters to the raw mapping rows
   const filteredMappingRows = useMemo(() => {
     return mappingRows.filter(row => {
-      if (filterLegacyAttribute && row.legacyFeatureId !== filterLegacyAttribute) return false;
-      if (filterFeasibility && (row.feasibility || '') !== filterFeasibility) return false;
-      if (filterValueStatus && (row.valueStatus || '') !== filterValueStatus) return false;
+      if (filterLegacyAttributes.length && !filterLegacyAttributes.includes(row.legacyFeatureId)) return false;
+      if (filterAttributeTypes.length && !filterAttributeTypes.includes(row.attributeType || '')) return false;
+      if (filterFeasibilities.length && !filterFeasibilities.includes(row.feasibility || '')) return false;
+      if (filterValueStatuses.length && !filterValueStatuses.includes(row.valueStatus || '')) return false;
       return true;
     });
-  }, [mappingRows, filterLegacyAttribute, filterFeasibility, filterValueStatus]);
+  }, [mappingRows, filterLegacyAttributes, filterAttributeTypes, filterFeasibilities, filterValueStatuses]);
 
   // Group mapping rows by legacy feature for the right pane
   const featureGroups = useMemo<FeatureGroup[]>(() => {
@@ -182,11 +281,12 @@ const ProductViewer: React.FC<ProductViewerProps> = ({ currentUser, onClose }) =
     }));
   }, [filteredMappingRows, selectedItem]);
 
-  const hasMappingFilters = !!(filterLegacyAttribute || filterFeasibility || filterValueStatus);
+  const hasMappingFilters = !!(filterLegacyAttributes.length || filterAttributeTypes.length || filterFeasibilities.length || filterValueStatuses.length);
   const clearMappingFilters = () => {
-    setFilterLegacyAttribute('');
-    setFilterFeasibility('');
-    setFilterValueStatus('');
+    setFilterLegacyAttributes([]);
+    setFilterAttributeTypes([]);
+    setFilterFeasibilities([]);
+    setFilterValueStatuses([]);
   };
 
   const totalPages = Math.max(1, Math.ceil(totalCount / PAGE_SIZE));
@@ -415,34 +515,46 @@ const ProductViewer: React.FC<ProductViewerProps> = ({ currentUser, onClose }) =
                   {selectedItem.classification && (
                     <span className="px-2 py-0.5 rounded-full text-[8px] font-black uppercase tracking-widest bg-indigo-50 text-indigo-600 border border-indigo-100">{selectedItem.classification}</span>
                   )}
+                  {approvalState && (
+                    <span
+                      title={approvalState.itemApproved ? formatApprovalTitle(approvalState.approvedByUsername, approvalState.approvedAt) : undefined}
+                      className={`px-2 py-0.5 rounded-full text-[8px] font-black uppercase tracking-widest border ${
+                        approvalState.itemApproved
+                          ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
+                          : 'bg-slate-100 text-slate-500 border-slate-200'
+                      }`}
+                    >
+                      {approvalState.itemApproved ? 'Item Approved' : 'Item Pending'}
+                    </span>
+                  )}
                 </div>
                 <p className="text-[11px] text-slate-500 font-medium mt-0.5">{selectedItem.description}</p>
 
                 <div className="flex flex-wrap items-center gap-1.5 mt-2.5">
-                  <select
-                    value={filterLegacyAttribute}
-                    onChange={e => setFilterLegacyAttribute(e.target.value)}
-                    className="px-2 py-1 border border-slate-200 rounded-md text-[10px] bg-white focus:ring-1 focus:ring-sky-400 outline-none"
-                  >
-                    <option value="">All Legacy Attributes</option>
-                    {mappingFilterOptions.legacyAttributes.map(a => <option key={a} value={a}>{a}</option>)}
-                  </select>
-                  <select
-                    value={filterFeasibility}
-                    onChange={e => setFilterFeasibility(e.target.value)}
-                    className="px-2 py-1 border border-slate-200 rounded-md text-[10px] bg-white focus:ring-1 focus:ring-sky-400 outline-none"
-                  >
-                    <option value="">All Feasibility</option>
-                    {mappingFilterOptions.feasibilities.map(f => <option key={f} value={f}>{f}</option>)}
-                  </select>
-                  <select
-                    value={filterValueStatus}
-                    onChange={e => setFilterValueStatus(e.target.value)}
-                    className="px-2 py-1 border border-slate-200 rounded-md text-[10px] bg-white focus:ring-1 focus:ring-sky-400 outline-none"
-                  >
-                    <option value="">All Value Status</option>
-                    {mappingFilterOptions.valueStatuses.map(s => <option key={s} value={s}>{s}</option>)}
-                  </select>
+                  <MultiSelectFilter
+                    label="Legacy Attribute"
+                    options={mappingFilterOptions.legacyAttributes}
+                    selected={filterLegacyAttributes}
+                    onChange={setFilterLegacyAttributes}
+                  />
+                  <MultiSelectFilter
+                    label="Attribute Type"
+                    options={mappingFilterOptions.attributeTypes}
+                    selected={filterAttributeTypes}
+                    onChange={setFilterAttributeTypes}
+                  />
+                  <MultiSelectFilter
+                    label="Feasibility"
+                    options={mappingFilterOptions.feasibilities}
+                    selected={filterFeasibilities}
+                    onChange={setFilterFeasibilities}
+                  />
+                  <MultiSelectFilter
+                    label="Value Status"
+                    options={mappingFilterOptions.valueStatuses}
+                    selected={filterValueStatuses}
+                    onChange={setFilterValueStatuses}
+                  />
                   {hasMappingFilters && (
                     <button
                       type="button"
@@ -477,6 +589,22 @@ const ProductViewer: React.FC<ProductViewerProps> = ({ currentUser, onClose }) =
                             {group.rows[0]?.attributeType && (
                               <span className="px-1.5 py-0.5 rounded-[3px] text-[7px] font-black uppercase bg-slate-200 text-slate-500">{group.rows[0].attributeType}</span>
                             )}
+                            {(() => {
+                              const fa = approvalState?.features?.[group.legacyFeatureId];
+                              const approved = !!fa;
+                              return (
+                                <span
+                                  title={approved ? formatApprovalTitle(fa?.approvedByUsername, fa?.approvedAt) : undefined}
+                                  className={`ml-auto px-1.5 py-0.5 rounded-[3px] text-[7px] font-black uppercase border ${
+                                    approved
+                                      ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
+                                      : 'bg-slate-100 text-slate-500 border-slate-200'
+                                  }`}
+                                >
+                                  {approved ? 'Approved' : 'Pending'}
+                                </span>
+                              );
+                            })()}
                           </div>
                           {group.description && <p className="text-[10px] text-slate-400 font-medium mt-0.5">{group.description}</p>}
                         </div>

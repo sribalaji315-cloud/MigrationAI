@@ -614,6 +614,7 @@ export interface GroupFeatureRow {
   targetAttribute: string | null;
   targetValue: string | null;
   valueStatus: string;
+  comments: string | null;
   valuelistId: string | null;
   whereUsedCount?: number;
   suggestedAttributes?: { attributeId: string; description: string; score: number }[] | null;

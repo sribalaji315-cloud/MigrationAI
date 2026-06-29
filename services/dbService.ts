@@ -1707,7 +1707,7 @@ export const dbService = {
     return resp.json();
   },
 
-  async updateGroupFeatureRow(id: number, updates: { targetAttribute?: string | null; targetValue?: string | null; valueStatus?: string }): Promise<{ ok: boolean; id: number; targetAttribute: string | null; targetValue: string | null; valueStatus: string }> {
+  async updateGroupFeatureRow(id: number, updates: { targetAttribute?: string | null; targetValue?: string | null; valueStatus?: string; comments?: string | null }): Promise<{ ok: boolean; id: number; targetAttribute: string | null; targetValue: string | null; valueStatus: string; comments: string | null }> {
     const resp = await this._fetchWithRefresh(`${SQL_ENDPOINT}/group-features/update-row`, {
       method: 'POST',
       headers: { ...this._authHeaders(), 'Content-Type': 'application/json' },

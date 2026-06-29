@@ -1497,26 +1497,31 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
   const isReadOnly = !canEdit;
   const isGenerationBlocked = isGenerationActive && isLockedByMe;
   const isDirty = isEditingRef.current;
+  const bannerMutedText = isLockedByMe || lockOwner ? 'text-white/70' : 'text-slate-500';
+  const bannerStrongText = isLockedByMe || lockOwner ? 'text-white/90' : 'text-slate-700';
+  const priorityBadgeClass = isLockedByMe || lockOwner
+    ? 'bg-white/15 border-white/20 text-white'
+    : 'bg-amber-50 border-amber-200 text-amber-700';
 
   return (
     <div className="flex-1 overflow-y-auto p-4 space-y-4 bg-[#F8FAFC]">
       <div className="max-w-6xl mx-auto space-y-4">
         
         {/* Compact Collaboration Banner */}
-        <div className={`px-4 py-2.5 rounded-xl flex items-center justify-between border shadow-sm transition-all duration-300 ${
+        <div className={`px-4 py-2.5 rounded-xl flex items-center justify-between gap-4 border shadow-sm transition-all duration-300 ${
           isLockedByMe 
             ? 'bg-indigo-600 border-indigo-500 text-white' 
             : lockOwner 
               ? 'bg-amber-600 border-amber-500 text-white' 
               : 'bg-white border-slate-200 text-slate-900 shadow-sm'
         }`}>
-          <div className="flex items-center gap-3">
+          <div className="flex items-center gap-3 min-w-0 flex-1">
              <div className={`w-8 h-8 rounded-lg flex items-center justify-center shadow-inner ${isLockedByMe ? 'bg-white/20' : lockOwner ? 'bg-black/10' : 'bg-slate-100 text-slate-400'}`}>
                 <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d={isLockedByMe ? "M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" : "M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z"} />
                 </svg>
              </div>
-             <div>
+             <div className="shrink-0">
                 <p className="text-[10px] font-black uppercase tracking-widest leading-none">
                    {isLockedByMe ? 'ACTIVE SESSION' : lockOwner ? `LOCKED BY ${lockOwner.userName.toUpperCase()}` : 'READ-ONLY VIEW'}
                 </p>
@@ -1525,10 +1530,20 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
                 </p>
              </div>
              {item && (
-               <div className={`ml-4 flex items-center gap-3 text-[9px] font-bold ${isLockedByMe || lockOwner ? 'text-white/70' : 'text-slate-500'}`}>
-                 <span className="border-l border-current/20 pl-3">{item.itemId}</span>
-                 {item.category && <span className="border-l border-current/20 pl-3">{item.category}</span>}
-                 {item.productType && <span className="border-l border-current/20 pl-3">{item.productType}</span>}
+               <div className={`ml-4 min-w-0 flex-1 border-l border-current/20 pl-3 ${bannerMutedText}`}>
+                 <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[9px] font-bold">
+                   <span className="shrink-0">{item.itemId}</span>
+                   {item.priority != null && (
+                     <span className={`shrink-0 px-1.5 py-0.5 rounded-[3px] border text-[7px] font-black uppercase tracking-widest ${priorityBadgeClass}`}>
+                       Priority {item.priority}
+                     </span>
+                   )}
+                   {item.category && <span className="shrink-0">{item.category}</span>}
+                   {item.productType && <span className="shrink-0">{item.productType}</span>}
+                 </div>
+                 <p className={`mt-0.5 truncate text-[9px] font-bold ${bannerStrongText}`} title={item.description || 'No description'}>
+                   {item.description || 'No description'}
+                 </p>
                </div>
              )}
           </div>
@@ -2084,8 +2099,12 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
                           targetValueDescription = descMap[mappedValue] || '';
                         }
 
-                        // Per-row metadata sourced from workspace_mappings (via grouped GlobalMapping.valueMeta)
-                        const valueMeta = effectiveMapping?.valueMeta?.[v];
+                        // Per-row metadata sourced from workspace_mappings (via grouped GlobalMapping.valueMeta).
+                        // localByFeature keeps only one group per feature, so unmapped rows (blank target) get
+                        // dropped. Fall back to any staged local mapping for this feature carrying metadata for
+                        // the value, so feasibility/condition/status still surface.
+                        const valueMeta = effectiveMapping?.valueMeta?.[v]
+                          || stagedLocalMappings.find(m => (m.legacyFeatureIds || []).includes(f.featureId) && m.valueMeta?.[v])?.valueMeta?.[v];
                         const rowCondition = (valueMeta?.condition ?? f.condition) || '';
                         const rowFeasibility = valueMeta?.feasibility || '';
                         const rowValueStatus = valueMeta?.valueStatus || '';
@@ -2151,7 +2170,11 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
                                   ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
                                   : rowFeasibility === 'No'
                                     ? 'bg-rose-50 text-rose-600 border-rose-200'
-                                    : 'bg-slate-50 text-slate-300 border-slate-100'
+                                    : rowFeasibility === 'Conditional'
+                                      ? 'bg-violet-50 text-violet-700 border-violet-200'
+                                      : rowFeasibility === 'Review'
+                                        ? 'bg-amber-50 text-amber-700 border-amber-200'
+                                        : 'bg-slate-50 text-slate-300 border-slate-100'
                               }`}
                               title={rowFeasibility ? `Feasibility: ${rowFeasibility}` : 'Feasibility not set'}
                             >
