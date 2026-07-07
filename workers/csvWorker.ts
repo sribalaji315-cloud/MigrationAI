@@ -64,9 +64,12 @@ export type CsvWorkerResponse =
  * Merge item-feature rows with group-feature sub-features.
  *
  * File 1 (item features): one row per item+feature+option.
- *   The last column (groupFeature) names the group-feature that this item uses.
- * File 2 (group features): one row per group+sub-feature+option.
- *   Sub-features are expanded into the item's feature list.
+ * File 2 (group features): one row per group+sub-feature+option, grouped by FeatureGroup.
+ *
+ * Linkage: an item "uses" a group when one of its own feature codes matches a
+ *   FeatureGroup code in File 2. That group's sub-features are then expanded into
+ *   the item's feature list. As a fallback, a non-empty `groupFeature` column value
+ *   on an item row also triggers expansion of the named group.
  */
 function mergeGroupFeatures(input: MergeGroupFeaturesInput): { items: MergedBomItem[]; stats: { totalItems: number; totalFeatures: number; groupFeaturesExpanded: number } } {
   const { itemFeatureRows, groupFeatureRows, itemCols, groupCols } = input;
@@ -115,8 +118,8 @@ function mergeGroupFeatures(input: MergeGroupFeaturesInput): { items: MergedBomI
 
   // --- 2. Build item map from item-feature rows ---
   const byItem = new Map<string, MergedBomItem>();
-  // Track which (item, groupName) pairs we've already expanded
-  const expandedGroups = new Set<string>();
+  // Fallback: explicit group names named by an item's `groupFeature` column
+  const itemGroupTriggers = new Map<string, Set<string>>();
   let groupFeaturesExpanded = 0;
 
   for (const row of itemFeatureRows) {
@@ -165,41 +168,53 @@ function mergeGroupFeatures(input: MergeGroupFeaturesInput): { items: MergedBomI
       }
     }
 
-    // Expand group feature sub-features into this item
-    const groupName = (row[itemCols.groupFeature] || '').trim();
-    if (groupName) {
-      const expandKey = `${itemId}\x00${groupName}`;
-      if (!expandedGroups.has(expandKey)) {
-        expandedGroups.add(expandKey);
-        const subs = groupMap.get(groupName);
-        if (subs) {
-          for (const sub of subs) {
-            let feat = item.features.find(f => f.featureId === sub.featureId);
-            if (!feat) {
-              feat = {
-                featureId: sub.featureId,
-                description: sub.description,
-                values: [...sub.values],
-                condition: sub.condition,
-                valueDescriptions: { ...sub.valueDescriptions },
-                valueTillDates: { ...sub.valueTillDates },
-              };
-              item.features.push(feat);
-              groupFeaturesExpanded++;
-            } else {
-              // Merge values from group into existing feature
-              for (const v of sub.values) {
-                if (!feat.values.includes(v)) {
-                  feat.values.push(v);
-                  if (sub.valueDescriptions[v]) {
-                    if (!feat.valueDescriptions) feat.valueDescriptions = {};
-                    feat.valueDescriptions[v] = sub.valueDescriptions[v];
-                  }
-                  if (sub.valueTillDates[v]) {
-                    if (!feat.valueTillDates) feat.valueTillDates = {};
-                    feat.valueTillDates[v] = sub.valueTillDates[v];
-                  }
-                }
+    // Fallback linkage: record any explicit group named by the item's groupFeature column
+    const groupCol = itemCols.groupFeature ? (row[itemCols.groupFeature] || '').trim() : '';
+    if (groupCol) {
+      let set = itemGroupTriggers.get(itemId);
+      if (!set) { set = new Set<string>(); itemGroupTriggers.set(itemId, set); }
+      set.add(groupCol);
+    }
+  }
+
+  // --- 3. Expand group sub-features into each item ---
+  // An item triggers a group when one of its own feature codes matches a FeatureGroup,
+  // or when its groupFeature column named the group (fallback). Snapshot the trigger
+  // names before expanding so newly added sub-features don't recursively re-expand.
+  for (const item of byItem.values()) {
+    const triggers = new Set<string>();
+    for (const f of item.features) triggers.add(f.featureId);
+    const explicit = itemGroupTriggers.get(item.itemId);
+    if (explicit) for (const g of explicit) triggers.add(g);
+
+    for (const groupName of triggers) {
+      const subs = groupMap.get(groupName);
+      if (!subs) continue;
+      for (const sub of subs) {
+        let feat = item.features.find(f => f.featureId === sub.featureId);
+        if (!feat) {
+          feat = {
+            featureId: sub.featureId,
+            description: sub.description,
+            values: [...sub.values],
+            condition: sub.condition,
+            valueDescriptions: { ...sub.valueDescriptions },
+            valueTillDates: { ...sub.valueTillDates },
+          };
+          item.features.push(feat);
+          groupFeaturesExpanded++;
+        } else {
+          // Merge values from group into existing feature
+          for (const v of sub.values) {
+            if (!feat.values.includes(v)) {
+              feat.values.push(v);
+              if (sub.valueDescriptions[v]) {
+                if (!feat.valueDescriptions) feat.valueDescriptions = {};
+                feat.valueDescriptions[v] = sub.valueDescriptions[v];
+              }
+              if (sub.valueTillDates[v]) {
+                if (!feat.valueTillDates) feat.valueTillDates = {};
+                feat.valueTillDates[v] = sub.valueTillDates[v];
               }
             }
           }

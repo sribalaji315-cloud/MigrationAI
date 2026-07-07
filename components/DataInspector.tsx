@@ -222,6 +222,7 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
   const [remoteAttribute, setRemoteAttribute] = useState<NewAttribute | null>(null);
   const [isAttributeLoading, setIsAttributeLoading] = useState(false);
   const [isCsvImporting, setIsCsvImporting] = useState(false);
+  const [isSwingFeasibilityImporting, setIsSwingFeasibilityImporting] = useState(false);
   const [csvImportProgress, setCsvImportProgress] = useState(0);
   const [isSaving, setIsSaving] = useState(false);
   const [isAutoSaving, setIsAutoSaving] = useState(false);
@@ -1825,7 +1826,7 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
       const lower = (s: string) => s.toLowerCase().replace(/[^a-z0-9]/g, '');
       for (const h of headers) {
         const l = lower(h);
-        if (l === 'featuregroup' || l === 'group') autoMap.featureGroup = h;
+        if (l === 'featuregroup') autoMap.featureGroup = h;
         else if (l === 'feature' || l === 'featureid') autoMap.feature = h;
         else if (l === 'featuredesc' || l === 'featuredescription') autoMap.featureDesc = h;
         else if (l === 'option' || l === 'optionid') autoMap.option = h;
@@ -2006,6 +2007,25 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
       alert('BOM data wiped successfully.');
     } catch (err: any) {
       alert(`Failed to wipe BOM data: ${err?.message || String(err)}`);
+    }
+  };
+
+  const handleImportSwingFeasibility = async () => {
+    if (currentUser.role !== 'admin') {
+      alert('Only administrators may import swing feasibility data.');
+      return;
+    }
+    if (isSwingFeasibilityImporting) return;
+    if (!confirm('This will update workspace mapping feasibility and condition values from the configured SwingExpansionValues SQLite table. Continue?')) return;
+
+    try {
+      setIsSwingFeasibilityImporting(true);
+      const result = await dbService.importSwingFeasibility(false);
+      alert(`Swing feasibility import finished.\n\n${result.summary || 'No summary returned.'}`);
+    } catch (err: any) {
+      alert(`Failed to import swing feasibility data: ${err?.message || String(err)}`);
+    } finally {
+      setIsSwingFeasibilityImporting(false);
     }
   };
 
@@ -2289,6 +2309,20 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
                       className="px-3 py-1.5 border border-rose-200 bg-rose-50 rounded-lg text-[9px] font-black text-rose-700 hover:bg-rose-100 transition-all uppercase tracking-widest"
                     >
                       Wipe BOM
+                    </button>
+                  )}
+                  {category === 'bom' && currentUser.role === 'admin' && (
+                    <button
+                      type="button"
+                      onClick={handleImportSwingFeasibility}
+                      disabled={isSwingFeasibilityImporting}
+                      className={`px-3 py-1.5 border rounded-lg text-[9px] font-black uppercase tracking-widest transition-all ${
+                        isSwingFeasibilityImporting
+                          ? 'border-slate-200 bg-slate-100 text-slate-400 cursor-not-allowed'
+                          : 'border-amber-200 bg-amber-50 text-amber-700 hover:bg-amber-100'
+                      }`}
+                    >
+                      {isSwingFeasibilityImporting ? 'Importing…' : 'Import Swing Feasibility'}
                     </button>
                   )}
                   {category === 'bom' && currentUser.role === 'admin' && (

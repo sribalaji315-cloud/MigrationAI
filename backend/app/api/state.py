@@ -58,6 +58,9 @@ _generation_lock = asyncio.Lock()
 _group_feature_mapping_lock = asyncio.Lock()
 _group_feature_suggest_lock = asyncio.Lock()
 _apply_group_feature_lock = asyncio.Lock()
+# A running/queued apply-group-feature job with no heartbeat for this long is
+# considered dead (e.g. server crash) and may be superseded by a new run.
+_APPLY_GROUP_FEATURE_STALE_SECS = 120
 GENERATION_STALE_TIMEOUT_SECONDS = 15 * 60
 GENERATION_INSERT_BATCH_SIZE = 1500
 GENERATION_INSERT_MAX_RETRIES = 5
@@ -8335,7 +8338,17 @@ def trigger_apply_group_features(
         .first()
     )
     if active:
-        return {"ok": True, "jobId": int(active.id)}
+        # Treat a job with no progress heartbeat as dead (e.g. the server crashed
+        # mid-run). Otherwise a zombie job blocks all future runs and the UI is
+        # stuck showing 0% forever.
+        last_beat = active.updated_at or active.started_at or 0
+        if (time.time() - float(last_beat)) < _APPLY_GROUP_FEATURE_STALE_SECS:
+            return {"ok": True, "jobId": int(active.id)}
+        active.status = "failed"
+        active.error_message = "stale job cleared (no progress heartbeat)"
+        active.finished_at = time.time()
+        active.updated_at = time.time()
+        db.commit()
 
     job = models.ApplyGroupFeatureJob(
         status="queued",
@@ -8427,6 +8440,7 @@ def _run_apply_group_feature_job(job_id: int):
             .filter(models.WorkspaceMapping.mapped_from == "group")
             .all()
         )
+        reverted = 0
         for row in prior_group_rows:
             target_attr, new_value, attr_type, mapped_from = _global_baseline_for_row(
                 str(row.legacy_feature_id or "").strip(),
@@ -8439,6 +8453,12 @@ def _run_apply_group_feature_job(job_id: int):
             row.attribute_type = attr_type
             row.mapped_from = mapped_from
             row.updated_at = time.time()
+            # Keep a heartbeat alive during this potentially long revert pass so the
+            # trigger endpoint doesn't mistake a busy job for a crashed one.
+            reverted += 1
+            if reverted % 5000 == 0:
+                job.updated_at = time.time()
+                db.commit()
         db.commit()
 
         # Step 2 — apply current group_features mappings.

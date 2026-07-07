@@ -807,6 +807,22 @@ export const dbService = {
     this._invalidateCache();
   },
 
+  async importSwingFeasibility(dryRun = false): Promise<{ ok: boolean; dryRun: boolean; sourceDbPath: string; summary: string }> {
+    if (!SQL_ENDPOINT) {
+      throw new Error('Database connection not available.');
+    }
+    const resp = await this._fetchWithRefresh(`${SQL_ENDPOINT}/imports/swing-feasibility?dryRun=${dryRun ? 'true' : 'false'}`, {
+      method: 'POST',
+      headers: this._authHeaders(),
+    });
+    if (!resp.ok) {
+      const errText = await resp.text();
+      throw new Error(`Failed to import swing feasibility data: ${resp.status} ${errText}`);
+    }
+    this._invalidateCache();
+    return resp.json();
+  },
+
   async saveAll(
     data: DatabaseState,
     userRole: 'admin' | 'user' | undefined = 'user',

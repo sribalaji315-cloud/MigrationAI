@@ -1,5 +1,5 @@
 {
-    "source_db_path": "C:\\Users\\ISA2\\OneDrive - HAWORTH INC\\Downloads\\migration app inputs\\sqlite.db",
+    "source_db_path": "C:\\myloadpoint\\Data services - Migration\\DataMapping\\API\\data-services.sqlite",
 
     "parent_table": "SwingExpansions",
     "parent_pk_column": "Id",

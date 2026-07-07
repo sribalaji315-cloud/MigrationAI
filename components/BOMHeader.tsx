@@ -46,6 +46,24 @@ const BOMHeader: React.FC<BOMHeaderProps> = ({ onRegenerate, isRefreshing, onIns
     }
   };
 
+  const [isSwingFeasibilityImporting, setIsSwingFeasibilityImporting] = useState(false);
+  const handleImportSwingFeasibility = async () => {
+    if (currentUser.role !== 'admin') return;
+    if (isSwingFeasibilityImporting) return;
+    if (!confirm('This will update workspace mapping feasibility and condition values from the configured SwingExpansionValues SQLite table. Continue?')) return;
+
+    try {
+      setIsSwingFeasibilityImporting(true);
+      const result = await dbService.importSwingFeasibility(false);
+      alert(`Swing feasibility import finished.\n\n${result.summary || 'No summary returned.'}`);
+      onRegenerate();
+    } catch (err: any) {
+      alert(`Failed to import swing feasibility data: ${err?.message || String(err)}`);
+    } finally {
+      setIsSwingFeasibilityImporting(false);
+    }
+  };
+
   // ML settings popover
   const [mlSettingsOpen, setMlSettingsOpen] = useState(false);
   const [mlSettings, setMlSettings] = useState<MLSettings>({ useSynonymAssist: true, synonymThreshold: 0.5, synonymWeight: 0.35 });
@@ -412,6 +430,23 @@ const BOMHeader: React.FC<BOMHeaderProps> = ({ onRegenerate, isRefreshing, onIns
                       <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6M7 4h7l5 5v11a2 2 0 01-2 2H7a2 2 0 01-2-2V6a2 2 0 012-2z" />
                     </svg>
                     Migration Manifest
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={handleImportSwingFeasibility}
+                    disabled={isSwingFeasibilityImporting}
+                    className={`flex items-center gap-1.5 px-2.5 py-1.5 border rounded-md text-[9px] font-black transition-all whitespace-nowrap uppercase tracking-wider ${
+                      isSwingFeasibilityImporting
+                        ? 'bg-slate-50 text-slate-300 border-slate-200 cursor-not-allowed'
+                        : 'bg-amber-50 text-amber-700 border-amber-100 hover:bg-amber-100'
+                    }`}
+                    title="Import feasibility and condition from SwingExpansionValues"
+                  >
+                    <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                    </svg>
+                    {isSwingFeasibilityImporting ? 'Importing...' : 'Import Feasibility'}
                   </button>
 
                   <button 
