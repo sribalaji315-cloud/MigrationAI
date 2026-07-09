@@ -29,6 +29,7 @@ export interface DashboardMetricsResponse {
   mapped: { features: number; values: number; items: number; notRequiredFeatures: number };
   excluded: { features: number; values: number };
   coverage: { attribute: number; value: number; item: number };
+  approval?: { approved: number; unapproved: number };
   includeExcluded: boolean;
   items: DashboardItemMetrics[];
 }

@@ -1,4 +1,8 @@
-{
+cd "c:\migration recovery\MigrationAI"
+git status
+git add .
+git commit -m "Update migration import configuration"
+git push{
     "source_db_path": "C:\\myloadpoint\\Data services - Migration\\DataMapping\\API\\data-services.sqlite",
 
     "parent_table": "SwingExpansions",

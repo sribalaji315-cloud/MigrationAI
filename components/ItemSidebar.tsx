@@ -55,12 +55,14 @@ function SidebarRow({ index, style, filteredItems, locks, currentUserId, selecte
       <button
         onClick={() => onSelect(item.itemId)}
         className={`w-full text-left px-4 py-3 border-b border-slate-50 transition-all relative ${
-          palette ? palette.wrapper : selectedId === item.itemId ? 'bg-blue-50/50 border-l-[3px] border-l-blue-600' : 'bg-transparent'
-        } ${selectedId === item.itemId ? 'ring-1 ring-indigo-100' : ''}`}
+          selectedId === item.itemId
+            ? 'bg-blue-100/70 border-l-[3px] border-l-blue-600 ring-2 ring-inset ring-blue-400 shadow-sm'
+            : palette ? palette.wrapper : 'bg-transparent'
+        }`}
         style={{ height: ITEM_ROW_HEIGHT }}
       >
         <div className="flex items-center justify-between">
-          <p className={`text-xs font-black truncate tracking-tight ${palette ? palette.text : selectedId === item.itemId ? 'text-blue-900' : 'text-slate-900'}`}>{item.itemId}</p>
+          <p className={`text-xs font-black truncate tracking-tight ${selectedId === item.itemId ? 'text-blue-900' : palette ? palette.text : 'text-slate-900'}`}>{item.itemId}</p>
           <div className="flex items-center gap-1">
             {item.approvedForMigration && (
               <div

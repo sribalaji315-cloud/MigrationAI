@@ -11,3 +11,4 @@ pydantic-settings
 python-dotenv
 python-multipart
 httpx
+openpyxl

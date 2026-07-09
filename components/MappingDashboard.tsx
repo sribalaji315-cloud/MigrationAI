@@ -66,6 +66,48 @@ const DonutStat: React.FC<DonutStatProps> = ({ label, value, primaryColor, secon
   );
 };
 
+interface ApprovalBarProps {
+  approved: number;
+  unapproved: number;
+}
+
+const ApprovalBar: React.FC<ApprovalBarProps> = ({ approved, unapproved }) => {
+  const total = approved + unapproved;
+  const maxVal = Math.max(approved, unapproved, 1);
+  const approvedPct = total > 0 ? Math.round((approved / total) * 100) : 0;
+  const unapprovedPct = total > 0 ? 100 - approvedPct : 0;
+
+  const bars = [
+    { label: 'Approved', value: approved, pct: approvedPct, color: 'bg-emerald-500', text: 'text-emerald-600' },
+    { label: 'Unapproved', value: unapproved, pct: unapprovedPct, color: 'bg-rose-400', text: 'text-rose-600' },
+  ];
+
+  return (
+    <div className="rounded-2xl bg-white border border-slate-100 shadow-sm p-5">
+      <div className="flex items-center justify-between mb-4">
+        <p className="text-[10px] font-black text-slate-500 uppercase tracking-widest">Item Approval Status</p>
+        <span className="text-[10px] font-bold text-slate-400">{total.toLocaleString()} item{total === 1 ? '' : 's'}</span>
+      </div>
+      <div className="space-y-3">
+        {bars.map((b) => (
+          <div key={b.label} className="flex items-center gap-3">
+            <span className="w-24 text-[10px] font-black uppercase tracking-widest text-slate-500 shrink-0">{b.label}</span>
+            <div className="flex-1 h-6 bg-slate-100 rounded-lg overflow-hidden">
+              <div
+                className={`h-full ${b.color} rounded-lg transition-all duration-500 ease-out`}
+                style={{ width: `${maxVal > 0 ? (b.value / maxVal) * 100 : 0}%` }}
+              />
+            </div>
+            <span className={`w-28 text-right text-[11px] font-bold ${b.text} shrink-0`}>
+              {b.value.toLocaleString()} ({b.pct}%)
+            </span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+};
+
 const MappingDashboard: React.FC<MappingDashboardProps> = ({ categories, productLines, priorities, onClose }) => {
   const [selectedCategory, setSelectedCategory] = useState(SELECT_ALL);
   const [selectedProductLine, setSelectedProductLine] = useState(SELECT_ALL);
@@ -320,6 +362,13 @@ const MappingDashboard: React.FC<MappingDashboardProps> = ({ categories, product
                   description={`${metrics.mapped.items.toLocaleString()} of ${metrics.totals.items.toLocaleString()} BOM items complete.`}
                 />
               </div>
+
+              {metrics.approval && (
+                <ApprovalBar
+                  approved={metrics.approval.approved}
+                  unapproved={metrics.approval.unapproved}
+                />
+              )}
 
               {metrics.excluded.features > 0 && (
                 <div className="flex items-center gap-3 px-1">

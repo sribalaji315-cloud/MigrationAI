@@ -2886,6 +2886,10 @@ def _get_unmapped_item_ids(db: Session) -> Set[str]:
         case(
             # Rows with value_status set are resolved (excluded) — not empty
             (WM.value_status.isnot(None), 0),
+            # Value-less feature rows (empty legacy_value) have nothing to map at
+            # the value level; if the attribute is mapped the feature is mapped,
+            # so don't count them as empty.
+            (func.trim(func.coalesce(WM.legacy_value, literal_column("''"))) == literal_column("''"), 0),
             (func.trim(func.coalesce(WM.new_value, literal_column("''"))) == literal_column("''"), 1),
             else_=0,
         )
@@ -3918,6 +3922,7 @@ def get_dashboard_metrics(
         models.BomItem.description,
         models.BomItem.category,
         models.BomItem.product_type,
+        models.BomItem.approved_for_migration,
     )
     if category:
         items_query = items_query.filter(models.BomItem.category == category)
@@ -3933,6 +3938,7 @@ def get_dashboard_metrics(
             "mapped": {"features": 0, "values": 0, "items": 0, "notRequiredFeatures": 0},
             "excluded": {"features": 0, "values": 0},
             "coverage": {"attribute": 0.0, "value": 0.0, "item": 0.0},
+            "approval": {"approved": 0, "unapproved": 0},
             "includeExcluded": bool(includeExcluded),
             "items": [],
         }
@@ -3941,13 +3947,17 @@ def get_dashboard_metrics(
         return empty
 
     bom_info: Dict[str, Dict[str, str]] = {}
+    approved_items = 0
     for r in bom_rows:
         bom_info[r.item_id] = {
             "description": r.description or "",
             "category": r.category or "",
             "productType": r.product_type or "",
         }
+        if getattr(r, "approved_for_migration", 0):
+            approved_items += 1
     item_ids = list(bom_info.keys())
+    unapproved_items = len(bom_rows) - approved_items
 
     # --- SQL aggregation on workspace_mappings: one row per (item, feature) ---
     from sqlalchemy import text as sa_text, literal_column
@@ -3966,15 +3976,19 @@ def get_dashboard_metrics(
         filter_clause += " AND bi.priority = :priority"
         bind_params["priority"] = priority
 
+    # Only rows with a non-empty legacy_value represent an actual legacy value
+    # that needs mapping.  A feature whose only workspace_mapping row has a blank
+    # legacy_value is an attribute-only mapping (no legacy values) and must not
+    # be counted as an unmapped value — mirrors the /item-statuses logic.
     agg_sql = sa_text(f"""
         SELECT
             wm.legacy_item_id,
             wm.legacy_feature_id,
             COALESCE(wm.attribute_type, '') AS attribute_type,
             COALESCE(wm.new_attribute_id, '') AS new_attribute_id,
-            COUNT(*) AS total_values,
-            SUM(CASE WHEN wm.new_value IS NOT NULL AND wm.new_value != '' THEN 1 ELSE 0 END) AS mapped_values,
-            SUM(CASE WHEN wm.value_status IS NOT NULL AND wm.value_status != '' THEN 1 ELSE 0 END) AS status_excluded_values
+            SUM(CASE WHEN TRIM(COALESCE(wm.legacy_value, '')) != '' THEN 1 ELSE 0 END) AS total_values,
+            SUM(CASE WHEN TRIM(COALESCE(wm.legacy_value, '')) != '' AND wm.new_value IS NOT NULL AND wm.new_value != '' THEN 1 ELSE 0 END) AS mapped_values,
+            SUM(CASE WHEN TRIM(COALESCE(wm.legacy_value, '')) != '' AND wm.value_status IS NOT NULL AND wm.value_status != '' THEN 1 ELSE 0 END) AS status_excluded_values
         FROM workspace_mappings wm
         INNER JOIN bom_items bi ON bi.item_id = wm.legacy_item_id
         WHERE {filter_clause}
@@ -4092,6 +4106,10 @@ def get_dashboard_metrics(
             "value": float(value_coverage),
             "item": float(item_coverage),
         },
+        "approval": {
+            "approved": int(approved_items),
+            "unapproved": int(unapproved_items),
+        },
         "includeExcluded": bool(includeExcluded),
         "items": item_rows,
     }
@@ -4145,6 +4163,10 @@ def get_item_statuses(
                 case(
                         # Rows with value_status set are resolved — not empty
                         (WM.value_status.isnot(None), 0),
+                        # Value-less feature rows (empty legacy_value) have nothing to
+                        # map at the value level; if the attribute is mapped the
+                        # feature is considered mapped, so don't count as empty.
+                        (func.trim(func.coalesce(WM.legacy_value, literal_column("''"))) == literal_column("''"), 0),
                         (func.trim(func.coalesce(WM.new_value, literal_column("''"))) == literal_column("''"), 1),
                         else_=0,
                 )
@@ -8431,35 +8453,56 @@ def _run_apply_group_feature_job(job_id: int):
         all_gm = db.query(models.GlobalMapping).filter(models.GlobalMapping.status == "active").all()
         mapping_by_feature = _build_latest_mapping_by_feature(all_gm)
         candidates_by_feature = _build_all_candidates_by_feature(all_gm)
+        # Heartbeat after index build (before the potentially large revert pass).
+        job.updated_at = time.time()
+        db.commit()
 
         # Step 1 — revert previously applied group rows to their global baseline so a re-run
         # reflects the current group_features (stale group mappings are undone). Local rows
         # are excluded by construction (they are never mapped_from='group').
-        prior_group_rows = (
-            db.query(models.WorkspaceMapping)
-            .filter(models.WorkspaceMapping.mapped_from == "group")
-            .all()
-        )
+        #
+        # The workspace_mappings table can hold millions of group rows, so we MUST NOT load
+        # them all at once (a single .all() here hangs the worker / exhausts memory and the
+        # job never progresses). Instead we page forward by primary key in bounded chunks,
+        # committing and heart-beating per chunk, and clearing the identity map to keep memory
+        # flat. Since we only advance by ``id`` and each processed row's mapped_from is changed
+        # away from 'group', rows are never revisited and the loop terminates.
+        REVERT_CHUNK = 5000
+        last_id = 0
         reverted = 0
-        for row in prior_group_rows:
-            target_attr, new_value, attr_type, mapped_from = _global_baseline_for_row(
-                str(row.legacy_feature_id or "").strip(),
-                str(row.legacy_value or ""),
-                mapping_by_feature,
-                candidates_by_feature,
+        while True:
+            chunk = (
+                db.query(models.WorkspaceMapping)
+                .filter(models.WorkspaceMapping.mapped_from == "group")
+                .filter(models.WorkspaceMapping.id > last_id)
+                .order_by(models.WorkspaceMapping.id)
+                .limit(REVERT_CHUNK)
+                .all()
             )
-            row.new_attribute_id = target_attr
-            row.new_value = new_value
-            row.attribute_type = attr_type
-            row.mapped_from = mapped_from
-            row.updated_at = time.time()
-            # Keep a heartbeat alive during this potentially long revert pass so the
-            # trigger endpoint doesn't mistake a busy job for a crashed one.
-            reverted += 1
-            if reverted % 5000 == 0:
-                job.updated_at = time.time()
-                db.commit()
-        db.commit()
+            if not chunk:
+                break
+            now_row = time.time()
+            for row in chunk:
+                last_id = row.id
+                target_attr, new_value, attr_type, mapped_from = _global_baseline_for_row(
+                    str(row.legacy_feature_id or "").strip(),
+                    str(row.legacy_value or ""),
+                    mapping_by_feature,
+                    candidates_by_feature,
+                )
+                row.new_attribute_id = target_attr
+                row.new_value = new_value
+                row.attribute_type = attr_type
+                row.mapped_from = mapped_from
+                row.updated_at = now_row
+                reverted += 1
+            # Heartbeat + free memory each chunk so the job isn't misdetected as stale and
+            # the ORM identity map doesn't grow unbounded across millions of rows.
+            job.updated_at = time.time()
+            db.commit()
+            # Detach the processed chunk (but keep ``job`` attached) to keep memory flat.
+            for row in chunk:
+                db.expunge(row)
 
         # Step 2 — apply current group_features mappings.
         gf_rows = db.query(models.GroupFeature).all()
@@ -8558,6 +8601,19 @@ def get_apply_group_feature_progress(
     if not job:
         return {"status": "idle", "isActive": False, "progress": 0, "totalFeatures": 0, "processedFeatures": 0, "generatedRows": 0}
     is_active = job.status in ("queued", "running")
+    if is_active:
+        # Auto-expire zombie jobs: if an "active" job has not emitted a progress
+        # heartbeat within the stale window, the worker died (e.g. the server was
+        # reloaded/crashed mid-run). Mark it failed so the UI unsticks and the
+        # button becomes clickable again instead of showing "Applying… 0%" forever.
+        last_beat = job.updated_at or job.started_at or 0
+        if last_beat and (time.time() - float(last_beat)) >= _APPLY_GROUP_FEATURE_STALE_SECS:
+            job.status = "failed"
+            job.error_message = job.error_message or "stale job cleared (no progress heartbeat)"
+            job.finished_at = time.time()
+            job.updated_at = time.time()
+            db.commit()
+            is_active = False
     progress = (job.processed_features / job.total_features) if job.total_features > 0 else (1.0 if job.status == "completed" else 0)
     return {
         "id": int(job.id),
