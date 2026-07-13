@@ -1,7 +1,7 @@
 from fastapi import APIRouter, BackgroundTasks, Body, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session, selectinload
-from sqlalchemy import func, or_, cast, case, String, literal_column, text as sa_text
+from sqlalchemy import func, or_, cast, case, String, literal_column, text as sa_text, tuple_
 from sqlalchemy.exc import IntegrityError, OperationalError
 from typing import Dict, List, Any, Optional, Set, Tuple
 import io, csv, re, time, hashlib, asyncio, logging, json
@@ -415,6 +415,34 @@ def _resolve_workspace_revert_metadata(
     }
 
 
+def _load_approved_protection(db: Session) -> Tuple[Set[str], Set[Tuple[str, str]]]:
+    """Load the approval sets that shield mappings from bulk regeneration jobs.
+
+    Returns ``(approved_item_ids, approved_pairs)`` where:
+      - ``approved_item_ids`` are item_id values whose BomItem has
+        ``approved_for_migration == 1`` (protects ALL of that item's features), and
+      - ``approved_pairs`` are ``(item_id, feature_id)`` tuples that have an
+        ItemFeatureApproval row (protects that single feature).
+
+    Both mapping generation and apply-group-feature must leave any workspace
+    mapping matching these sets untouched.
+    """
+    approved_item_ids: Set[str] = {
+        r[0]
+        for r in db.query(models.BomItem.item_id)
+        .filter(models.BomItem.approved_for_migration == 1)
+        .all()
+    }
+    approved_pairs: Set[Tuple[str, str]] = {
+        (r[0], r[1])
+        for r in db.query(
+            models.ItemFeatureApproval.item_id,
+            models.ItemFeatureApproval.feature_id,
+        ).all()
+    }
+    return approved_item_ids, approved_pairs
+
+
 async def _run_mapping_generation_async(job_id: int):
     """Acquire async lock and run the CPU-bound generation in a thread pool executor."""
     async with _generation_lock:
@@ -452,9 +480,26 @@ def _run_mapping_generation_job(job_id: int):
         # latest BOM uploads and global mapping rules.
         # Preserve rows that were manually overridden (mapped_from == 'local').
         preserved_revert_metadata = _snapshot_workspace_revert_metadata(db, include_local=False)
-        db.query(models.WorkspaceMapping).filter(
+
+        # Preserve rows belonging to approved items / approved features: those must
+        # never be regenerated or discarded. Exclude them from the bulk delete and
+        # skip them in the generation loop below.
+        approved_item_ids, approved_pairs = _load_approved_protection(db)
+        _del_q = db.query(models.WorkspaceMapping).filter(
             models.WorkspaceMapping.mapped_from != "local"
-        ).delete(synchronize_session=False)
+        )
+        if approved_item_ids:
+            _del_q = _del_q.filter(
+                models.WorkspaceMapping.legacy_item_id.notin_(approved_item_ids)
+            )
+        if approved_pairs:
+            _del_q = _del_q.filter(
+                tuple_(
+                    models.WorkspaceMapping.legacy_item_id,
+                    models.WorkspaceMapping.legacy_feature_id,
+                ).notin_(list(approved_pairs))
+            )
+        _del_q.delete(synchronize_session=False)
         db.commit()
 
         # Collect (item_id, feature_id) pairs that have local overrides so the
@@ -549,6 +594,15 @@ def _run_mapping_generation_job(job_id: int):
 
             # Skip features that have local overrides — those are user-managed.
             if (legacy_item_id, feat_feature_id) in local_override_pairs:
+                processed_features += 1
+                continue
+
+            # Skip approved items (all features) and approved features so their
+            # existing mappings are preserved rather than regenerated.
+            if (
+                legacy_item_id in approved_item_ids
+                or (legacy_item_id, feat_feature_id) in approved_pairs
+            ):
                 processed_features += 1
                 continue
 
@@ -8457,6 +8511,10 @@ def _run_apply_group_feature_job(job_id: int):
         job.updated_at = time.time()
         db.commit()
 
+        # Approved items (all features) and approved features must not be touched by
+        # either the revert pass or the apply pass below.
+        approved_item_ids, approved_pairs = _load_approved_protection(db)
+
         # Step 1 — revert previously applied group rows to their global baseline so a re-run
         # reflects the current group_features (stale group mappings are undone). Local rows
         # are excluded by construction (they are never mapped_from='group').
@@ -8484,6 +8542,12 @@ def _run_apply_group_feature_job(job_id: int):
             now_row = time.time()
             for row in chunk:
                 last_id = row.id
+                # Never revert rows belonging to approved items / approved features.
+                if (
+                    row.legacy_item_id in approved_item_ids
+                    or (row.legacy_item_id, str(row.legacy_feature_id or "").strip()) in approved_pairs
+                ):
+                    continue
                 target_attr, new_value, attr_type, mapped_from = _global_baseline_for_row(
                     str(row.legacy_feature_id or "").strip(),
                     str(row.legacy_value or ""),
@@ -8548,6 +8612,12 @@ def _run_apply_group_feature_job(job_id: int):
                         .all()
                     )
                 for row in matched_rows:
+                    # Do not apply group targets onto approved items / approved features.
+                    if (
+                        row.legacy_item_id in approved_item_ids
+                        or (row.legacy_item_id, sub_feature) in approved_pairs
+                    ):
+                        continue
                     row.new_attribute_id = target_attr
                     row.new_value = (gf.target_value or "")
                     row.mapped_from = "group"

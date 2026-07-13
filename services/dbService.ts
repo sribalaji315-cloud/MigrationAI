@@ -824,6 +824,64 @@ export const dbService = {
     return resp.json();
   },
 
+  async uploadSwingExpansionXlsx(
+    itemFile: File,
+    groupFile: File,
+    dryRun = false,
+  ): Promise<{ ok: boolean; status: string; dryRun: boolean }> {
+    if (!SQL_ENDPOINT) {
+      throw new Error('Database connection not available.');
+    }
+    const formData = new FormData();
+    formData.append('item_file', itemFile);
+    formData.append('group_file', groupFile);
+    const headers: Record<string, string> = {};
+    const auth = this._authHeaders();
+    if (auth.Authorization) headers.Authorization = auth.Authorization;
+    const resp = await this._fetchWithRefresh(
+      `${SQL_ENDPOINT}/imports/swing-expansion?dryRun=${dryRun ? 'true' : 'false'}`,
+      {
+        method: 'POST',
+        headers,
+        body: formData,
+      },
+    );
+    if (!resp.ok) {
+      const errText = await resp.text();
+      throw new Error(`Failed to start swing expansion import: ${resp.status} ${errText}`);
+    }
+    return resp.json();
+  },
+
+  async fetchSwingExpansionProgress(): Promise<{
+    status: string;
+    isActive: boolean;
+    phase: string | null;
+    progress: number;
+    totalItems: number;
+    processedItems: number;
+    stagedRows: number;
+    matched: number;
+    updated: number;
+    counts: { Yes: number; No: number; Conditional: number; Review: number };
+    parseFailures: number;
+    dryRun: boolean;
+    error: string | null;
+  }> {
+    if (!SQL_ENDPOINT) {
+      throw new Error('Database connection not available.');
+    }
+    const resp = await this._fetchWithRefresh(`${SQL_ENDPOINT}/imports/swing-expansion/progress`, {
+      method: 'GET',
+      headers: this._authHeaders(),
+    });
+    if (!resp.ok) {
+      const errText = await resp.text();
+      throw new Error(`Failed to fetch swing expansion progress: ${resp.status} ${errText}`);
+    }
+    return resp.json();
+  },
+
   async saveAll(
     data: DatabaseState,
     userRole: 'admin' | 'user' | undefined = 'user',

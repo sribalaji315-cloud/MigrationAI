@@ -1,4 +1,5 @@
-import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
+import React, { useState, useEffect, useCallback, useMemo, useRef, useTransition } from 'react';
+import { List, useDynamicRowHeight, type RowComponentProps } from 'react-window';
 import { LegacyItem, User, WorkspaceMappingRow, ItemApprovalState } from '../types';
 import { dbService } from '../services/dbService';
 import { buildCsv } from '../utils/csvHelpers';
@@ -117,6 +118,136 @@ interface FeatureGroup {
   rows: WorkspaceMappingRow[];
 }
 
+type ConditionTranslationMap = Record<string, { attr: string; value: string }>;
+
+// Rewrites source condition tokens (e.g. `.*AGNI = 'NI002'`) into target
+// attribute/value tokens using only the current item's mappings. Tokens without
+// a matching mapping are left unchanged. Operators, parentheses and whitespace
+// are preserved because only the matched tokens are replaced.
+const CONDITION_TOKEN_RE = /(\.\*)?([A-Za-z_][A-Za-z0-9_]*)\s*(=|<>)\s*'([^']*)'/g;
+
+type ConditionSegment = { text: string; kind: 'plain' | 'translated' | 'legacy' };
+
+// Splits a condition into segments: attribute/value tokens that resolve to a
+// target become 'translated', tokens without a target mapping stay 'legacy',
+// and operators/parentheses/whitespace are 'plain'.
+const buildConditionSegments = (condition: string, map: ConditionTranslationMap): ConditionSegment[] => {
+  const segments: ConditionSegment[] = [];
+  let lastIndex = 0;
+  CONDITION_TOKEN_RE.lastIndex = 0;
+  let m: RegExpExecArray | null;
+  while ((m = CONDITION_TOKEN_RE.exec(condition)) !== null) {
+    const [full, , ident, op, value] = m;
+    if (m.index > lastIndex) {
+      segments.push({ text: condition.slice(lastIndex, m.index), kind: 'plain' });
+    }
+    const target = map[`${ident}|${value}`];
+    if (target) {
+      segments.push({ text: `${target.attr} ${op} '${target.value}'`, kind: 'translated' });
+    } else {
+      segments.push({ text: full, kind: 'legacy' });
+    }
+    lastIndex = m.index + full.length;
+  }
+  if (lastIndex < condition.length) {
+    segments.push({ text: condition.slice(lastIndex), kind: 'plain' });
+  }
+  return segments;
+};
+
+// --- Virtualized mapping list (react-window) -------------------------------
+// Dynamic row heights so long conditions can wrap and display fully.
+const DEFAULT_ROW_HEIGHT = 30;
+
+type FlatMappingItem =
+  | { kind: 'header'; group: FeatureGroup }
+  | { kind: 'row'; row: WorkspaceMappingRow; isLast: boolean };
+
+interface MappingRowProps {
+  items: FlatMappingItem[];
+  translateConditions: boolean;
+  conditionSegmentsByRow: Map<WorkspaceMappingRow, ConditionSegment[]>;
+  approvalState: ItemApprovalState | null;
+}
+
+const DASH = <span className="text-slate-300">—</span>;
+
+const MappingListRow = ({ index, style, items, translateConditions, conditionSegmentsByRow, approvalState }: RowComponentProps<MappingRowProps>) => {
+  const item = items[index];
+
+  if (item.kind === 'header') {
+    const group = item.group;
+    const fa = approvalState?.features?.[group.legacyFeatureId];
+    const approved = !!fa;
+    const attributeType = group.rows[0]?.attributeType;
+    return (
+      <div style={style} className="px-4">
+        <div className="pt-3">
+          <div className="bg-slate-50 border-x border-t border-slate-200 rounded-t-lg px-4 py-2">
+            <div className="flex items-center gap-2">
+              <span className="text-[11px] font-black text-slate-800 tracking-tight">{group.legacyFeatureId}</span>
+              {attributeType && (
+                <span className="px-1.5 py-0.5 rounded-[3px] text-[7px] font-black uppercase bg-slate-200 text-slate-500">{attributeType}</span>
+              )}
+              <span
+                title={approved ? formatApprovalTitle(fa?.approvedByUsername, fa?.approvedAt) : undefined}
+                className={`ml-auto px-1.5 py-0.5 rounded-[3px] text-[7px] font-black uppercase border ${
+                  approved
+                    ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
+                    : 'bg-slate-100 text-slate-500 border-slate-200'
+                }`}
+              >
+                {approved ? 'Approved' : 'Pending'}
+              </span>
+            </div>
+            {group.description && <p className="text-[10px] text-slate-400 font-medium mt-0.5">{group.description}</p>}
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  const row = item.row;
+  const segments = translateConditions && row.condition ? conditionSegmentsByRow.get(row) : undefined;
+  return (
+    <div style={style} className="px-4">
+      <div className={`grid grid-cols-6 items-start gap-1 bg-white border-x border-slate-200 text-[11px] py-1.5 ${item.isLast ? 'border-b rounded-b-lg' : 'border-b border-slate-50'}`}>
+        <div className="px-4 min-w-0 font-bold text-slate-700 break-words">{row.legacyValue || DASH}</div>
+        <div className="px-3 min-w-0 text-slate-600 break-words">{row.newAttributeId || DASH}</div>
+        <div className="px-3 min-w-0 text-slate-600 break-words">{row.newValue || DASH}</div>
+        <div className="px-3 min-w-0 break-words text-slate-500">
+          {!row.condition
+            ? DASH
+            : segments
+              ? segments.map((seg, i) => (
+                  <span
+                    key={i}
+                    className={seg.kind === 'translated'
+                      ? 'text-emerald-600 font-semibold'
+                      : seg.kind === 'legacy'
+                        ? 'text-rose-600 font-semibold'
+                        : 'text-slate-500'}
+                  >
+                    {seg.text}
+                  </span>
+                ))
+              : row.condition}
+        </div>
+        <div className="px-3 min-w-0">
+          {row.feasibility ? (
+            <span className={`inline-block px-1.5 py-0.5 rounded-[3px] text-[8px] font-black uppercase border ${feasibilityTone(row.feasibility)}`}>{row.feasibility}</span>
+          ) : DASH}
+        </div>
+        <div className="px-3 min-w-0">
+          {row.valueStatus ? (
+            <span className={`inline-block px-1.5 py-0.5 rounded-[3px] text-[8px] font-black uppercase border ${valueStatusTone(row.valueStatus)}`}>{row.valueStatus}</span>
+          ) : DASH}
+        </div>
+      </div>
+    </div>
+  );
+};
+
 const ProductViewer: React.FC<ProductViewerProps> = ({ currentUser, onClose }) => {
   void currentUser;
 
@@ -144,6 +275,10 @@ const ProductViewer: React.FC<ProductViewerProps> = ({ currentUser, onClose }) =
   const [isLoadingMappings, setIsLoadingMappings] = useState(false);
   const [statusMessage, setStatusMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
   const [approvalState, setApprovalState] = useState<ItemApprovalState | null>(null);
+
+  // Right pane: translate condition source tokens into target attribute/value tokens
+  const [translateConditions, setTranslateConditions] = useState(false);
+  const [isTranslating, startTranslationTransition] = useTransition();
 
   // Right pane: mapping-level filters (multi-select)
   const [filterLegacyAttributes, setFilterLegacyAttributes] = useState<string[]>([]);
@@ -281,6 +416,48 @@ const ProductViewer: React.FC<ProductViewerProps> = ({ currentUser, onClose }) =
     }));
   }, [filteredMappingRows, selectedItem]);
 
+  // Map of `${legacyFeatureId}|${legacyValue}` -> target attribute/value, built
+  // only from the current item's mappings.
+  const conditionTranslationMap = useMemo<ConditionTranslationMap>(() => {
+    const map: ConditionTranslationMap = {};
+    for (const row of mappingRows) {
+      if (!row.legacyFeatureId || !row.legacyValue || !row.newAttributeId || !row.newValue) continue;
+      const key = `${row.legacyFeatureId}|${row.legacyValue}`;
+      if (!map[key]) map[key] = { attr: row.newAttributeId, value: row.newValue };
+    }
+    return map;
+  }, [mappingRows]);
+
+  // Precompute condition segments once (keyed by row reference) so toggling and
+  // scrolling stay instant. Translated tokens are green, untranslated legacy
+  // tokens are red, operators/parentheses neutral.
+  const conditionSegmentsByRow = useMemo(() => {
+    const map = new Map<WorkspaceMappingRow, ConditionSegment[]>();
+    for (const row of mappingRows) {
+      if (row.condition) map.set(row, buildConditionSegments(row.condition, conditionTranslationMap));
+    }
+    return map;
+  }, [mappingRows, conditionTranslationMap]);
+
+  // Flatten grouped rows into a single list for virtualization (react-window).
+  const flatMappingItems = useMemo<FlatMappingItem[]>(() => {
+    const flat: FlatMappingItem[] = [];
+    for (const group of featureGroups) {
+      flat.push({ kind: 'header', group });
+      group.rows.forEach((row, idx) => {
+        flat.push({ kind: 'row', row, isLast: idx === group.rows.length - 1 });
+      });
+    }
+    return flat;
+  }, [featureGroups]);
+
+  // Dynamic row heights let long conditions wrap and display fully. The key
+  // resets cached measurements when the underlying list changes.
+  const rowHeightCache = useDynamicRowHeight({
+    defaultRowHeight: DEFAULT_ROW_HEIGHT,
+    key: `${selectedItem?.itemId ?? ''}|${flatMappingItems.length}|${translateConditions ? 't' : 'f'}`,
+  });
+
   const hasMappingFilters = !!(filterLegacyAttributes.length || filterAttributeTypes.length || filterFeasibilities.length || filterValueStatuses.length);
   const clearMappingFilters = () => {
     setFilterLegacyAttributes([]);
@@ -310,6 +487,7 @@ const ProductViewer: React.FC<ProductViewerProps> = ({ currentUser, onClose }) =
       'Target Value',
       'Attribute Type',
       'Condition',
+      ...(translateConditions ? ['Translated Condition'] : []),
       'Feasibility',
       'Value Status',
     ];
@@ -324,6 +502,7 @@ const ProductViewer: React.FC<ProductViewerProps> = ({ currentUser, onClose }) =
         r.newValue || '',
         r.attributeType || '',
         r.condition || '',
+        ...(translateConditions ? [conditionSegmentsByRow.get(r)?.map(s => s.text).join('') ?? (r.condition || '')] : []),
         r.feasibility || '',
         r.valueStatus || '',
       ]);
@@ -357,6 +536,25 @@ const ProductViewer: React.FC<ProductViewerProps> = ({ currentUser, onClose }) =
           </div>
         </div>
         <div className="flex items-center gap-2">
+          <button
+            type="button"
+            onClick={() => startTranslationTransition(() => setTranslateConditions(v => !v))}
+            aria-pressed={translateConditions}
+            aria-busy={isTranslating}
+            title="Translate condition source tokens into target attribute/value tokens"
+            className={`flex items-center gap-1.5 px-3 py-1.5 rounded-md text-[9px] font-black uppercase tracking-wider transition-all border ${
+              translateConditions
+                ? 'bg-sky-600 text-white border-sky-600 hover:bg-sky-700'
+                : 'bg-slate-100 text-slate-600 border-slate-200 hover:bg-slate-200'
+            }`}
+          >
+            {isTranslating ? (
+              <span className={`w-2.5 h-2.5 border-2 rounded-full animate-spin ${translateConditions ? 'border-white/40 border-t-white' : 'border-slate-300 border-t-slate-500'}`} />
+            ) : (
+              <span className={`w-2 h-2 rounded-full ${translateConditions ? 'bg-white' : 'bg-slate-400'}`} />
+            )}
+            Translate Conditions
+          </button>
           <button
             type="button"
             onClick={handleExportCsv}
@@ -570,7 +768,7 @@ const ProductViewer: React.FC<ProductViewerProps> = ({ currentUser, onClose }) =
                 </div>
               </div>
 
-              <div className="flex-1 overflow-y-auto p-4">
+              <div className="flex-1 min-h-0 flex flex-col">
                 {isLoadingMappings ? (
                   <div className="flex items-center justify-center py-16">
                     <div className="w-6 h-6 border-2 border-sky-600 border-t-transparent rounded-full animate-spin" />
@@ -580,69 +778,34 @@ const ProductViewer: React.FC<ProductViewerProps> = ({ currentUser, onClose }) =
                     {hasMappingFilters ? 'No mappings match the selected filters.' : 'No mappings found for this product.'}
                   </div>
                 ) : (
-                  <div className="space-y-3">
-                    {featureGroups.map(group => (
-                      <div key={group.legacyFeatureId} className="bg-white border border-slate-200 rounded-lg overflow-hidden">
-                        <div className="bg-slate-50 border-b border-slate-100 px-4 py-2">
-                          <div className="flex items-center gap-2">
-                            <span className="text-[11px] font-black text-slate-800 tracking-tight">{group.legacyFeatureId}</span>
-                            {group.rows[0]?.attributeType && (
-                              <span className="px-1.5 py-0.5 rounded-[3px] text-[7px] font-black uppercase bg-slate-200 text-slate-500">{group.rows[0].attributeType}</span>
-                            )}
-                            {(() => {
-                              const fa = approvalState?.features?.[group.legacyFeatureId];
-                              const approved = !!fa;
-                              return (
-                                <span
-                                  title={approved ? formatApprovalTitle(fa?.approvedByUsername, fa?.approvedAt) : undefined}
-                                  className={`ml-auto px-1.5 py-0.5 rounded-[3px] text-[7px] font-black uppercase border ${
-                                    approved
-                                      ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
-                                      : 'bg-slate-100 text-slate-500 border-slate-200'
-                                  }`}
-                                >
-                                  {approved ? 'Approved' : 'Pending'}
-                                </span>
-                              );
-                            })()}
-                          </div>
-                          {group.description && <p className="text-[10px] text-slate-400 font-medium mt-0.5">{group.description}</p>}
-                        </div>
-                        <table className="w-full table-fixed text-[11px]">
-                          <thead>
-                            <tr className="text-left text-[8px] font-black uppercase tracking-widest text-slate-400 border-b border-slate-100">
-                              <th className="w-1/6 px-4 py-1.5 font-black">Source Value</th>
-                              <th className="w-1/6 px-3 py-1.5 font-black">Target Attribute</th>
-                              <th className="w-1/6 px-3 py-1.5 font-black">Target Value</th>
-                              <th className="w-1/6 px-3 py-1.5 font-black">Condition</th>
-                              <th className="w-1/6 px-3 py-1.5 font-black">Feasibility</th>
-                              <th className="w-1/6 px-3 py-1.5 font-black">Status</th>
-                            </tr>
-                          </thead>
-                          <tbody>
-                            {group.rows.map((row, idx) => (
-                              <tr key={`${row.legacyValue}-${idx}`} className="border-b border-slate-50 last:border-b-0">
-                                <td className="w-1/6 px-4 py-1.5 font-bold text-slate-700 break-words">{row.legacyValue || <span className="text-slate-300">—</span>}</td>
-                                <td className="w-1/6 px-3 py-1.5 text-slate-600 break-words">{row.newAttributeId || <span className="text-slate-300">—</span>}</td>
-                                <td className="w-1/6 px-3 py-1.5 text-slate-600 break-words">{row.newValue || <span className="text-slate-300">—</span>}</td>
-                                <td className="w-1/6 px-3 py-1.5 text-slate-500 break-words">{row.condition || <span className="text-slate-300">—</span>}</td>
-                                <td className="w-1/6 px-3 py-1.5">
-                                  {row.feasibility ? (
-                                    <span className={`px-1.5 py-0.5 rounded-[3px] text-[8px] font-black uppercase border ${feasibilityTone(row.feasibility)}`}>{row.feasibility}</span>
-                                  ) : <span className="text-slate-300">—</span>}
-                                </td>
-                                <td className="w-1/6 px-3 py-1.5">
-                                  {row.valueStatus ? (
-                                    <span className={`px-1.5 py-0.5 rounded-[3px] text-[8px] font-black uppercase border ${valueStatusTone(row.valueStatus)}`}>{row.valueStatus}</span>
-                                  ) : <span className="text-slate-300">—</span>}
-                                </td>
-                              </tr>
-                            ))}
-                          </tbody>
-                        </table>
+                  <>
+                    {/* Sticky column headers */}
+                    <div className="px-4 pt-4 shrink-0">
+                      <div className="grid grid-cols-6 text-left text-[8px] font-black uppercase tracking-widest text-slate-400 pb-1.5 border-b border-slate-100">
+                        <div className="px-4">Source Value</div>
+                        <div className="px-3">Target Attribute</div>
+                        <div className="px-3">Target Value</div>
+                        <div className="px-3">Condition</div>
+                        <div className="px-3">Feasibility</div>
+                        <div className="px-3">Status</div>
                       </div>
-                    ))}
-                  </div>
+                    </div>
+                    <div className="flex-1 min-h-0 pb-4">
+                      <List<MappingRowProps>
+                        rowComponent={MappingListRow}
+                        rowCount={flatMappingItems.length}
+                        rowHeight={rowHeightCache}
+                        rowProps={{
+                          items: flatMappingItems,
+                          translateConditions,
+                          conditionSegmentsByRow,
+                          approvalState,
+                        }}
+                        overscanCount={8}
+                        style={{ height: '100%' }}
+                      />
+                    </div>
+                  </>
                 )}
               </div>
             </>

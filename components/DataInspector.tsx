@@ -247,6 +247,26 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
   const featureFile1Ref = useRef<HTMLInputElement | null>(null);
   const featureFile2Ref = useRef<HTMLInputElement | null>(null);
 
+  // ---- Swing expansion (xlsx) feasibility/condition import state ----
+  const [showSwingExpansionModal, setShowSwingExpansionModal] = useState(false);
+  const [swingItemFile, setSwingItemFile] = useState<File | null>(null);
+  const [swingGroupFile, setSwingGroupFile] = useState<File | null>(null);
+  const [swingDryRun, setSwingDryRun] = useState(true);
+  const [swingRunning, setSwingRunning] = useState(false);
+  const [swingProgress, setSwingProgress] = useState<Awaited<ReturnType<typeof dbService.fetchSwingExpansionProgress>> | null>(null);
+  const swingItemFileRef = useRef<HTMLInputElement | null>(null);
+  const swingGroupFileRef = useRef<HTMLInputElement | null>(null);
+  const swingPollRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (swingPollRef.current) {
+        window.clearInterval(swingPollRef.current);
+        swingPollRef.current = null;
+      }
+    };
+  }, []);
+
   // ---- Classification filter state (all distinct classes + attributes) ----
   const [allClassOptions, setAllClassOptions] = useState<{ classId: string; className: string }[]>([]);
   const [allAttributeOptions, setAllAttributeOptions] = useState<string[]>([]);
@@ -2029,6 +2049,63 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
     }
   };
 
+  const resetSwingExpansionModal = () => {
+    if (swingPollRef.current) {
+      window.clearInterval(swingPollRef.current);
+      swingPollRef.current = null;
+    }
+    setShowSwingExpansionModal(false);
+    setSwingItemFile(null);
+    setSwingGroupFile(null);
+    setSwingDryRun(true);
+    setSwingRunning(false);
+    setSwingProgress(null);
+  };
+
+  const handleSwingFileSelect = (which: 'item' | 'group', file: File | null) => {
+    if (!file) return;
+    if (which === 'item') setSwingItemFile(file);
+    else setSwingGroupFile(file);
+  };
+
+  const handleRunSwingExpansion = async () => {
+    if (currentUser.role !== 'admin') {
+      alert('Only administrators may run swing expansion.');
+      return;
+    }
+    if (!swingItemFile || !swingGroupFile) {
+      alert('Select both the item features and group features xlsx files.');
+      return;
+    }
+    if (swingRunning) return;
+    try {
+      setSwingRunning(true);
+      setSwingProgress(null);
+      await dbService.uploadSwingExpansionXlsx(swingItemFile, swingGroupFile, swingDryRun);
+      swingPollRef.current = window.setInterval(async () => {
+        try {
+          const p = await dbService.fetchSwingExpansionProgress();
+          setSwingProgress(p);
+          if (!p.isActive) {
+            if (swingPollRef.current) {
+              window.clearInterval(swingPollRef.current);
+              swingPollRef.current = null;
+            }
+            setSwingRunning(false);
+            if (p.status === 'completed' && !p.dryRun) {
+              (dbService as any)._invalidateCache?.();
+            }
+          }
+        } catch {
+          /* keep polling; transient errors are non-fatal */
+        }
+      }, 1000);
+    } catch (err: any) {
+      setSwingRunning(false);
+      alert(`Failed to start swing expansion: ${err?.message || String(err)}`);
+    }
+  };
+
   const handleSave = async () => {
     await persistInspectorData({ source: 'manual', closeInspector: true });
   };
@@ -2323,6 +2400,15 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
                       }`}
                     >
                       {isSwingFeasibilityImporting ? 'Importing…' : 'Import Swing Feasibility'}
+                    </button>
+                  )}
+                  {category === 'bom' && currentUser.role === 'admin' && (
+                    <button
+                      type="button"
+                      onClick={() => { resetSwingExpansionModal(); setShowSwingExpansionModal(true); }}
+                      className="px-3 py-1.5 border border-amber-200 bg-amber-50 rounded-lg text-[9px] font-black text-amber-700 hover:bg-amber-100 transition-all uppercase tracking-widest"
+                    >
+                      Swing Feasibility (xlsx)
                     </button>
                   )}
                   {category === 'bom' && currentUser.role === 'admin' && (
@@ -4113,6 +4199,107 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
       </div>
 
       {/* Feature CSV Import Modal */}
+      {showSwingExpansionModal && (
+        <div className="fixed inset-0 z-[200] flex items-center justify-center p-4 bg-slate-900/50 backdrop-blur-sm">
+          <div className="bg-white rounded-2xl shadow-2xl w-full max-w-xl max-h-[85vh] flex flex-col overflow-hidden border border-slate-200">
+            <div className="px-6 py-4 border-b border-slate-100 flex justify-between items-center shrink-0">
+              <div>
+                <h3 className="text-sm font-black text-slate-900 tracking-tight">Swing Feasibility &amp; Condition (xlsx)</h3>
+                <p className="text-[9px] text-slate-400 font-bold uppercase tracking-widest mt-0.5">Item Features + Group Features → feasibility / condition</p>
+              </div>
+              <button onClick={resetSwingExpansionModal} disabled={swingRunning} className="p-1.5 text-slate-400 hover:text-slate-600 hover:bg-slate-50 rounded-md transition-all disabled:opacity-40">
+                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>
+              </button>
+            </div>
+
+            <div className="flex-1 overflow-auto p-6 space-y-5">
+              <p className="text-[10px] text-slate-500 leading-relaxed">
+                Upload the two raw PowerBI exports. The swing engine computes feasibility (Yes / No / Conditional / Review) and the normalized condition, then updates <span className="font-bold">only</span> the feasibility and condition columns on existing workspace mappings. Nothing else in mapping generation is changed.
+              </p>
+
+              {/* Item features file */}
+              <div className="rounded-lg border border-slate-200 p-4">
+                <div className="flex items-center justify-between mb-2">
+                  <span className="text-[10px] font-black text-slate-700 uppercase tracking-wider">File 1: Item Features</span>
+                  {swingItemFile && <span className="text-[9px] text-emerald-600 font-bold">{swingItemFile.name}</span>}
+                </div>
+                <button
+                  type="button"
+                  disabled={swingRunning}
+                  onClick={() => swingItemFileRef.current?.click()}
+                  className="px-3 py-1.5 border border-amber-200 bg-amber-50 rounded-lg text-[9px] font-black text-amber-700 hover:bg-amber-100 transition-all uppercase tracking-widest disabled:opacity-40"
+                >
+                  {swingItemFile ? 'Change File' : 'Select File'}
+                </button>
+                <input ref={swingItemFileRef} type="file" accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" className="hidden" onChange={(e) => { handleSwingFileSelect('item', e.target.files?.[0] || null); e.target.value = ''; }} />
+              </div>
+
+              {/* Group features file */}
+              <div className="rounded-lg border border-slate-200 p-4">
+                <div className="flex items-center justify-between mb-2">
+                  <span className="text-[10px] font-black text-slate-700 uppercase tracking-wider">File 2: Group Features</span>
+                  {swingGroupFile && <span className="text-[9px] text-emerald-600 font-bold">{swingGroupFile.name}</span>}
+                </div>
+                <button
+                  type="button"
+                  disabled={swingRunning}
+                  onClick={() => swingGroupFileRef.current?.click()}
+                  className="px-3 py-1.5 border border-amber-200 bg-amber-50 rounded-lg text-[9px] font-black text-amber-700 hover:bg-amber-100 transition-all uppercase tracking-widest disabled:opacity-40"
+                >
+                  {swingGroupFile ? 'Change File' : 'Select File'}
+                </button>
+                <input ref={swingGroupFileRef} type="file" accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" className="hidden" onChange={(e) => { handleSwingFileSelect('group', e.target.files?.[0] || null); e.target.value = ''; }} />
+              </div>
+
+              <label className="flex items-center gap-2 text-[10px] font-bold text-slate-600 select-none">
+                <input type="checkbox" checked={swingDryRun} disabled={swingRunning} onChange={(e) => setSwingDryRun(e.target.checked)} />
+                Dry run (compute counts only, do not write)
+              </label>
+
+              {swingProgress && (
+                <div className="rounded-lg border border-slate-200 p-4 space-y-3">
+                  <div className="flex items-center justify-between">
+                    <span className="text-[9px] font-black text-slate-500 uppercase tracking-widest">{swingProgress.phase || swingProgress.status}</span>
+                    <span className="text-[9px] font-bold text-slate-400">{swingProgress.processedItems}/{swingProgress.totalItems || '?'} items</span>
+                  </div>
+                  <div className="w-full h-2 bg-slate-200 rounded-full overflow-hidden">
+                    <div className="h-full bg-amber-500 transition-all duration-300" style={{ width: `${Math.round((swingProgress.progress || 0) * 100)}%` }} />
+                  </div>
+                  <div className="grid grid-cols-4 gap-2 text-center">
+                    <div><div className="text-[13px] font-black text-emerald-600">{swingProgress.counts?.Yes ?? 0}</div><div className="text-[8px] font-bold text-slate-400 uppercase">Yes</div></div>
+                    <div><div className="text-[13px] font-black text-rose-600">{swingProgress.counts?.No ?? 0}</div><div className="text-[8px] font-bold text-slate-400 uppercase">No</div></div>
+                    <div><div className="text-[13px] font-black text-amber-600">{swingProgress.counts?.Conditional ?? 0}</div><div className="text-[8px] font-bold text-slate-400 uppercase">Cond.</div></div>
+                    <div><div className="text-[13px] font-black text-slate-500">{swingProgress.counts?.Review ?? 0}</div><div className="text-[8px] font-bold text-slate-400 uppercase">Review</div></div>
+                  </div>
+                  <div className="flex items-center justify-between text-[9px] text-slate-500 font-bold">
+                    <span>Matched: {swingProgress.matched}</span>
+                    <span>Updated: {swingProgress.updated}</span>
+                    <span>Rows: {swingProgress.stagedRows}</span>
+                  </div>
+                  {swingProgress.status === 'completed' && (
+                    <div className="text-[10px] font-black text-emerald-600 uppercase tracking-wider">{swingProgress.dryRun ? 'Dry run complete — no writes' : 'Import complete'}</div>
+                  )}
+                  {swingProgress.status === 'failed' && (
+                    <div className="text-[10px] font-black text-rose-600">Failed: {swingProgress.error}</div>
+                  )}
+                </div>
+              )}
+            </div>
+
+            <div className="px-6 py-4 border-t border-slate-100 flex justify-end gap-2 shrink-0">
+              <button onClick={resetSwingExpansionModal} disabled={swingRunning} className="px-3 py-1.5 border border-slate-200 bg-slate-50 rounded-lg text-[9px] font-black text-slate-500 hover:bg-slate-100 transition-all uppercase tracking-widest disabled:opacity-40">Close</button>
+              <button
+                onClick={handleRunSwingExpansion}
+                disabled={swingRunning || !swingItemFile || !swingGroupFile}
+                className="px-3 py-1.5 border border-amber-200 bg-amber-50 rounded-lg text-[9px] font-black text-amber-700 hover:bg-amber-100 transition-all uppercase tracking-widest disabled:opacity-40 disabled:cursor-not-allowed"
+              >
+                {swingRunning ? 'Running…' : (swingDryRun ? 'Run Dry Run' : 'Run & Apply')}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {showFeatureImportModal && (
         <div className="fixed inset-0 z-[200] flex items-center justify-center p-4 bg-slate-900/50 backdrop-blur-sm">
           <div className="bg-white rounded-2xl shadow-2xl w-full max-w-2xl max-h-[80vh] flex flex-col overflow-hidden border border-slate-200">

@@ -1,5 +1,5 @@
 
-import React, { useState, useEffect, useMemo, useRef } from 'react';
+import React, { useState, useEffect, useMemo, useRef, useCallback } from 'react';
 import { LegacyItem, NewClassification, GlobalMapping, LocalItemMappings, NewAttribute, ItemLock, User, FeatureFlags, MappingTypeConfig, MLPrediction, ItemApprovalState } from '../types';
 import { dbService } from '../services/dbService';
 
@@ -743,6 +743,12 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
   const [fetchedClasses, setFetchedClasses] = useState<Record<string, NewClassification>>({});
   const fetchingClassRef = useRef<string | null>(null);
 
+  // On-demand fetched allowed values for target attributes that live in a
+  // classification not currently loaded (e.g. selected via cross-class search).
+  // Keyed by normalizeAttrId(attributeId).
+  const [fetchedAttributeValues, setFetchedAttributeValues] = useState<Record<string, string[]>>({});
+  const fetchingAttrValuesRef = useRef<Set<string>>(new Set());
+
   // Merge prop classes with on-demand fetched classes
   const mergedClasses = useMemo(() => {
     const byId = new Map<string, NewClassification>();
@@ -1095,6 +1101,48 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
     return byAttr;
   }, [engineeringGlobalMappings, mergedClasses]);
 
+  // Fetch allowed values for a target attribute that has no locally-known
+  // candidate values (typically because it was selected via cross-class search
+  // and its owning classification isn't loaded). Results are cached by
+  // normalized attribute id so the value dropdown can offer real options.
+  const fetchAttributeValuesIfNeeded = useCallback((attrId: string) => {
+    if (!attrId) return;
+    const upper = attrId.toUpperCase();
+    if (upper === 'UNMAPPED' || upper === 'NOT REQUIRED') return;
+    const key = normalizeAttrId(attrId);
+    if (!key) return;
+    // Already have local candidates for this attribute → no fetch needed.
+    if ((attributeCandidateValues[attrId] || []).length > 0) return;
+    // Already fetched or in-flight.
+    if (fetchedAttributeValues[key] || fetchingAttrValuesRef.current.has(key)) return;
+    fetchingAttrValuesRef.current.add(key);
+    dbService.fetchGroupFeatureAttributeValues(attrId, undefined, 200)
+      .then(result => {
+        const values = (result.items || []).map(i => i.value).filter(Boolean);
+        setFetchedAttributeValues(prev => ({ ...prev, [key]: values }));
+      })
+      .catch(err => console.warn(`Failed to fetch values for attribute '${attrId}':`, err))
+      .finally(() => { fetchingAttrValuesRef.current.delete(key); });
+  }, [attributeCandidateValues, fetchedAttributeValues]);
+
+  // Backfill allowed values for target attributes already selected (via global
+  // or local mappings) whose values aren't locally known, so the value dropdown
+  // is populated on load without requiring re-selection.
+  useEffect(() => {
+    const attrIds = new Set<string>();
+    engineeringGlobalMappings.forEach(m => {
+      (m.newAttributeId || '').replace(/\s+/g, '').split(';').forEach(p => {
+        const a = p.trim();
+        if (a) attrIds.add(a);
+      });
+    });
+    stagedLocalMappings.forEach(m => {
+      if (m.newAttributeId) attrIds.add(m.newAttributeId);
+    });
+    attrIds.forEach(a => fetchAttributeValuesIfNeeded(a));
+  }, [engineeringGlobalMappings, stagedLocalMappings, fetchAttributeValuesIfNeeded]);
+
+
   const legacyFilterOptions = useMemo(() => {
     if (!item) return [] as string[];
     const set = new Set<string>();
@@ -1364,6 +1412,10 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
     if (!item) return;
     isEditingRef.current = true;
     clearApprovalForFeatureLocally(featureId);
+
+    // Ensure the value dropdown has real options for the chosen attribute even
+    // when it lives in a classification that isn't currently loaded.
+    fetchAttributeValuesIfNeeded(attrId);
 
     // Precompute feature values so we can auto-populate NOT REQUIRED mappings
     const feature = item.features.find(f => f.featureId === featureId);
@@ -1910,6 +1962,14 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
               const attrDef = activeClass?.attributes.find(a => normalizeAttrId(a.attributeId) === normalizeAttrId(selectedAttribute));
               if (attrDef && attrDef.allowedValues && attrDef.allowedValues.length > 0) {
                 candidateValuesForAttribute = attrDef.allowedValues;
+              }
+            }
+            // Fall back to on-demand fetched values for attributes whose owning
+            // classification isn't loaded (e.g. selected via cross-class search).
+            if (candidateValuesForAttribute.length === 0 && selectedAttribute && selectedAttribute !== 'UNMAPPED' && selectedAttribute !== 'NOT REQUIRED') {
+              const fetched = fetchedAttributeValues[normalizeAttrId(selectedAttribute)];
+              if (fetched && fetched.length > 0) {
+                candidateValuesForAttribute = fetched;
               }
             }
             // Ensure NOT REQUIRED is always available as a value option
