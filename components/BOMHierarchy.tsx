@@ -199,6 +199,7 @@ const BOMHierarchy: React.FC<BOMHierarchyProps> = ({ currentUser, onClose }) => 
           unit: ci(row, 'unit', 'uom'),
           condition: ci(row, 'condition'),
           formula: ci(row, 'formula'),
+          conversion: ci(row, 'conversion'),
         } satisfies BomHierarchyItem;
       }).filter(item => item.itemId);
 
@@ -638,6 +639,7 @@ const BOMHierarchy: React.FC<BOMHierarchyProps> = ({ currentUser, onClose }) => 
                 <th className="px-4 py-3 text-[9px] font-black text-slate-400 uppercase tracking-widest w-20 text-center">Unit</th>
                 <th className="px-4 py-3 text-[9px] font-black text-slate-400 uppercase tracking-widest min-w-[16rem]">Condition</th>
                 <th className="px-4 py-3 text-[9px] font-black text-slate-400 uppercase tracking-widest w-32">Formula</th>
+                <th className="px-4 py-3 text-[9px] font-black text-slate-400 uppercase tracking-widest min-w-[14rem]">Feature Conversion</th>
                 <th className="px-4 py-3 text-[9px] font-black text-slate-400 uppercase tracking-widest w-28 text-center">Type</th>
               </tr>
             </thead>
@@ -667,6 +669,7 @@ const BOMHierarchy: React.FC<BOMHierarchyProps> = ({ currentUser, onClose }) => 
                       <td className="px-4 py-2.5"><span className="text-[9px] text-slate-400">Top-level BOM assembly</span></td>
                       <td className="px-4 py-2.5 text-center"><span className="text-[10px] text-slate-400">—</span></td>
                       <td className="px-4 py-2.5 text-center"><span className="text-[10px] text-slate-400">—</span></td>
+                      <td className="px-4 py-2.5"><span className="text-[9px] text-slate-400">—</span></td>
                       <td className="px-4 py-2.5"><span className="text-[9px] text-slate-400">—</span></td>
                       <td className="px-4 py-2.5"><span className="text-[9px] text-slate-400">—</span></td>
                       <td className="px-4 py-2.5 text-center">
@@ -766,6 +769,13 @@ const BOMHierarchy: React.FC<BOMHierarchyProps> = ({ currentUser, onClose }) => 
                     </td>
                     <td className="px-4 py-2.5">
                       <span className="text-[9px] text-purple-600 font-medium line-clamp-1">{item.formula || '—'}</span>
+                    </td>
+                    <td className="px-4 py-2.5">
+                      {item.conversion ? (
+                        <span className="text-[9px] text-teal-600 font-medium whitespace-pre-wrap break-words">{item.conversion}</span>
+                      ) : (
+                        <span className="text-[9px] text-slate-400">—</span>
+                      )}
                     </td>
                     <td className="px-4 py-2.5 text-center">
                       {row.expandable ? (

@@ -326,6 +326,7 @@ class BomHierarchy(Base):
     unit = Column(String, nullable=True)
     condition = Column(String, nullable=True)
     formula = Column(String, nullable=True)
+    conversion = Column(String, nullable=True)
     created_at = Column(Float, nullable=True)
     created_by = Column(String, nullable=True)
 

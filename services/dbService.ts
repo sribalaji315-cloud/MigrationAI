@@ -1,3 +1,4 @@
+
 import { GlobalMapping, DatabaseState, User, ConnectionMode, NewAttribute, WorkspaceMappingRow, MappingGenerationProgress, ValueListGroup, ValueListRow, NewClassification, BomHierarchyItem, MLPrediction, MLSettings, FeatureCombinationJobProgress, FeatureCombinationRow, FeatureCombinationItem, ConsolidationAnalysis, SubsetMergeDetail, AttributeCombinationJobProgress, AttributeCombinationRow, AttributeCombinationItem, AttrComboConsolidationAnalysis, MigrationManifestRow, MigrationManifestFilters, MigrationManifestItemSummary, MigrationManifestAttributeGroup, MigrationManifestValueDetail, MergedWorkspaceMappingRow, MergeJob, ValuelistStrategyJob, TargetAttributeProfile, ValuelistDedupGroup, ValuelistMergeProposal, ValuelistApplyResult, GroupFeatureRow, GroupFeatureMappingJobProgress, GroupFeatureWhereUsedItem, GroupFeatureFilters, ApplyGroupFeatureProgress, ItemApprovalState } from '../types';
 
 export interface SaveAllResult {
@@ -624,6 +625,20 @@ export const dbService = {
     return resp.json();
   },
 
+  async regenerateItem(itemId: string): Promise<{ ok: boolean; rowsDeleted: number; rowsGenerated: number; skipped?: string }> {
+    if (!SQL_ENDPOINT) throw new Error('Database connection not available.');
+    const resp = await this._fetchWithRefresh(
+      `${SQL_ENDPOINT}/workspace-mappings/${encodeURIComponent(itemId)}/regenerate`,
+      { method: 'POST', headers: this._authHeaders() },
+    );
+    if (!resp.ok) {
+      const errText = await resp.text();
+      throw new Error(`Failed to regenerate item: ${resp.status} ${errText}`);
+    }
+    this._invalidateCache();
+    return resp.json();
+  },
+
   async revertAllToGlobal(): Promise<{ ok: boolean; localRowsDeleted: number; mappingGenerationJobId: number }> {
     if (!SQL_ENDPOINT) throw new Error('Database connection not available.');
     const resp = await this._fetchWithRefresh(
@@ -879,6 +894,91 @@ export const dbService = {
       throw new Error(`Failed to fetch swing expansion progress: ${resp.status} ${errText}`);
     }
     return resp.json();
+  },
+
+  async uploadItemFeaturesCsv(
+    file: File,
+    columnMapping: Record<string, number>,
+    dryRun = false,
+  ): Promise<{ ok: boolean; status: string; dryRun: boolean }> {
+    if (!SQL_ENDPOINT) {
+      throw new Error('Database connection not available.');
+    }
+    const formData = new FormData();
+    formData.append('file', file);
+    formData.append('columnMapping', JSON.stringify(columnMapping));
+    const headers: Record<string, string> = {};
+    const auth = this._authHeaders();
+    if (auth.Authorization) headers.Authorization = auth.Authorization;
+    const resp = await this._fetchWithRefresh(
+      `${SQL_ENDPOINT}/imports/item-features?dryRun=${dryRun ? 'true' : 'false'}`,
+      {
+        method: 'POST',
+        headers,
+        body: formData,
+      },
+    );
+    if (!resp.ok) {
+      const errText = await resp.text();
+      throw new Error(`Failed to start item-features import: ${resp.status} ${errText}`);
+    }
+    return resp.json();
+  },
+
+  async fetchItemFeaturesProgress(): Promise<{
+    status: string;
+    phase: string | null;
+    isActive: boolean;
+    progress: number;
+    processedRows: number;
+    totalRows: number;
+    processedItems: number;
+    totalItems: number;
+    createdItems: number;
+    createdFeatures: number;
+    updatedItems: number;
+    addedFeatures: number;
+    addedValues: number;
+    unchangedItems: number;
+    rowsSkippedEmpty: number;
+    dryRun: boolean;
+    error: string | null;
+  }> {
+    if (!SQL_ENDPOINT) {
+      throw new Error('Database connection not available.');
+    }
+    const resp = await this._fetchWithRefresh(`${SQL_ENDPOINT}/imports/item-features/progress`, {
+      method: 'GET',
+      headers: this._authHeaders(),
+    });
+    if (!resp.ok) {
+      const errText = await resp.text();
+      throw new Error(`Failed to fetch item-features import progress: ${resp.status} ${errText}`);
+    }
+    return resp.json();
+  },
+
+  async downloadItemFeaturesMergeReport(): Promise<void> {
+    if (!SQL_ENDPOINT) {
+      throw new Error('Database connection not available.');
+    }
+    const resp = await this._fetchWithRefresh(`${SQL_ENDPOINT}/imports/item-features/merge-report.csv`, {
+      method: 'GET',
+      headers: this._authHeaders(),
+    });
+    if (!resp.ok) {
+      const errText = await resp.text();
+      throw new Error(`Failed to download merge report: ${resp.status} ${errText}`);
+    }
+    const blob = await resp.blob();
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = 'item-features-merge-report.csv';
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
   },
 
   async saveAll(

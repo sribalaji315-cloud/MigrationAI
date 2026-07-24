@@ -217,6 +217,7 @@ export interface BomHierarchyItem {
   unit?: string;
   condition?: string;
   formula?: string;
+  conversion?: string;
   createdAt?: number;
   createdBy?: string;
 }

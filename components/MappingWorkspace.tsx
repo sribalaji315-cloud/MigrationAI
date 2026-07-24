@@ -947,6 +947,29 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
     }
   };
 
+  const [isRegeneratingItem, setIsRegeneratingItem] = useState(false);
+  const handleRegenerateItem = async () => {
+    if (!item) return;
+    if (isRegeneratingItem) return;
+    if (!confirm(`Regenerate mappings for "${item.itemId}" from global rules? Your manual overrides and approved features are preserved.`)) return;
+    try {
+      setIsRegeneratingItem(true);
+      const result = await dbService.regenerateItem(item.itemId);
+      if (result.skipped === 'approved') {
+        alert(`"${item.itemId}" is approved for migration and was not regenerated.`);
+      }
+      if (onRevertItem) {
+        await onRevertItem(item.itemId);
+      } else {
+        onSyncFromDB();
+      }
+    } catch (e: any) {
+      alert(`Regenerate failed: ${e.message}`);
+    } finally {
+      setIsRegeneratingItem(false);
+    }
+  };
+
   // --- Migration approval --------------------------------------------------
   // Fetch approval state whenever the selected item changes.
   useEffect(() => {
@@ -1220,8 +1243,7 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
       const globalMapping = globalMappingsForFeature[0] || null;
       const localOverride = localByFeature[f.featureId];
       const fallbackGlobal = allGlobalMappingsByFeature[f.featureId];
-      // Use global mapping's attributeType for type filtering (workspace mappings have empty attributeType)
-      const effectiveType = normalizeMappingType(fallbackGlobal?.attributeType);
+      const effectiveType = normalizeMappingType(localOverride?.attributeType || fallbackGlobal?.attributeType);
       if (includedMappingTypeSet && effectiveType && !includedMappingTypeSet.has(effectiveType)) {
         return;
       }
@@ -1678,6 +1700,24 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
              </div>
 
              <div className="flex gap-2">
+             {(isLockedByMe || currentUser.role === 'admin') && (
+                <button
+                  type="button"
+                  onClick={handleRegenerateItem}
+                  disabled={isGenerationBlocked || isRegeneratingItem}
+                  title="Regenerate this item's mappings from global rules (keeps your manual overrides and approved features)"
+                  className={`px-3 py-1.5 text-[9px] font-black rounded-lg transition-all uppercase tracking-widest flex items-center gap-1.5 ${
+                    isGenerationBlocked || isRegeneratingItem
+                      ? 'bg-white/5 text-white/30 cursor-not-allowed'
+                      : 'bg-violet-500/20 border border-violet-400/40 text-violet-200 hover:bg-violet-500/30'
+                  }`}
+                >
+                  <svg className={`w-3 h-3 ${isRegeneratingItem ? 'animate-spin' : ''}`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                  </svg>
+                  {isRegeneratingItem ? 'Regenerating...' : 'Regenerate'}
+                </button>
+             )}
              {!isLockedByMe && !lockOwner && (
                 <button type="button" onClick={() => onSignOn().catch(e => console.error("Sign on failed:", e))} className="px-4 py-1.5 bg-indigo-600 text-white text-[9px] font-black rounded-lg hover:bg-indigo-700 transition-all uppercase tracking-widest shadow-lg shadow-indigo-300/30">
                   Sign On
@@ -1991,23 +2031,13 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
             const attributePalette = toneTheme[attributeTone];
             const isExpanded = !!expandedFeatures[f.featureId];
 
-            // Migration approval (feature level). Features whose values are all
-            // NOT REQUIRED / discontinued / infeasible are auto-satisfied and
-            // need no manual approval.
-            const featureValuesList = f.values || [];
-            const allValuesInactive = featureValuesList.length > 0 && featureValuesList.every(v => {
-              const vm = effectiveMapping?.valueMeta?.[v];
-              const vs = (vm?.valueStatus || '').toLowerCase();
-              const feas = (vm?.feasibility || '').toLowerCase();
-              return vs === 'discontinued' || vs === 'ignored' || vs === 'deprecated' || feas === 'no';
-            });
-            const isFeatureAutoSatisfied = attributeTone === 'notRequired' || allValuesInactive;
+            // Migration approval (feature level). Every feature requires manual
+            // approval, even when its values are all NOT REQUIRED / discontinued /
+            // infeasible.
             const featureApprover = approvalState?.features?.[f.featureId];
             const isFeatureApproved = !!featureApprover;
             const featureApprovalTitle = isFeatureApproved && featureApprover?.approvedByUsername
               ? `Approved by ${featureApprover.approvedByUsername}${featureApprover.approvedAt ? ' · ' + new Date(featureApprover.approvedAt * 1000).toLocaleString() : ''}`
-              : isFeatureAutoSatisfied
-              ? 'Auto-satisfied (not required / discontinued) — counts as approved'
               : 'Approve this feature for migration';
 
             return (
@@ -2058,12 +2088,7 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
 
                     <div className="flex flex-col items-end gap-1 min-w-[220px]">
                       <div className="flex flex-wrap items-center justify-end gap-2">
-                        {isFeatureAutoSatisfied ? (
-                          <span title={featureApprovalTitle} className="px-2 py-0.5 bg-slate-100 text-slate-500 text-[7px] font-black rounded-full uppercase tracking-wider inline-flex items-center gap-1">
-                            <svg className="w-2.5 h-2.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={3} d="M5 13l4 4L19 7" /></svg>
-                            Auto
-                          </span>
-                        ) : isLockedByMe ? (
+                        {isLockedByMe ? (
                           <button
                             type="button"
                             onClick={() => handleToggleFeatureApproval(f.featureId)}

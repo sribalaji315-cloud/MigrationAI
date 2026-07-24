@@ -267,6 +267,33 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
     };
   }, []);
 
+  // ---- Item-features CSV import (NEW, isolated) state ----
+  const ITEM_FEATURES_FIELDS: { key: string; label: string; required: boolean }[] = [
+    { key: 'item', label: 'Item', required: true },
+    { key: 'feature', label: 'Feature', required: true },
+    { key: 'valueCode', label: 'Value (code)', required: false },
+    { key: 'valueNumber', label: 'Value (number)', required: false },
+    { key: 'unit', label: 'Unit', required: false },
+  ];
+  const [showItemFeaturesModal, setShowItemFeaturesModal] = useState(false);
+  const [itemFeaturesFile, setItemFeaturesFile] = useState<File | null>(null);
+  const [itemFeaturesHeaders, setItemFeaturesHeaders] = useState<string[]>([]);
+  const [itemFeaturesColMap, setItemFeaturesColMap] = useState<Record<string, number | ''>>({});
+  const [itemFeaturesDryRun, setItemFeaturesDryRun] = useState(true);
+  const [itemFeaturesRunning, setItemFeaturesRunning] = useState(false);
+  const [itemFeaturesProgress, setItemFeaturesProgress] = useState<Awaited<ReturnType<typeof dbService.fetchItemFeaturesProgress>> | null>(null);
+  const itemFeaturesFileRef = useRef<HTMLInputElement | null>(null);
+  const itemFeaturesPollRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (itemFeaturesPollRef.current) {
+        window.clearInterval(itemFeaturesPollRef.current);
+        itemFeaturesPollRef.current = null;
+      }
+    };
+  }, []);
+
   // ---- Classification filter state (all distinct classes + attributes) ----
   const [allClassOptions, setAllClassOptions] = useState<{ classId: string; className: string }[]>([]);
   const [allAttributeOptions, setAllAttributeOptions] = useState<string[]>([]);
@@ -2106,6 +2133,130 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
     }
   };
 
+  // ---- Item-features CSV import handlers (NEW, isolated) ----
+  const resetItemFeaturesModal = () => {
+    if (itemFeaturesPollRef.current) {
+      window.clearInterval(itemFeaturesPollRef.current);
+      itemFeaturesPollRef.current = null;
+    }
+    setShowItemFeaturesModal(false);
+    setItemFeaturesFile(null);
+    setItemFeaturesHeaders([]);
+    setItemFeaturesColMap({});
+    setItemFeaturesDryRun(true);
+    setItemFeaturesRunning(false);
+    setItemFeaturesProgress(null);
+  };
+
+  const handleDownloadItemFeaturesTemplate = () => {
+    const rows: string[][] = [
+      ['item', 'model', 'sequence', 'feature', 'value', 'value', 'unit'],
+      ['A10440701', '', '10', '2GW01', '', '0.148', 'GW2'],
+      ['A10440701', '0C029', '20', 'ASUPC', 'CLKD', '0', ''],
+      ['A10440701', '', '5', 'EPCKF', '', '400', 'ST0'],
+    ];
+    const csv = buildCsv(rows);
+    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = 'item-features-template.csv';
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
+  };
+
+  const handleItemFeaturesFileSelect = async (file: File | null) => {
+    if (!file) return;
+    setItemFeaturesFile(file);
+    setItemFeaturesProgress(null);
+    // Read just enough of the file to get the header row.
+    let headerLine = '';
+    try {
+      const slice = file.slice(0, 64 * 1024);
+      const text = await slice.text();
+      headerLine = (text.split(/\r?\n/)[0] || '').trim();
+    } catch {
+      headerLine = '';
+    }
+    const delimiter = detectDelimiter(headerLine);
+    const headers = splitDelimitedLine(headerLine, delimiter).map(h => h.trim());
+    setItemFeaturesHeaders(headers);
+
+    // Auto-map by index against the known canonical layout, falling back to
+    // name matching. The two duplicate "value" columns are disambiguated by
+    // taking the first "value" as code and the second as number.
+    const valueIdxs = headers
+      .map((h, i) => ({ h: h.toLowerCase(), i }))
+      .filter(x => x.h === 'value')
+      .map(x => x.i);
+    const findByName = (...names: string[]) =>
+      headers.findIndex(h => names.includes(h.toLowerCase()));
+    const auto: Record<string, number | ''> = {
+      item: findByName('item') >= 0 ? findByName('item') : 0,
+      feature: findByName('feature') >= 0 ? findByName('feature') : 3,
+      valueCode: valueIdxs.length >= 1 ? valueIdxs[0] : (headers.length > 4 ? 4 : ''),
+      valueNumber: valueIdxs.length >= 2 ? valueIdxs[1] : (headers.length > 5 ? 5 : ''),
+      unit: findByName('unit') >= 0 ? findByName('unit') : (headers.length > 6 ? 6 : ''),
+    };
+    setItemFeaturesColMap(auto);
+  };
+
+  const handleRunItemFeaturesImport = async () => {
+    if (currentUser.role !== 'admin') {
+      alert('Only administrators may import item features.');
+      return;
+    }
+    if (!itemFeaturesFile) {
+      alert('Select an item-features CSV file.');
+      return;
+    }
+    const map = itemFeaturesColMap;
+    if (map.item === '' || map.item == null || map.feature === '' || map.feature == null) {
+      alert('Map both the Item and Feature columns.');
+      return;
+    }
+    if ((map.valueCode === '' || map.valueCode == null) && (map.valueNumber === '' || map.valueNumber == null)) {
+      alert('Map at least one value column (code or number).');
+      return;
+    }
+    if (itemFeaturesRunning) return;
+
+    const columnMapping: Record<string, number> = {};
+    ITEM_FEATURES_FIELDS.forEach(({ key }) => {
+      const v = map[key];
+      if (typeof v === 'number') columnMapping[key] = v;
+    });
+
+    try {
+      setItemFeaturesRunning(true);
+      setItemFeaturesProgress(null);
+      await dbService.uploadItemFeaturesCsv(itemFeaturesFile, columnMapping, itemFeaturesDryRun);
+      itemFeaturesPollRef.current = window.setInterval(async () => {
+        try {
+          const p = await dbService.fetchItemFeaturesProgress();
+          setItemFeaturesProgress(p);
+          if (!p.isActive) {
+            if (itemFeaturesPollRef.current) {
+              window.clearInterval(itemFeaturesPollRef.current);
+              itemFeaturesPollRef.current = null;
+            }
+            setItemFeaturesRunning(false);
+            if (p.status === 'completed' && !p.dryRun) {
+              (dbService as any)._invalidateCache?.();
+            }
+          }
+        } catch {
+          /* keep polling; transient errors are non-fatal */
+        }
+      }, 1000);
+    } catch (err: any) {
+      setItemFeaturesRunning(false);
+      alert(`Failed to start item-features import: ${err?.message || String(err)}`);
+    }
+  };
+
   const handleSave = async () => {
     await persistInspectorData({ source: 'manual', closeInspector: true });
   };
@@ -2418,6 +2569,15 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
                       className="px-3 py-1.5 border border-violet-200 bg-violet-50 rounded-lg text-[9px] font-black text-violet-700 hover:bg-violet-100 transition-all uppercase tracking-widest"
                     >
                       Import Feature CSVs
+                    </button>
+                  )}
+                  {category === 'bom' && currentUser.role === 'admin' && (
+                    <button
+                      type="button"
+                      onClick={() => { resetItemFeaturesModal(); setShowItemFeaturesModal(true); }}
+                      className="px-3 py-1.5 border border-cyan-200 bg-cyan-50 rounded-lg text-[9px] font-black text-cyan-700 hover:bg-cyan-100 transition-all uppercase tracking-widest"
+                    >
+                      Import Item Features
                     </button>
                   )}
                   {currentUser.role === 'admin' && (
@@ -4294,6 +4454,147 @@ const DataInspector: React.FC<DataInspectorProps> = ({ category, onClose, data, 
                 className="px-3 py-1.5 border border-amber-200 bg-amber-50 rounded-lg text-[9px] font-black text-amber-700 hover:bg-amber-100 transition-all uppercase tracking-widest disabled:opacity-40 disabled:cursor-not-allowed"
               >
                 {swingRunning ? 'Running…' : (swingDryRun ? 'Run Dry Run' : 'Run & Apply')}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {showItemFeaturesModal && (
+        <div className="fixed inset-0 z-[200] flex items-center justify-center p-4 bg-slate-900/50 backdrop-blur-sm">
+          <div className="bg-white rounded-2xl shadow-2xl w-full max-w-xl max-h-[85vh] flex flex-col overflow-hidden border border-slate-200">
+            <div className="px-6 py-4 border-b border-slate-100 flex justify-between items-center shrink-0">
+              <div>
+                <h3 className="text-sm font-black text-slate-900 tracking-tight">Import Item Features (CSV)</h3>
+                <p className="text-[9px] text-slate-400 font-bold uppercase tracking-widest mt-0.5">Item + Feature + Value → bom items / features</p>
+              </div>
+              <button onClick={resetItemFeaturesModal} disabled={itemFeaturesRunning} className="p-1.5 text-slate-400 hover:text-slate-600 hover:bg-slate-50 rounded-md transition-all disabled:opacity-40">
+                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>
+              </button>
+            </div>
+
+            <div className="flex-1 overflow-auto p-6 space-y-5">
+              <p className="text-[10px] text-slate-500 leading-relaxed">
+                Upload an item-features CSV. Models are aggregated away: a feature that appears under multiple models is collapsed into one <span className="font-bold">(item, feature)</span> with the union of its values. New items are created; existing items are <span className="font-bold">merged</span> — missing features and new values are added, existing values are left intact.
+              </p>
+
+              <div className="flex items-center justify-between">
+                <span className="text-[10px] font-black text-slate-700 uppercase tracking-wider">Template</span>
+                <button
+                  type="button"
+                  onClick={handleDownloadItemFeaturesTemplate}
+                  className="px-3 py-1.5 border border-slate-200 bg-slate-50 rounded-lg text-[9px] font-black text-slate-600 hover:bg-slate-100 transition-all uppercase tracking-widest"
+                >
+                  Download Template
+                </button>
+              </div>
+
+              {/* File select */}
+              <div className="rounded-lg border border-slate-200 p-4">
+                <div className="flex items-center justify-between mb-2">
+                  <span className="text-[10px] font-black text-slate-700 uppercase tracking-wider">CSV File</span>
+                  {itemFeaturesFile && <span className="text-[9px] text-emerald-600 font-bold">{itemFeaturesFile.name}</span>}
+                </div>
+                <button
+                  type="button"
+                  disabled={itemFeaturesRunning}
+                  onClick={() => itemFeaturesFileRef.current?.click()}
+                  className="px-3 py-1.5 border border-cyan-200 bg-cyan-50 rounded-lg text-[9px] font-black text-cyan-700 hover:bg-cyan-100 transition-all uppercase tracking-widest disabled:opacity-40"
+                >
+                  {itemFeaturesFile ? 'Change File' : 'Select File'}
+                </button>
+                <input ref={itemFeaturesFileRef} type="file" accept=".csv,text/csv" className="hidden" onChange={(e) => { handleItemFeaturesFileSelect(e.target.files?.[0] || null); e.target.value = ''; }} />
+              </div>
+
+              {/* Column mapping */}
+              {itemFeaturesHeaders.length > 0 && (
+                <div className="rounded-lg border border-slate-200 p-4 space-y-2">
+                  <span className="text-[10px] font-black text-slate-700 uppercase tracking-wider">Column Mapping</span>
+                  {ITEM_FEATURES_FIELDS.map(({ key, label, required }) => (
+                    <div key={key} className="flex items-center justify-between gap-3">
+                      <span className="text-[10px] font-bold text-slate-600">
+                        {label}{required && <span className="text-rose-500"> *</span>}
+                      </span>
+                      <select
+                        value={itemFeaturesColMap[key] === '' || itemFeaturesColMap[key] == null ? '' : String(itemFeaturesColMap[key])}
+                        disabled={itemFeaturesRunning}
+                        onChange={(e) => setItemFeaturesColMap(prev => ({
+                          ...prev,
+                          [key]: e.target.value === '' ? '' : Number(e.target.value),
+                        }))}
+                        className="px-2 py-1 border border-slate-200 bg-white rounded-md text-[9px] font-bold text-slate-600 min-w-[160px]"
+                      >
+                        <option value="">— none —</option>
+                        {itemFeaturesHeaders.map((h, i) => (
+                          <option key={i} value={i}>{`${h || '(blank)'} (col ${i + 1})`}</option>
+                        ))}
+                      </select>
+                    </div>
+                  ))}
+                  <p className="text-[8px] text-slate-400 font-bold uppercase tracking-wider pt-1">Value = code when present, else number. Model / sequence are ignored.</p>
+                </div>
+              )}
+
+              <label className="flex items-center gap-2 text-[10px] font-bold text-slate-600 select-none">
+                <input type="checkbox" checked={itemFeaturesDryRun} disabled={itemFeaturesRunning} onChange={(e) => setItemFeaturesDryRun(e.target.checked)} />
+                Dry run (compute counts only, do not write)
+              </label>
+
+              {itemFeaturesProgress && (
+                <div className="rounded-lg border border-slate-200 p-4 space-y-3">
+                  <div className="flex items-center justify-between">
+                    <span className="text-[9px] font-black text-slate-500 uppercase tracking-widest">{itemFeaturesProgress.phase || itemFeaturesProgress.status}</span>
+                    <span className="text-[9px] font-bold text-slate-400">
+                      {itemFeaturesProgress.phase === 'parsing'
+                        ? `${itemFeaturesProgress.processedRows} rows`
+                        : `${itemFeaturesProgress.processedItems}/${itemFeaturesProgress.totalItems || '?'} items`}
+                    </span>
+                  </div>
+                  <div className="w-full h-2 bg-slate-200 rounded-full overflow-hidden">
+                    <div className="h-full bg-cyan-500 transition-all duration-300" style={{ width: `${Math.round((itemFeaturesProgress.progress || 0) * 100)}%` }} />
+                  </div>
+                  <div className="grid grid-cols-3 gap-2 text-center">
+                    <div><div className="text-[13px] font-black text-emerald-600">{itemFeaturesProgress.createdItems}</div><div className="text-[8px] font-bold text-slate-400 uppercase">New Items</div></div>
+                    <div><div className="text-[13px] font-black text-cyan-600">{itemFeaturesProgress.createdFeatures}</div><div className="text-[8px] font-bold text-slate-400 uppercase">New Features</div></div>
+                    <div><div className="text-[13px] font-black text-amber-600">{itemFeaturesProgress.updatedItems}</div><div className="text-[8px] font-bold text-slate-400 uppercase">Merged Items</div></div>
+                  </div>
+                  <div className="flex items-center justify-between text-[9px] text-slate-500 font-bold">
+                    <span>Added: {itemFeaturesProgress.addedFeatures} feat / {itemFeaturesProgress.addedValues} val</span>
+                    <span>Empty skipped: {itemFeaturesProgress.rowsSkippedEmpty}</span>
+                  </div>
+                  {itemFeaturesProgress.status === 'completed' && itemFeaturesProgress.updatedItems > 0 && (
+                    <button
+                      type="button"
+                      onClick={async () => {
+                        try {
+                          await dbService.downloadItemFeaturesMergeReport();
+                        } catch (err: any) {
+                          alert(`Failed to download merge report: ${err?.message || String(err)}`);
+                        }
+                      }}
+                      className="w-full px-3 py-1.5 border border-slate-200 bg-slate-50 rounded-lg text-[9px] font-black text-slate-600 hover:bg-slate-100 transition-all uppercase tracking-widest"
+                    >
+                      Download Merge Report ({itemFeaturesProgress.updatedItems})
+                    </button>
+                  )}
+                  {itemFeaturesProgress.status === 'completed' && (
+                    <div className="text-[10px] font-black text-emerald-600 uppercase tracking-wider">{itemFeaturesProgress.dryRun ? 'Dry run complete — no writes' : 'Import complete'}</div>
+                  )}
+                  {itemFeaturesProgress.status === 'failed' && (
+                    <div className="text-[10px] font-black text-rose-600">Failed: {itemFeaturesProgress.error}</div>
+                  )}
+                </div>
+              )}
+            </div>
+
+            <div className="px-6 py-4 border-t border-slate-100 flex justify-end gap-2 shrink-0">
+              <button onClick={resetItemFeaturesModal} disabled={itemFeaturesRunning} className="px-3 py-1.5 border border-slate-200 bg-slate-50 rounded-lg text-[9px] font-black text-slate-500 hover:bg-slate-100 transition-all uppercase tracking-widest disabled:opacity-40">Close</button>
+              <button
+                onClick={handleRunItemFeaturesImport}
+                disabled={itemFeaturesRunning || !itemFeaturesFile || itemFeaturesHeaders.length === 0}
+                className="px-3 py-1.5 border border-cyan-200 bg-cyan-50 rounded-lg text-[9px] font-black text-cyan-700 hover:bg-cyan-100 transition-all uppercase tracking-widest disabled:opacity-40 disabled:cursor-not-allowed"
+              >
+                {itemFeaturesRunning ? 'Running…' : (itemFeaturesDryRun ? 'Run Dry Run' : 'Run & Import')}
               </button>
             </div>
           </div>

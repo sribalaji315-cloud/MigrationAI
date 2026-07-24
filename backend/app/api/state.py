@@ -2424,6 +2424,222 @@ def _regenerate_item_from_global(item_id: str, user_id: str, username: str, db: 
     return {"ok": True, "rowsDeleted": deleted, "rowsGenerated": generated}
 
 
+def _regenerate_item_preserving_local(item_id: str, user_id: str, username: str, db: Session):
+    """Regenerate a single item's workspace mappings from BOM + global mappings while
+    preserving manual local overrides (mapped_from='local') and approved items/features.
+
+    Mirrors the bulk mapping-generation job's preservation rules, scoped to one item.
+    """
+    # Approval protection: an approved item is never regenerated; approved
+    # (item, feature) pairs keep their existing mappings.
+    approved_item_ids, approved_pairs = _load_approved_protection(db)
+    if item_id in approved_item_ids:
+        return {"ok": True, "rowsDeleted": 0, "rowsGenerated": 0, "skipped": "approved"}
+
+    # Preserve metadata for the rows we are about to regenerate (exclude local).
+    preserved_revert_metadata = _snapshot_workspace_revert_metadata(
+        db, item_id=item_id, include_local=False
+    )
+
+    # Collect (item, feature) pairs with local overrides so we skip them entirely.
+    _local_pairs_raw = (
+        db.query(models.WorkspaceMapping.legacy_feature_id)
+        .filter(
+            models.WorkspaceMapping.legacy_item_id == item_id,
+            models.WorkspaceMapping.mapped_from == "local",
+        )
+        .distinct()
+        .all()
+    )
+    local_override_features: Set[str] = {r[0] for r in _local_pairs_raw}
+
+    # Delete only regenerable rows: this item's rows that are not local overrides
+    # and not protected by an approved (item, feature) pair.
+    _del_q = db.query(models.WorkspaceMapping).filter(
+        models.WorkspaceMapping.legacy_item_id == item_id,
+        models.WorkspaceMapping.mapped_from != "local",
+    )
+    if approved_pairs:
+        _approved_features_for_item = [f for (i, f) in approved_pairs if i == item_id]
+        if _approved_features_for_item:
+            _del_q = _del_q.filter(
+                models.WorkspaceMapping.legacy_feature_id.notin_(_approved_features_for_item)
+            )
+    deleted = _del_q.delete(synchronize_session=False)
+    db.commit()
+
+    # Look up the BomItem PK for this item_id
+    bom_item = db.query(models.BomItem).filter(models.BomItem.item_id == item_id).first()
+    if not bom_item:
+        return {"ok": True, "rowsDeleted": deleted, "rowsGenerated": 0}
+
+    mapping_by_feature = _build_latest_mapping_by_feature(db.query(models.GlobalMapping).all())
+    candidates_by_feature = _build_all_candidates_by_feature(db.query(models.GlobalMapping).all())
+
+    # Build exclusion indexes
+    _gm_status_by_feature: Dict[str, str] = {}
+    _gm_ignored_values_by_feature: Dict[str, Set[str]] = {}
+    for gm in db.query(models.GlobalMapping).all():
+        gm_status = (getattr(gm, "status", "active") or "active").strip().lower()
+        gm_ignored = set(getattr(gm, "ignored_values", []) or [])
+        for fid in (getattr(gm, "legacy_feature_ids", []) or []):
+            nfid = str(fid or "").strip()
+            if not nfid:
+                continue
+            if gm_status != "active":
+                _gm_status_by_feature[nfid] = gm_status
+            if gm_ignored:
+                _gm_ignored_values_by_feature.setdefault(nfid, set()).update(gm_ignored)
+
+    features = db.query(models.BomFeature).filter(models.BomFeature.item_id == bom_item.id).all()
+
+    signed_ts = time.time()
+    generated = 0
+    for feat in features:
+        feat_feature_id = str(getattr(feat, "feature_id", "") or "").strip()
+
+        # Skip features preserved as local overrides or protected by approval.
+        if feat_feature_id in local_override_features:
+            continue
+        if (item_id, feat_feature_id) in approved_pairs:
+            continue
+
+        mapping = mapping_by_feature.get(feat_feature_id)
+        candidates = candidates_by_feature.get(feat_feature_id, [])
+        if len(candidates) > 1:
+            target_attr = ""
+            candidates_json = candidates
+        elif len(candidates) == 1:
+            target_attr = candidates[0]
+            candidates_json = candidates
+        else:
+            target_attr = ""
+            candidates_json = None
+        attr_type = (getattr(mapping, "attribute_type", "") or "").strip() if mapping else ""
+        feat_condition = (getattr(feat, "condition", "") or "").strip() or None
+        feat_formula = (getattr(feat, "formula", "") or "").strip() or None
+        value_mappings = getattr(mapping, "value_mappings", {}) if mapping else {}
+
+        feature_gm_status = _gm_status_by_feature.get(feat_feature_id)
+        feature_ignored_values = _gm_ignored_values_by_feature.get(feat_feature_id, set())
+
+        raw_values = getattr(feat, "values", []) or []
+        till_dates: Dict[str, str] = {}
+        if isinstance(raw_values, dict):
+            values = [str(v) for v in (raw_values.get("values") or [])]
+            till_dates = raw_values.get("valueTillDates", {}) or {}
+        elif isinstance(raw_values, list):
+            values = [str(v) for v in raw_values]
+        else:
+            values = []
+
+        if not values:
+            row_metadata = _resolve_workspace_revert_metadata(
+                preserved_revert_metadata,
+                item_id,
+                feat_feature_id,
+                "",
+                feat_condition,
+                feature_gm_status,
+            )
+            db.add(models.WorkspaceMapping(
+                legacy_item_id=item_id,
+                legacy_feature_id=feat_feature_id,
+                legacy_value="",
+                new_attribute_id=target_attr,
+                new_value="",
+                attribute_type=attr_type,
+                condition=row_metadata["condition"],
+                formula=feat_formula,
+                mapped_from="global",
+                value_status=row_metadata["value_status"],
+                feasibility=row_metadata["feasibility"],
+                signed_on_by_user_id=user_id,
+                signed_on_by_username=username,
+                signed_on_at=signed_ts,
+                updated_at=time.time(),
+                version=1,
+                created_by=user_id,
+                modified_by=user_id,
+                modified_at=time.time(),
+                candidate_attribute_ids_json=candidates_json,
+            ))
+            generated += 1
+        else:
+            for legacy_value in values:
+                val_status = None
+                if feature_gm_status:
+                    val_status = feature_gm_status
+                elif legacy_value in feature_ignored_values:
+                    val_status = "ignored"
+                else:
+                    td_str = till_dates.get(legacy_value)
+                    if td_str and str(td_str).strip():
+                        val_status = "discontinued"
+
+                row_metadata = _resolve_workspace_revert_metadata(
+                    preserved_revert_metadata,
+                    item_id,
+                    feat_feature_id,
+                    legacy_value,
+                    feat_condition,
+                    val_status,
+                )
+                effective_value_status = row_metadata["value_status"]
+
+                if effective_value_status:
+                    db.add(models.WorkspaceMapping(
+                        legacy_item_id=item_id,
+                        legacy_feature_id=feat_feature_id,
+                        legacy_value=str(legacy_value),
+                        new_attribute_id=target_attr,
+                        new_value="NOT REQUIRED",
+                        attribute_type=attr_type,
+                        condition=row_metadata["condition"],
+                        formula=feat_formula,
+                        mapped_from="global",
+                        value_status=effective_value_status,
+                        feasibility=row_metadata["feasibility"],
+                        signed_on_by_user_id=user_id,
+                        signed_on_by_username=username,
+                        signed_on_at=signed_ts,
+                        updated_at=time.time(),
+                        version=1,
+                        created_by=user_id,
+                        modified_by=user_id,
+                        modified_at=time.time(),
+                        candidate_attribute_ids_json=candidates_json,
+                    ))
+                else:
+                    resolved = _resolve_value_mapping(value_mappings, legacy_value)
+                    db.add(models.WorkspaceMapping(
+                        legacy_item_id=item_id,
+                        legacy_feature_id=feat_feature_id,
+                        legacy_value=str(legacy_value),
+                        new_attribute_id=target_attr,
+                        new_value=(resolved or ""),
+                        attribute_type=attr_type,
+                        condition=row_metadata["condition"],
+                        formula=feat_formula,
+                        mapped_from="global" if resolved else "",
+                        value_status=effective_value_status,
+                        feasibility=row_metadata["feasibility"],
+                        signed_on_by_user_id=user_id,
+                        signed_on_by_username=username,
+                        signed_on_at=signed_ts,
+                        updated_at=time.time(),
+                        version=1,
+                        created_by=user_id,
+                        modified_by=user_id,
+                        modified_at=time.time(),
+                        candidate_attribute_ids_json=candidates_json,
+                    ))
+                generated += 1
+
+    db.commit()
+    return {"ok": True, "rowsDeleted": deleted, "rowsGenerated": generated}
+
+
 @router.post("/workspace-mappings/{item_id}/revert-to-global")
 def revert_item_to_global(
     item_id: str,
@@ -2438,6 +2654,23 @@ def revert_item_to_global(
             raise HTTPException(status_code=403, detail="item must be signed on by current user")
 
     return _regenerate_item_from_global(item_id, current_user_id, getattr(current_user, "username", None), db)
+
+
+@router.post("/workspace-mappings/{item_id}/regenerate")
+def regenerate_item(
+    item_id: str,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """Regenerate a single item's workspace mappings from BOM + global mappings,
+    preserving manual local overrides and approved items/features."""
+    current_user_id = f"USR-{current_user.id}"
+    if getattr(current_user, "role", "user") != "admin":
+        lock_row = db.query(models.ItemLock).filter(models.ItemLock.item_id == item_id).first()
+        if not lock_row or lock_row.user_id != current_user_id:
+            raise HTTPException(status_code=403, detail="item must be signed on by current user")
+
+    return _regenerate_item_preserving_local(item_id, current_user_id, getattr(current_user, "username", None), db)
 
 
 @router.post("/workspace-mappings/revert-all-to-global")
@@ -4740,6 +4973,7 @@ def get_bom_hierarchy(
             "unit": row.unit,
             "condition": row.condition,
             "formula": row.formula,
+            "conversion": row.conversion,
             "createdAt": row.created_at,
             "createdBy": row.created_by,
         }
@@ -4789,6 +5023,7 @@ def save_bom_hierarchy(
                 "unit": (item.get("unit") or "").strip() or None,
                 "condition": (item.get("condition") or "").strip() or None,
                 "formula": (item.get("formula") or "").strip() or None,
+                "conversion": (item.get("conversion") or "").strip() or None,
                 "created_at": now_ts,
                 "created_by": user_id,
             }
@@ -4916,6 +5151,7 @@ def get_bom_hierarchy_children(
             "unit": row.unit,
             "condition": row.condition,
             "formula": row.formula,
+            "conversion": row.conversion,
         }
         for row in rows
     ]
@@ -8571,6 +8807,19 @@ def _run_apply_group_feature_job(job_id: int):
         # Step 2 — apply current group_features mappings.
         gf_rows = db.query(models.GroupFeature).all()
 
+        # Precedence: when the same (feature_group, feature_id, option) has both a
+        # discontinued row and a non-discontinued (e.g. in_progress) row, the
+        # non-discontinued row wins. Collect keys with at least one non-discontinued
+        # row so discontinued duplicates are skipped below.
+        non_discontinued_keys: Set[Tuple[str, str, str]] = set()
+        for gf in gf_rows:
+            if str(gf.value_status or "").strip().lower() != "discontinued":
+                non_discontinued_keys.add((
+                    str(gf.feature_group or "").strip(),
+                    str(gf.feature_id or "").strip(),
+                    str(gf.option or ""),
+                ))
+
         # Distinct feature_group names -> set of items that contain that group
         # (presence only; the group row's value is irrelevant).
         feature_groups = sorted(
@@ -8596,8 +8845,19 @@ def _run_apply_group_feature_job(job_id: int):
             sub_feature = str(gf.feature_id or "").strip()
             option = str(gf.option or "")
             target_attr = (gf.target_attribute or "").strip()
+            gf_value_status = str(gf.value_status or "").strip().lower()
 
-            item_ids = items_by_group.get(fg) if (fg and sub_feature and target_attr) else None
+            # A discontinued row is superseded when a non-discontinued row exists
+            # for the same option (in_progress wins over discontinued).
+            superseded = (
+                gf_value_status == "discontinued"
+                and (fg, sub_feature, option) in non_discontinued_keys
+            )
+            item_ids = (
+                items_by_group.get(fg)
+                if (fg and sub_feature and target_attr and not superseded)
+                else None
+            )
             if item_ids:
                 item_list = list(item_ids)
                 matched_rows: List[models.WorkspaceMapping] = []
@@ -8619,7 +8879,9 @@ def _run_apply_group_feature_job(job_id: int):
                     ):
                         continue
                     row.new_attribute_id = target_attr
-                    row.new_value = (gf.target_value or "")
+                    row.new_value = "NOT REQUIRED" if gf_value_status == "discontinued" else (gf.target_value or "")
+                    if gf_value_status == "discontinued":
+                        row.value_status = "discontinued"
                     row.mapped_from = "group"
                     row.modified_by = "apply_group_feature"
                     row.modified_at = time.time()

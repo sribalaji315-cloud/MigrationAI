@@ -99,10 +99,10 @@ const App: React.FC = () => {
   const sidebarSearchGenRef = useRef(0);
   const sidebarLoadGenRef = useRef(0);
 
-  const refreshItemStatuses = useCallback(async () => {
+  const refreshItemStatuses = useCallback(async (itemIds?: string[]) => {
     try {
-      const statuses = await dbService.fetchItemStatuses();
-      setItemStatuses(statuses);
+      const statuses = await dbService.fetchItemStatuses(itemIds && itemIds.length ? itemIds : undefined);
+      setItemStatuses(prev => ({ ...prev, ...statuses }));
     } catch (err) {
       console.warn('Failed to refresh item statuses', err);
     }
@@ -142,7 +142,7 @@ const App: React.FC = () => {
       setSidebarTotalCount(totalCount);
       setSidebarSearchResults(null);
       setSidebarSearchTotal(0);
-      await refreshItemStatuses();
+      await refreshItemStatuses(result.items.map(item => item.itemId));
     } catch (err) {
       if (gen !== sidebarLoadGenRef.current) return;
       console.warn('Failed to fetch filtered BOM items', err);
@@ -265,14 +265,19 @@ const App: React.FC = () => {
       const init = await dbService.fetchInit();
 
       // Step 2: Fire ALL secondary fetches in parallel
-      const [bomResult, totalCount, statuses, mappingResult, classResult, filters] = await Promise.all([
+      const [bomResult, totalCount, mappingResult, classResult, filters] = await Promise.all([
         dbService.fetchSignedOnBomItems({ limit: 20, offset: 0 }).catch(err => { console.warn('Failed to fetch signed-on BOM items', err); return { items: [] as DatabaseState['bom'], signedOnCount: 0, totalCount: 0 }; }),
         dbService.fetchBomCount().catch(err => { console.warn('Failed to fetch BOM count', err); return 0; }),
-        dbService.fetchItemStatuses().catch(err => { console.warn('Failed to fetch item statuses', err); return {} as Record<string, 'mapped' | 'unmapped' | 'notRequired'>; }),
         dbService.fetchGlobalMappingsPaginated({ limit: 20, offset: 0 }).catch(err => { console.warn('Failed to fetch mappings', err); return { items: [] as GlobalMapping[], total: 0 }; }),
         dbService.fetchClassificationsPaginated({ limit: 20, offset: 0 }).catch(err => { console.warn('Failed to fetch classifications', err); return { items: [] as any[], total: 0 }; }),
         dbService.fetchBomFilters().catch(err => { console.warn('Failed to fetch BOM filters', err); return { categories: [] as string[], productTypes: [] as string[], priorities: [] as number[] }; }),
       ]);
+
+      // Fetch statuses scoped to the loaded first page (fast targeted query;
+      // the all-items aggregate can exceed the client timeout and wipe badges).
+      const statuses = await dbService
+        .fetchItemStatuses(bomResult.items.map(item => item.itemId))
+        .catch(err => { console.warn('Failed to fetch item statuses', err); return {} as Record<string, 'mapped' | 'unmapped' | 'notRequired'>; });
 
       setDbState({
         bom: bomResult.items,
@@ -836,8 +841,7 @@ const App: React.FC = () => {
           onSelect={setSelectedItemId} 
           locks={dbState.locks}
           currentUserId={currentUser.userId}
-          itemStatuses={itemStatuses}
-          showUnmappedOnly={showUnmappedOnlyInSidebar}
+          itemStatuses={itemStatuses}          showUnmappedOnly={showUnmappedOnlyInSidebar}
           onToggleUnmappedOnly={() => {
             const next = !showUnmappedOnlyInSidebar;
             setShowUnmappedOnlyInSidebar(next);

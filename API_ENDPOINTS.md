@@ -285,6 +285,7 @@ This file documents the backend HTTP API implemented under `backend/app`.
 | GET | /mapping-generation/progress | `get_mapping_generation_progress` | none | JSON job status |
 | GET | /workspace-mappings/{item_id} | `get_workspace_mappings_for_item` | none | JSON item workspace mappings |
 | POST | /workspace-mappings/{item_id}/revert-to-global | `revert_item_to_global` | none | JSON `{"ok": true}` |
+| POST | /workspace-mappings/{item_id}/regenerate | `regenerate_item` | none | JSON `{"ok": true, "rowsDeleted": n, "rowsGenerated": n}` |
 | POST | /workspace-mappings/revert-all-to-global | `revert_all_to_global` | JSON optional filter payload | JSON bulk result |
 | PUT | /workspace-mappings/{item_id} | `put_workspace_mappings_for_item` | JSON mapping payload | JSON updated mappings |
 | GET | /state | `get_state` | query filters and paging | JSON application state snapshot |

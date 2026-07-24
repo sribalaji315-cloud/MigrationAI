@@ -185,7 +185,7 @@ const ItemSidebar: React.FC<ItemSidebarProps> = ({ items, selectedId, onSelect, 
   }, [priorities]);
 
   useEffect(() => {
-    setLiveItemStatuses(itemStatuses || {});
+    setLiveItemStatuses(prev => ({ ...prev, ...(itemStatuses || {}) }));
   }, [itemStatuses]);
 
   const statusRequestKey = useMemo(() => {
@@ -197,9 +197,10 @@ const ItemSidebar: React.FC<ItemSidebarProps> = ({ items, selectedId, onSelect, 
 
     const refreshStatuses = async () => {
       try {
-        const nextStatuses = await dbService.fetchItemStatuses();
+        const visibleIds = items.map(item => item.itemId);
+        const nextStatuses = await dbService.fetchItemStatuses(visibleIds.length ? visibleIds : undefined);
         if (!cancelled) {
-          setLiveItemStatuses(nextStatuses || {});
+          setLiveItemStatuses(prev => ({ ...prev, ...(nextStatuses || {}) }));
         }
       } catch (err) {
         if (!cancelled) {
