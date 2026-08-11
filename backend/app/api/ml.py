@@ -12,6 +12,7 @@ from typing import Any, Dict, List, Optional
 import httpx
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from pydantic import BaseModel
+from sqlalchemy import String as SAString, cast
 from sqlalchemy.orm import Session
 
 from ..core.config import settings
@@ -74,6 +75,23 @@ class PredictAllStatusResponse(BaseModel):
 
 class AssignClassificationRequest(BaseModel):
     classId: str
+
+
+class TargetCandidateIn(BaseModel):
+    id: str
+    name: Optional[str] = None
+
+
+class TargetFeatureIn(BaseModel):
+    key: str
+    description: Optional[str] = None
+
+
+class SuggestTargetsRequest(BaseModel):
+    features: List[TargetFeatureIn]
+    candidates: List[TargetCandidateIn]
+    topK: int = 3
+    threshold: Optional[float] = None
 
 
 # ---------------------------------------------------------------------------
@@ -142,6 +160,29 @@ def _call_ml_service_sync(description: str, top_k: int = 3) -> List[Dict[str, An
 
         data = resp.json()
         return data.get("suggestions") or []
+
+
+async def _call_suggest_targets(payload: Dict[str, Any]) -> Dict[str, List[Dict[str, Any]]]:
+    """Call the ML service /suggest-targets endpoint and return per-feature suggestions."""
+    if not settings.ML_SERVICE_URL:
+        raise HTTPException(status_code=503, detail="ML service URL not configured")
+
+    headers: Dict[str, str] = {}
+    if settings.ML_SERVICE_API_KEY:
+        headers["Authorization"] = f"Bearer {settings.ML_SERVICE_API_KEY}"
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.post(
+            f"{settings.ML_SERVICE_URL}/suggest-targets",
+            json=payload,
+            headers=headers,
+        )
+        if resp.status_code != 200:
+            logger.error("ML service returned %s: %s", resp.status_code, resp.text[:500])
+            raise HTTPException(status_code=502, detail=f"ML service error: {resp.status_code}")
+
+        data = resp.json()
+        return data.get("results") or {}
 
 
 def _resolve_predictions(
@@ -219,6 +260,76 @@ async def predict_single(
     db.commit()
 
     return PredictResponse(itemId=item_id, predictions=[PredictionOut(**p) for p in predictions])
+
+
+@router.post("/suggest-targets/{item_id}")
+async def suggest_targets(
+    item_id: str,
+    body: SuggestTargetsRequest,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """Synonym-assist suggestions of target attributes for unmapped features of an item."""
+    threshold = body.threshold if body.threshold is not None else _ml_settings["synonymThreshold"]
+
+    items: List[Dict[str, str]] = []
+    for f in body.features:
+        description = (f.description or "").strip()
+        # Fallback: when this item's feature has no description, borrow any other
+        # non-blank description recorded for the same feature_id across the dataset.
+        if not description or description == f.key:
+            rows = (
+                db.query(models.BomFeature.description)
+                .filter(models.BomFeature.feature_id == f.key)
+                .filter(models.BomFeature.description.isnot(None))
+                .distinct()
+                .all()
+            )
+            descriptions = {str(r[0]).strip() for r in rows if r[0] and str(r[0]).strip()}
+            if descriptions:
+                description = " ".join(sorted(descriptions))
+        items.append({"key": f.key, "description": description or f.key})
+
+    # Candidate targets: those sent by the client PLUS every target attribute the
+    # feature is globally mapped to, so the correct option is always scoreable
+    # even when the client only loaded a subset of classes.
+    candidate_map: Dict[str, str] = {}
+    for c in body.candidates:
+        cid = str(c.id or "").strip()
+        if cid and cid not in candidate_map:
+            candidate_map[cid] = c.name or ""
+    for f in body.features:
+        gm_rows = (
+            db.query(models.GlobalMapping.new_attribute_id)
+            .filter(cast(models.GlobalMapping.legacy_feature_ids, SAString).like(f'%"{f.key}"%'))
+            .all()
+        )
+        for (attr,) in gm_rows:
+            for part in str(attr or "").split(";"):
+                part = part.strip()
+                if part and part not in ("UNMAPPED", "NOT REQUIRED") and part not in candidate_map:
+                    candidate_map[part] = ""
+
+    # Also include every known classification target attribute so the best match
+    # can surface even when it lives in a class the client has not loaded.
+    for (attrs,) in db.query(models.Classification.attributes).all():
+        if not isinstance(attrs, list):
+            continue
+        for a in attrs:
+            if not isinstance(a, dict):
+                continue
+            aid = str(a.get("attributeId") or a.get("id") or "").strip()
+            if aid and aid not in candidate_map:
+                candidate_map[aid] = str(a.get("description") or "")
+
+    payload: Dict[str, Any] = {
+        "items": items,
+        "candidates": [{"id": cid, "name": name} for cid, name in candidate_map.items()],
+        "topK": body.topK,
+        "threshold": threshold,
+    }
+    results = await _call_suggest_targets(payload)
+    return {"itemId": item_id, "results": results}
 
 
 @router.post("/predict-all", response_model=PredictAllStatusResponse)

@@ -32,6 +32,8 @@ export interface DashboardMetricsResponse {
   approval?: { approved: number; unapproved: number };
   includeExcluded: boolean;
   items: DashboardItemMetrics[];
+  itemsTotal?: number;
+  itemsReturned?: number;
 }
 
 function resolveSqlEndpoint() {
@@ -713,7 +715,7 @@ export const dbService = {
     return resp.json();
   },
 
-  async fetchDashboardMetrics(options?: { category?: string; productLine?: string; priority?: number; includeExcluded?: boolean; forceRecompute?: boolean }): Promise<DashboardMetricsResponse> {
+  async fetchDashboardMetrics(options?: { category?: string; productLine?: string; priority?: number; includeExcluded?: boolean; forceRecompute?: boolean; itemSearch?: string; itemLimit?: number; itemOffset?: number }): Promise<DashboardMetricsResponse> {
     if (!SQL_ENDPOINT) {
       throw new Error('Database connection not available.');
     }
@@ -723,6 +725,9 @@ export const dbService = {
     if (options?.priority != null) params.set('priority', String(options.priority));
     if (options?.includeExcluded) params.set('includeExcluded', 'true');
     if (options?.forceRecompute) params.set('forceRecompute', 'true');
+    if (options?.itemSearch) params.set('itemSearch', options.itemSearch);
+    if (options?.itemLimit != null) params.set('itemLimit', String(options.itemLimit));
+    if (options?.itemOffset != null) params.set('itemOffset', String(options.itemOffset));
     const query = params.toString();
     return this._cachedFetch(`${SQL_ENDPOINT}/dashboard/metrics${query ? `?${query}` : ''}`, {
       headers: this._authHeaders(),
@@ -1308,6 +1313,30 @@ export const dbService = {
       throw new Error(`ML prediction failed: ${resp.status} ${errText}`);
     }
     this._invalidateCache();
+    return resp.json();
+  },
+
+  async suggestFeatureTargets(
+    itemId: string,
+    features: { key: string; description: string }[],
+    candidates: { id: string; name: string }[],
+    options?: { topK?: number; threshold?: number },
+  ): Promise<{ itemId: string; results: Record<string, { targetId: string; confidence: number }[]> }> {
+    if (!SQL_ENDPOINT) throw new Error('Database connection not available.');
+    const resp = await this._fetchWithRefresh(`${SQL_ENDPOINT}/ml/suggest-targets/${encodeURIComponent(itemId)}`, {
+      method: 'POST',
+      headers: { ...this._authHeaders(), 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        features,
+        candidates,
+        topK: options?.topK ?? 3,
+        threshold: options?.threshold ?? 0,
+      }),
+    });
+    if (!resp.ok) {
+      const errText = await resp.text();
+      throw new Error(`Target suggestion failed: ${resp.status} ${errText}`);
+    }
     return resp.json();
   },
 

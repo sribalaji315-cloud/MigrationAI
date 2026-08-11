@@ -1,5 +1,5 @@
-import React, { useMemo, useState } from 'react';
-import { dbService, DashboardMetricsResponse, DashboardItemMetrics } from '../services/dbService';
+import React, { useEffect, useRef, useState } from 'react';
+import { dbService, DashboardMetricsResponse } from '../services/dbService';
 
 interface MappingDashboardProps {
   categories: string[];
@@ -17,6 +17,11 @@ interface DonutStatProps {
 }
 
 const SELECT_ALL = '__all__';
+
+// Maximum item rows rendered into the DOM at once. Rendering all rows (can be
+// 20k+) freezes the browser tab, so we cap the visible list and prompt the user
+// to narrow the filter to find specific items.
+const MAX_VISIBLE_ROWS = 200;
 
 const DonutStat: React.FC<DonutStatProps> = ({ label, value, primaryColor, secondaryColor, description }) => {
   const size = 140;
@@ -115,23 +120,23 @@ const MappingDashboard: React.FC<MappingDashboardProps> = ({ categories, product
   const [itemFilter, setItemFilter] = useState('');
   const [includeExcluded, setIncludeExcluded] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
+  const [itemsLoading, setItemsLoading] = useState(false);
   const [error, setError] = useState('');
   const [metrics, setMetrics] = useState<DashboardMetricsResponse | null>(null);
   const [progress, setProgress] = useState(0);
   const [progressPhase, setProgressPhase] = useState('');
 
+  // Filters that produced the currently displayed metrics. Item search re-fetches
+  // must reuse these so the breakdown list stays consistent with the donuts even
+  // if the user changed a dropdown without recomputing.
+  const appliedFiltersRef = useRef<{ category?: string; productLine?: string; priority?: number; includeExcluded: boolean } | null>(null);
+
   const canCompute = Boolean(selectedCategory) && Boolean(selectedProductLine);
 
-  const filteredItems = useMemo(() => {
-    const rows = metrics?.items || [];
-    const q = itemFilter.trim().toLowerCase();
-    if (!q) return rows;
-    return rows.filter(
-      (it: DashboardItemMetrics) =>
-        it.itemId.toLowerCase().includes(q) ||
-        (it.description || '').toLowerCase().includes(q)
-    );
-  }, [metrics, itemFilter]);
+  // Server already filters + limits the breakdown, so render its rows directly.
+  const visibleItems = metrics?.items || [];
+  const itemsTotal = metrics?.itemsTotal ?? visibleItems.length;
+  const hiddenItemCount = Math.max(0, itemsTotal - visibleItems.length);
 
   const handleCompute = async (forceRecompute = false) => {
     if (!canCompute) return;
@@ -155,7 +160,12 @@ const MappingDashboard: React.FC<MappingDashboardProps> = ({ categories, product
       const category = selectedCategory === SELECT_ALL ? undefined : selectedCategory;
       const productLine = selectedProductLine === SELECT_ALL ? undefined : selectedProductLine;
       const priority = selectedPriority === SELECT_ALL ? undefined : parseInt(selectedPriority, 10);
-      const response = await dbService.fetchDashboardMetrics({ category, productLine, priority, includeExcluded, forceRecompute });
+      const response = await dbService.fetchDashboardMetrics({
+        category, productLine, priority, includeExcluded, forceRecompute,
+        itemSearch: itemFilter.trim() || undefined,
+        itemLimit: MAX_VISIBLE_ROWS,
+      });
+      appliedFiltersRef.current = { category, productLine, priority, includeExcluded };
       timers.forEach(clearTimeout);
       setProgress(100);
       setProgressPhase('Done');
@@ -189,7 +199,12 @@ const MappingDashboard: React.FC<MappingDashboardProps> = ({ categories, product
       const category = selectedCategory === SELECT_ALL ? undefined : selectedCategory;
       const productLine = selectedProductLine === SELECT_ALL ? undefined : selectedProductLine;
       const priority = selectedPriority === SELECT_ALL ? undefined : parseInt(selectedPriority, 10);
-      const response = await dbService.fetchDashboardMetrics({ category, productLine, priority, includeExcluded: next });
+      const response = await dbService.fetchDashboardMetrics({
+        category, productLine, priority, includeExcluded: next,
+        itemSearch: itemFilter.trim() || undefined,
+        itemLimit: MAX_VISIBLE_ROWS,
+      });
+      appliedFiltersRef.current = { category, productLine, priority, includeExcluded: next };
       timers.forEach(clearTimeout);
       setProgress(100);
       setProgressPhase('Done');
@@ -203,6 +218,42 @@ const MappingDashboard: React.FC<MappingDashboardProps> = ({ categories, product
       setIsLoading(false);
     }
   };
+
+  // Debounced, server-side item search. Only refreshes the breakdown list (not
+  // the donuts) by reusing the filters that produced the current metrics.
+  useEffect(() => {
+    const applied = appliedFiltersRef.current;
+    if (!metrics || !applied) return;
+
+    let cancelled = false;
+    const handle = setTimeout(async () => {
+      setItemsLoading(true);
+      try {
+        const response = await dbService.fetchDashboardMetrics({
+          category: applied.category,
+          productLine: applied.productLine,
+          priority: applied.priority,
+          includeExcluded: applied.includeExcluded,
+          itemSearch: itemFilter.trim() || undefined,
+          itemLimit: MAX_VISIBLE_ROWS,
+        });
+        if (cancelled) return;
+        setMetrics(prev => prev ? {
+          ...prev,
+          items: response.items,
+          itemsTotal: response.itemsTotal,
+          itemsReturned: response.itemsReturned,
+        } : response);
+      } catch (err) {
+        console.warn('Failed to refresh item breakdown', err);
+      } finally {
+        if (!cancelled) setItemsLoading(false);
+      }
+    }, 300);
+
+    return () => { cancelled = true; clearTimeout(handle); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [itemFilter]);
 
   return (
     <div className="fixed inset-0 z-[110] flex items-center justify-center p-4 bg-slate-900/50 backdrop-blur-sm">
@@ -417,11 +468,13 @@ const MappingDashboard: React.FC<MappingDashboardProps> = ({ categories, product
                       </tr>
                     </thead>
                     <tbody>
-                      {filteredItems.length === 0 ? (
+                      {visibleItems.length === 0 ? (
                         <tr>
-                          <td colSpan={9} className="px-4 py-6 text-center text-slate-400 text-xs">No items match your filter.</td>
+                          <td colSpan={9} className="px-4 py-6 text-center text-slate-400 text-xs">
+                            {itemsLoading ? 'Searching...' : 'No items match your filter.'}
+                          </td>
                         </tr>
-                      ) : filteredItems.map((it) => {
+                      ) : visibleItems.map((it) => {
                         const mappableAttrs = Math.max(0, it.totalFeatures - it.notRequiredFeatures);
                         const attrPct = mappableAttrs > 0 ? Math.round((it.mappedFeatures / mappableAttrs) * 100) : 100;
                         const valPct = it.totalValues > 0 ? Math.round((it.mappedValues / it.totalValues) * 100) : 100;
@@ -463,7 +516,12 @@ const MappingDashboard: React.FC<MappingDashboardProps> = ({ categories, product
 
                 {itemFilter && (
                   <p className="px-4 py-2 text-[10px] text-slate-400 border-t border-slate-50">
-                    Showing {filteredItems.length} of {metrics.totals.items} items
+                    Showing {visibleItems.length} of {itemsTotal.toLocaleString()} matching items
+                  </p>
+                )}
+                {!itemFilter && hiddenItemCount > 0 && (
+                  <p className="px-4 py-2 text-[10px] text-slate-400 border-t border-slate-50">
+                    Showing first {visibleItems.length} of {metrics.totals.items.toLocaleString()} items. Type in the filter above to find specific items.
                   </p>
                 )}
               </div>

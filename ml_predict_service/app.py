@@ -9,6 +9,7 @@ that this service is fully decoupled from the Creo Gateway that lives in
 
 import csv
 import json
+import math
 import os
 import re
 import secrets
@@ -91,7 +92,7 @@ app.add_middleware(
 
 @app.middleware("http")
 async def require_api_key(request: Request, call_next):
-    if not API_KEY or request.url.path not in {"/predict"}:
+    if not API_KEY or request.url.path not in {"/predict", "/suggest-targets"}:
         return await call_next(request)
     auth_header = request.headers.get("Authorization", "")
     if auth_header != f"Bearer {API_KEY}":
@@ -110,6 +111,23 @@ class PredictRequest(BaseModel):
     useSynonymAssist: bool = False
     synonymThreshold: float = 0.8
     synonymWeight: float = 0.35
+
+
+class TargetCandidate(BaseModel):
+    id: str
+    name: Optional[str] = None
+
+
+class TargetFeature(BaseModel):
+    key: str
+    description: Optional[str] = None
+
+
+class SuggestTargetsRequest(BaseModel):
+    items: List[TargetFeature]
+    candidates: List[TargetCandidate]
+    topK: int = 3
+    threshold: float = 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -471,3 +489,88 @@ def predict(body: PredictRequest) -> Dict[str, Any]:
         "modelVersion": get_model_version(),
         "classSource": "metadata.class_catalog" if catalog_classes else "model.classes_",
     }
+
+
+# Small synonym groups so semantically-equal ERP terms match (e.g. type <-> style).
+SYNONYM_GROUPS: List[set] = [
+    {"type", "style", "kind", "variant"},
+    {"color", "colour"},
+    {"quantity", "qty", "count", "number", "num"},
+    {"length", "len"},
+    {"width", "wide"},
+    {"height", "tall"},
+    {"material", "mat"},
+    {"diameter", "dia"},
+]
+
+
+def _expand_synonyms(token: str) -> set:
+    expanded = {token}
+    for group in SYNONYM_GROUPS:
+        if token in group:
+            expanded |= group
+    return expanded
+
+
+@app.post("/suggest-targets")
+def suggest_targets(body: SuggestTargetsRequest) -> Dict[str, Any]:
+    """IDF-weighted, synonym-aware text matching of features against candidate targets."""
+    threshold = max(0.0, min(1.0, float(body.threshold)))
+    top_k = max(1, int(body.topK))
+
+    candidate_index: List[Dict[str, Any]] = []
+    for candidate in body.candidates:
+        target_id = str(candidate.id or "").strip()
+        if target_id == "":
+            continue
+        text = f"{target_id} {candidate.name or ''}"
+        candidate_index.append({
+            "id": target_id,
+            "tokens": tokenize_text(text),
+            "normalized": normalize_label(text),
+        })
+
+    n_candidates = max(1, len(candidate_index))
+
+    results: Dict[str, List[Dict[str, Any]]] = {}
+    for feature in body.items:
+        key = str(feature.key or "").strip()
+        if key == "":
+            continue
+        description = feature.description or ""
+        desc_tokens = tokenize_text(description)
+        desc_normalized = normalize_label(description)
+
+        # Distinctive tokens (e.g. "arm") weigh more than common ones (e.g. "type");
+        # synonyms count toward a token's match so "type" also matches "style".
+        token_synonyms = {t: _expand_synonyms(t) for t in desc_tokens}
+        idf: Dict[str, float] = {}
+        for t in desc_tokens:
+            df = sum(
+                1 for cand in candidate_index
+                if any(syn and syn in cand["normalized"] for syn in token_synonyms[t])
+            )
+            idf[t] = math.log((n_candidates + 1.0) / (df + 1.0)) + 1.0
+        total_idf = sum(idf.values()) or 1.0
+
+        scored: List[Dict[str, Any]] = []
+        for candidate in candidate_index:
+            cand_norm = candidate["normalized"]
+            if desc_normalized and desc_normalized == cand_norm:
+                score = 1.0
+            elif desc_tokens and cand_norm:
+                matched = sum(
+                    idf[t] for t in desc_tokens
+                    if any(syn and syn in cand_norm for syn in token_synonyms[t])
+                )
+                score = matched / total_idf
+            else:
+                score = 0.0
+            score = max(0.0, min(1.0, float(score)))
+            if score < threshold:
+                continue
+            scored.append({"targetId": candidate["id"], "confidence": round(score, 4)})
+        scored.sort(key=lambda item: item["confidence"], reverse=True)
+        results[key] = scored[:top_k]
+
+    return {"results": results, "provider": "local-ml", "modelVersion": get_model_version()}

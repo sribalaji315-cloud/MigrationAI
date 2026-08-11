@@ -742,7 +742,7 @@ const BOMHierarchy: React.FC<BOMHierarchyProps> = ({ currentUser, onClose }) => 
                       </div>
                     </td>
                     <td className="px-4 py-2.5 text-center">
-                      <span className="text-[10px] font-black text-slate-600">{item.level ?? '—'}</span>
+                      <span className="text-[10px] font-black text-slate-600">{row.depth}</span>
                     </td>
                     <td className="px-4 py-2.5">
                       <span className="text-[9px] text-slate-600 font-medium line-clamp-1">{item.description || '—'}</span>

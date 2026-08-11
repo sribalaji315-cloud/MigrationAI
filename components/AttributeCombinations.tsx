@@ -143,6 +143,12 @@ const AttributeCombinations: React.FC<AttributeCombinationsProps> = ({ currentUs
   const [rightPanelWidth, setRightPanelWidth] = useState(380);
   const draggingRef = useRef(false);
 
+  // Chart + export state
+  const [showChart, setShowChart] = useState(false);
+  const [chartRows, setChartRows] = useState<AttributeCombinationRow[]>([]);
+  const [isLoadingChart, setIsLoadingChart] = useState(false);
+  const [isExporting, setIsExporting] = useState(false);
+
   // --- Resize handlers ---
   const handleMouseDown = useCallback((e: React.MouseEvent) => {
     e.preventDefault();
@@ -322,6 +328,100 @@ const AttributeCombinations: React.FC<AttributeCombinationsProps> = ({ currentUs
       .finally(() => setIsLoadingConsolidation(false));
   }, [selectedCombo, consolidation]);
 
+  // --- Fetch every combination matching the current filters (for chart / export) ---
+  const fetchAllFiltered = useCallback(async (): Promise<AttributeCombinationRow[]> => {
+    const priorityNum = filterPriorities.length === 1 ? Number(filterPriorities[0]) : undefined;
+    const all: AttributeCombinationRow[] = [];
+    const PAGE = 5000;
+    for (let offset = 0; ; offset += PAGE) {
+      const result = await dbService.fetchAttributeCombinations({
+        search: search || undefined,
+        category: filterCategories.length ? filterCategories.join(',') : undefined,
+        productType: filterProductTypes.length ? filterProductTypes.join(',') : undefined,
+        priority: priorityNum,
+        attributeType: filterAttributeTypes.length ? filterAttributeTypes.join(',') : undefined,
+        sortBy: 'itemCount',
+        sortDir: 'desc',
+        analysisMode: analysisMode || undefined,
+        limit: PAGE,
+        offset,
+      });
+      all.push(...result.items);
+      if (all.length >= result.total || result.items.length < PAGE) break;
+    }
+    return all;
+  }, [search, filterCategories, filterProductTypes, filterPriorities, filterAttributeTypes, analysisMode]);
+
+  const effectiveCount = useCallback((r: AttributeCombinationRow): number => (
+    filterPriorities.length === 1 && r.filteredItemCount != null ? r.filteredItemCount : r.itemCount
+  ), [filterPriorities]);
+
+  // --- Show bar chart of items sharing each attribute set ---
+  const handleShowChart = useCallback(async () => {
+    setShowChart(true);
+    setIsLoadingChart(true);
+    try {
+      const all = await fetchAllFiltered();
+      all.sort((a, b) => effectiveCount(b) - effectiveCount(a));
+      setChartRows(all);
+    } catch (err: any) {
+      console.error('chart fetch failed', err);
+      setChartRows([]);
+    } finally {
+      setIsLoadingChart(false);
+    }
+  }, [fetchAllFiltered, effectiveCount]);
+
+  // --- Export attribute combinations (with item counts) to Excel ---
+  const handleExportExcel = useCallback(async () => {
+    setIsExporting(true);
+    try {
+      const all = await fetchAllFiltered();
+      all.sort((a, b) => effectiveCount(b) - effectiveCount(a));
+      const hasPrio = filterPriorities.length === 1;
+      const esc = (v: any) => String(v ?? '')
+        .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+      const headers = [
+        '# Attrs', 'Attribute Set (Fingerprint)', 'Attribute Types',
+        'Categories', 'Product Types', 'Priorities',
+        ...(hasPrio ? [`Items (P${filterPriorities[0]})`, 'Items (Total)'] : ['Items']),
+        ...(analysisMode ? ['Similar Fingerprints'] : []),
+      ];
+      const headerHtml = `<tr>${headers.map(h => `<th style="background:#1e3a8a;color:#fff;font-weight:bold;border:1px solid #cbd5e1;padding:4px 8px;text-align:left">${esc(h)}</th>`).join('')}</tr>`;
+      const bodyHtml = all.map(r => {
+        const cells: string[] = [
+          esc(r.featureCount),
+          esc((r.featureIds || []).join(', ') || 'No attributes mapped'),
+          esc((r.attributeTypes || []).join(', ')),
+          esc((r.categories || []).join(', ')),
+          esc((r.productTypes || []).join(', ')),
+          esc((r.priorities || []).map(p => `P${p}`).join(', ')),
+        ];
+        if (hasPrio) {
+          cells.push(esc(r.filteredItemCount ?? 0), esc(r.itemCount));
+        } else {
+          cells.push(esc(r.itemCount));
+        }
+        if (analysisMode) cells.push(esc(r.similarCount ?? 0));
+        return `<tr>${cells.map(c => `<td style="border:1px solid #e2e8f0;padding:3px 8px;vertical-align:top">${c}</td>`).join('')}</tr>`;
+      }).join('');
+      const html = `<html xmlns:o="urn:schemas-microsoft-com:office:office" xmlns:x="urn:schemas-microsoft-com:office:excel" xmlns="http://www.w3.org/TR/REC-html40"><head><meta charset="utf-8"><!--[if gte mso 9]><xml><x:ExcelWorkbook><x:ExcelWorksheets><x:ExcelWorksheet><x:Name>Attribute Combinations</x:Name><x:WorksheetOptions><x:DisplayGridlines/></x:WorksheetOptions></x:ExcelWorksheet></x:ExcelWorksheets></x:ExcelWorkbook></xml><![endif]--></head><body><table>${headerHtml}${bodyHtml}</table></body></html>`;
+      const blob = new Blob(['\ufeff', html], { type: 'application/vnd.ms-excel;charset=utf-8;' });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = `attribute-combinations_${new Date().toISOString().slice(0, 10)}.xls`;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      URL.revokeObjectURL(url);
+    } catch (err: any) {
+      console.error('excel export failed', err);
+    } finally {
+      setIsExporting(false);
+    }
+  }, [fetchAllFiltered, effectiveCount, filterPriorities, analysisMode]);
+
   // --- Derived ---
   const isActive = jobProgress?.status === 'queued' || jobProgress?.status === 'running';
   const totalPages = Math.ceil(total / PAGE_SIZE);
@@ -406,6 +506,31 @@ const AttributeCombinations: React.FC<AttributeCombinationsProps> = ({ currentUs
                 Build Analysis
               </>
             )}
+          </button>
+          <div className="h-4 w-px bg-slate-200" />
+          <button
+            onClick={handleShowChart}
+            disabled={isLoadingChart}
+            className="flex items-center gap-1.5 px-3 py-1.5 bg-slate-100 text-slate-600 rounded-md text-[9px] font-black uppercase tracking-wider hover:bg-slate-200 disabled:opacity-50 transition-all"
+          >
+            <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" />
+            </svg>
+            Chart
+          </button>
+          <button
+            onClick={handleExportExcel}
+            disabled={isExporting}
+            className="flex items-center gap-1.5 px-3 py-1.5 bg-emerald-600 text-white rounded-md text-[9px] font-black uppercase tracking-wider hover:bg-emerald-700 disabled:opacity-50 disabled:cursor-not-allowed transition-all"
+          >
+            {isExporting ? (
+              <div className="w-3 h-3 border-2 border-white border-t-transparent rounded-full animate-spin" />
+            ) : (
+              <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+              </svg>
+            )}
+            {isExporting ? 'Exporting…' : 'Excel'}
           </button>
           <div className="h-4 w-px bg-slate-200" />
           <button
@@ -897,6 +1022,74 @@ const AttributeCombinations: React.FC<AttributeCombinationsProps> = ({ currentUs
           )}
         </div>
       </div>
+
+      {/* Bar chart modal */}
+      {showChart && (
+        <div className="fixed inset-0 z-[60] bg-slate-900/50 flex items-center justify-center p-6" onClick={() => setShowChart(false)}>
+          <div
+            className="bg-white rounded-xl shadow-2xl w-full max-w-4xl max-h-[85vh] flex flex-col overflow-hidden"
+            onClick={e => e.stopPropagation()}
+          >
+            <div className="flex items-center justify-between px-5 py-3 border-b border-slate-200 shrink-0">
+              <div>
+                <h2 className="text-sm font-black text-slate-800 uppercase tracking-wider">Items Sharing Attribute Sets</h2>
+                <p className="text-[10px] text-slate-400 font-medium mt-0.5">
+                  Top attribute combinations by number of items{filterPriorities.length === 1 ? ` (P${filterPriorities[0]})` : ''}
+                </p>
+              </div>
+              <button
+                onClick={() => setShowChart(false)}
+                className="flex items-center gap-1 px-3 py-1.5 bg-slate-100 text-slate-600 rounded-md text-[9px] font-black uppercase tracking-wider hover:bg-slate-200 transition-all"
+              >
+                <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>
+                Close
+              </button>
+            </div>
+            <div className="flex-1 overflow-auto p-5">
+              {isLoadingChart ? (
+                <div className="flex items-center justify-center h-40 gap-2 text-slate-400 text-xs">
+                  <div className="w-4 h-4 border-2 border-blue-500 border-t-transparent rounded-full animate-spin" />
+                  Loading chart…
+                </div>
+              ) : chartRows.length === 0 ? (
+                <div className="text-center py-12 text-slate-400 text-xs">No data to chart.</div>
+              ) : (() => {
+                const top = chartRows.slice(0, 40);
+                const maxCount = Math.max(1, ...top.map(effectiveCount));
+                return (
+                  <div className="space-y-1.5">
+                    {top.map((r, idx) => {
+                      const count = effectiveCount(r);
+                      const pct = (count / maxCount) * 100;
+                      const label = (r.featureIds && r.featureIds.length > 0)
+                        ? r.featureIds.join(' · ')
+                        : 'No attributes mapped';
+                      return (
+                        <div key={r.id} className="flex items-center gap-2 text-[10px]">
+                          <span className="w-6 text-right text-slate-400 font-bold shrink-0">{idx + 1}</span>
+                          <span className="w-44 truncate text-slate-600 font-medium shrink-0" title={label}>{label}</span>
+                          <div className="flex-1 h-4 bg-slate-100 rounded overflow-hidden relative">
+                            <div
+                              className="h-full bg-gradient-to-r from-blue-500 to-indigo-500 rounded"
+                              style={{ width: `${Math.max(1, pct)}%` }}
+                            />
+                          </div>
+                          <span className="w-14 text-right font-bold text-slate-700 shrink-0">{count.toLocaleString()}</span>
+                        </div>
+                      );
+                    })}
+                    {chartRows.length > 40 && (
+                      <p className="text-[10px] text-slate-400 font-medium pt-2 text-center">
+                        Showing top 40 of {chartRows.length.toLocaleString()} attribute sets — use Excel export for the full list
+                      </p>
+                    )}
+                  </div>
+                );
+              })()}
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };

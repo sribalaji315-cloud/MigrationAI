@@ -1,6 +1,6 @@
 
 import React, { useState, useEffect, useMemo, useRef, useCallback } from 'react';
-import { LegacyItem, NewClassification, GlobalMapping, LocalItemMappings, NewAttribute, ItemLock, User, FeatureFlags, MappingTypeConfig, MLPrediction, ItemApprovalState } from '../types';
+import { LegacyItem, NewClassification, GlobalMapping, LocalItemMappings, NewAttribute, ItemLock, User, FeatureFlags, MappingTypeConfig, MLPrediction, TargetSuggestion, ItemApprovalState } from '../types';
 import { dbService } from '../services/dbService';
 
 type Tone = 'mapped' | 'unmapped' | 'notRequired' | 'partial' | 'multiple';
@@ -726,6 +726,8 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
   const [stagedClassId, setStagedClassId] = useState<string | null>(null);
   const [mlPredicting, setMlPredicting] = useState(false);
   const [mlPredictions, setMlPredictions] = useState<MLPrediction[]>([]);
+  const [suggestingTargets, setSuggestingTargets] = useState(false);
+  const [featureTargetSuggestions, setFeatureTargetSuggestions] = useState<Record<string, TargetSuggestion[]>>({});
   const [legacyFilter, setLegacyFilter] = useState('');
   const [showUnmappedOnly, setShowUnmappedOnly] = useState(false);
   const [feasibilityFilter, setFeasibilityFilter] = useState('');
@@ -804,6 +806,7 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
       setStagedClassId(assignedClassId || 'UNCLASSIFIED');
       previousClassIdRef.current = assignedClassId || null;
       setMlPredictions(item.mlPredictions || []);
+      setFeatureTargetSuggestions({});
       setStagedLocalMappings(
         JSON.parse(JSON.stringify(localItemMappings[item.itemId] || [])).map((m: GlobalMapping) => ({
           ...m,
@@ -840,6 +843,7 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
       setStagedClassId(null);
       previousClassIdRef.current = null;
       setMlPredictions([]);
+      setFeatureTargetSuggestions({});
       setStagedLocalMappings([]);
       setManualInputs({});
       setLegacyFilter('');
@@ -872,6 +876,50 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
   const handlePickPrediction = (classId: string) => {
     isEditingRef.current = true;
     setStagedClassId(classId);
+  };
+
+  const handleSuggestTargets = async () => {
+    if (!item) return;
+    setSuggestingTargets(true);
+    try {
+      const features = item.features.map(f => ({ key: f.featureId, description: f.description || f.featureId }));
+      // Candidate set = class/system target attributes UNION each feature's global-mapping
+      // targets, drawn from ALL the same sources the row dropdown uses (per-item fetch,
+      // engineering global mappings, and the single-global-per-feature map).
+      const candMap = new Map<string, string>();
+      const addTargets = (attrIdStr?: string) => {
+        (attrIdStr || '')
+          .replace(/\s+/g, '')
+          .split(';')
+          .map(s => s.trim())
+          .filter(s => s && s !== 'UNMAPPED' && s !== 'NOT REQUIRED')
+          .forEach(id => { if (!candMap.has(id)) candMap.set(id, ''); });
+      };
+      targetAttributes.forEach(a => { if (!candMap.has(a.attributeId)) candMap.set(a.attributeId, a.description || ''); });
+      const globalByFeatureEng: Record<string, GlobalMapping[]> = {};
+      engineeringGlobalMappings.forEach(m => {
+        (m.legacyFeatureIds || []).forEach(fid => {
+          (globalByFeatureEng[fid] = globalByFeatureEng[fid] || []).push(m);
+        });
+      });
+      item.features.forEach(f => {
+        const list = globalByFeatureMap[f.featureId] || globalByFeatureEng[f.featureId] || [];
+        list.forEach(gm => addTargets(gm.newAttributeId));
+        const single = allGlobalMappingsByFeature[f.featureId];
+        if (single) addTargets(single.newAttributeId);
+      });
+      const candidates = Array.from(candMap, ([id, name]) => ({ id, name }));
+      if (candidates.length === 0) {
+        setFeatureTargetSuggestions({});
+        return;
+      }
+      const result = await dbService.suggestFeatureTargets(item.itemId, features, candidates);
+      setFeatureTargetSuggestions(result.results || {});
+    } catch (err) {
+      console.error('Target suggestion failed:', err);
+    } finally {
+      setSuggestingTargets(false);
+    }
   };
 
   const commitToSystem = async () => {
@@ -1820,6 +1868,25 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
                     />
                   )}
 
+                  {isLockedByMe && (
+                    <button
+                      type="button"
+                      onClick={handleSuggestTargets}
+                      disabled={suggestingTargets || !item || targetAttributes.length === 0}
+                      title="Suggest target attributes for unmapped features (synonym assist)"
+                      className={`inline-flex items-center gap-1 px-3 py-1 rounded-full border text-[8px] font-black uppercase tracking-widest transition-all ${
+                        suggestingTargets
+                          ? 'bg-violet-100 border-violet-200 text-violet-400 cursor-wait animate-pulse'
+                          : 'bg-violet-50 border-violet-200 text-violet-700 hover:bg-violet-100'
+                      }`}
+                    >
+                      <svg className="w-2.5 h-2.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M9.663 17h4.673M12 3v1m6.364 1.636l-.707.707M21 12h-1M4 12H3m3.343-5.657l-.707-.707m2.828 9.9a5 5 0 117.072 0l-.548.547A3.374 3.374 0 0014 18.469V19a2 2 0 11-4 0v-.531c0-.895-.356-1.754-.988-2.386l-.548-.547z" />
+                      </svg>
+                      <span>{suggestingTargets ? 'Suggesting...' : 'Suggest Targets'}</span>
+                    </button>
+                  )}
+
                   <div className="flex items-center gap-2">
                     <button
                       type="button"
@@ -2017,8 +2084,9 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
               candidateValuesForAttribute = [...candidateValuesForAttribute, 'NOT REQUIRED'];
             }
             // Multiple tone only when global-generated with multiple candidates
-            // and user hasn't confirmed via local override yet.
-            const isUserConfirmed = localOverride?.mappedFrom === 'local';
+            // and user hasn't confirmed via local override yet. Group-applied rows
+            // count as confirmed (rendered green, like a local override).
+            const isUserConfirmed = localOverride?.mappedFrom === 'local' || localOverride?.mappedFrom === 'group';
             const attributeTone: Tone = selectedAttribute === 'UNMAPPED'
               ? 'unmapped'
               : selectedAttribute === 'NOT REQUIRED'
@@ -2113,7 +2181,12 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
                             Local
                           </span>
                         )}
-                        {(globalMapping || localOverride) && (!localOverride || localOverride.mappedFrom !== 'local') && (
+                        {localOverride && localOverride.mappedFrom === 'group' && (
+                          <span className="px-2 py-0.5 bg-teal-100 text-teal-700 text-[7px] font-black rounded-full uppercase tracking-wider">
+                            Group
+                          </span>
+                        )}
+                        {(globalMapping || localOverride) && (!localOverride || (localOverride.mappedFrom !== 'local' && localOverride.mappedFrom !== 'group')) && (
                           <span className="px-2 py-0.5 bg-blue-100 text-blue-700 text-[7px] font-black rounded-full uppercase tracking-wider">
                             Global
                           </span>
@@ -2141,6 +2214,22 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
                           >
                             {selectedAttribute}
                           </p>
+                        )}
+                        {isLockedByMe && (selectedAttribute === 'UNMAPPED' || (hasMultipleOptions && !isUserConfirmed)) && featureTargetSuggestions[f.featureId]?.some(s => s.confidence > 0) && (
+                          <div className="mt-1 flex flex-wrap items-center justify-end gap-1">
+                            {featureTargetSuggestions[f.featureId].filter(s => s.confidence > 0).map((sug, si) => (
+                              <button
+                                key={sug.targetId + si}
+                                type="button"
+                                onClick={() => handleUpdateLinkage(f.featureId, sug.targetId)}
+                                title={`${sug.targetId}: ${Math.round(sug.confidence * 100)}% confidence`}
+                                className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded-full border border-violet-200 bg-white text-violet-700 text-[7px] font-black uppercase tracking-widest hover:bg-violet-50 transition-colors"
+                              >
+                                <span className="truncate max-w-[100px]">{sug.targetId}</span>
+                                <span className="text-violet-400">{Math.round(sug.confidence * 100)}%</span>
+                              </button>
+                            ))}
+                          </div>
                         )}
                       </div>
                     </div>

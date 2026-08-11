@@ -20,6 +20,10 @@ const feasibilityTone = (raw?: string | null): string => {
   return 'bg-slate-100 text-slate-600 border-slate-200';
 };
 
+// Sentinel option used in the Value Status filter to match rows that have no
+// value status set (empty/blank).
+const BLANK_VALUE_STATUS = '(blank)';
+
 const valueStatusTone = (raw?: string | null): string => {
   const v = (raw || '').trim().toLowerCase();
   if (v === 'discontinued') return 'bg-rose-100 text-rose-700 border-rose-200';
@@ -119,6 +123,10 @@ interface FeatureGroup {
 }
 
 type ConditionTranslationMap = Record<string, { attr: string; value: string }>;
+// Maps a legacy feature/attribute id -> its target attribute id, used as a
+// fallback so the attribute name still translates when a specific condition
+// value (e.g. `L1`, `*`) has no value-level mapping.
+type AttributeTranslationMap = Record<string, string>;
 
 // Rewrites source condition tokens (e.g. `.*AGNI = 'NI002'`) into target
 // attribute/value tokens using only the current item's mappings. Tokens without
@@ -131,7 +139,7 @@ type ConditionSegment = { text: string; kind: 'plain' | 'translated' | 'legacy' 
 // Splits a condition into segments: attribute/value tokens that resolve to a
 // target become 'translated', tokens without a target mapping stay 'legacy',
 // and operators/parentheses/whitespace are 'plain'.
-const buildConditionSegments = (condition: string, map: ConditionTranslationMap): ConditionSegment[] => {
+const buildConditionSegments = (condition: string, map: ConditionTranslationMap, attrMap: AttributeTranslationMap): ConditionSegment[] => {
   const segments: ConditionSegment[] = [];
   let lastIndex = 0;
   CONDITION_TOKEN_RE.lastIndex = 0;
@@ -144,6 +152,12 @@ const buildConditionSegments = (condition: string, map: ConditionTranslationMap)
     const target = map[`${ident}|${value}`];
     if (target) {
       segments.push({ text: `${target.attr} ${op} '${target.value}'`, kind: 'translated' });
+    } else if (attrMap[ident]) {
+      // Attribute has a target mapping but this value doesn't: translate the
+      // attribute name and keep the original value untranslated.
+      segments.push({ text: attrMap[ident], kind: 'translated' });
+      segments.push({ text: ` ${op} `, kind: 'plain' });
+      segments.push({ text: `'${value}'`, kind: 'legacy' });
     } else {
       segments.push({ text: full, kind: 'legacy' });
     }
@@ -367,17 +381,22 @@ const ProductViewer: React.FC<ProductViewerProps> = ({ currentUser, onClose }) =
     const attributeTypes = new Set<string>();
     const feasibilities = new Set<string>();
     const valueStatuses = new Set<string>();
+    let hasBlankValueStatus = false;
     for (const row of mappingRows) {
       if (row.legacyFeatureId) legacyAttributes.add(row.legacyFeatureId);
       if (row.attributeType) attributeTypes.add(row.attributeType);
       if (row.feasibility) feasibilities.add(row.feasibility);
       if (row.valueStatus) valueStatuses.add(row.valueStatus);
+      else hasBlankValueStatus = true;
     }
     return {
       legacyAttributes: Array.from(legacyAttributes).sort((a, b) => a.localeCompare(b)),
       attributeTypes: Array.from(attributeTypes).sort((a, b) => a.localeCompare(b)),
       feasibilities: Array.from(feasibilities).sort((a, b) => a.localeCompare(b)),
-      valueStatuses: Array.from(valueStatuses).sort((a, b) => a.localeCompare(b)),
+      valueStatuses: [
+        ...Array.from(valueStatuses).sort((a, b) => a.localeCompare(b)),
+        ...(hasBlankValueStatus ? [BLANK_VALUE_STATUS] : []),
+      ],
     };
   }, [mappingRows]);
 
@@ -387,7 +406,11 @@ const ProductViewer: React.FC<ProductViewerProps> = ({ currentUser, onClose }) =
       if (filterLegacyAttributes.length && !filterLegacyAttributes.includes(row.legacyFeatureId)) return false;
       if (filterAttributeTypes.length && !filterAttributeTypes.includes(row.attributeType || '')) return false;
       if (filterFeasibilities.length && !filterFeasibilities.includes(row.feasibility || '')) return false;
-      if (filterValueStatuses.length && !filterValueStatuses.includes(row.valueStatus || '')) return false;
+      if (filterValueStatuses.length) {
+        const vs = row.valueStatus || '';
+        const matches = vs ? filterValueStatuses.includes(vs) : filterValueStatuses.includes(BLANK_VALUE_STATUS);
+        if (!matches) return false;
+      }
       return true;
     });
   }, [mappingRows, filterLegacyAttributes, filterAttributeTypes, filterFeasibilities, filterValueStatuses]);
@@ -428,16 +451,28 @@ const ProductViewer: React.FC<ProductViewerProps> = ({ currentUser, onClose }) =
     return map;
   }, [mappingRows]);
 
+  // Map of legacy feature/attribute id -> target attribute id, used as a
+  // fallback so the attribute name still translates when a specific condition
+  // value has no value-level mapping.
+  const attributeTranslationMap = useMemo<AttributeTranslationMap>(() => {
+    const map: AttributeTranslationMap = {};
+    for (const row of mappingRows) {
+      if (!row.legacyFeatureId || !row.newAttributeId) continue;
+      if (!map[row.legacyFeatureId]) map[row.legacyFeatureId] = row.newAttributeId;
+    }
+    return map;
+  }, [mappingRows]);
+
   // Precompute condition segments once (keyed by row reference) so toggling and
   // scrolling stay instant. Translated tokens are green, untranslated legacy
   // tokens are red, operators/parentheses neutral.
   const conditionSegmentsByRow = useMemo(() => {
     const map = new Map<WorkspaceMappingRow, ConditionSegment[]>();
     for (const row of mappingRows) {
-      if (row.condition) map.set(row, buildConditionSegments(row.condition, conditionTranslationMap));
+      if (row.condition) map.set(row, buildConditionSegments(row.condition, conditionTranslationMap, attributeTranslationMap));
     }
     return map;
-  }, [mappingRows, conditionTranslationMap]);
+  }, [mappingRows, conditionTranslationMap, attributeTranslationMap]);
 
   // Flatten grouped rows into a single list for virtualization (react-window).
   const flatMappingItems = useMemo<FlatMappingItem[]>(() => {

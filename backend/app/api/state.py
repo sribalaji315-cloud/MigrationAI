@@ -82,6 +82,39 @@ def invalidate_metrics_cache():
     _metrics_cache_fingerprint.clear()
 
 
+def _project_dashboard_items(
+    result: Dict[str, Any],
+    item_search: Optional[str],
+    offset: int,
+    limit: int,
+) -> Dict[str, Any]:
+    """Return a lightweight view of a cached dashboard result.
+
+    The full per-item breakdown (which can be 20k+ rows) is kept server-side in
+    the metrics cache. Each response only carries a filtered + paginated slice so
+    the payload stays small and the browser is never asked to render everything.
+    """
+    items = result.get("items", []) or []
+    q = (item_search or "").strip().lower()
+    if q:
+        items = [
+            it for it in items
+            if q in str(it.get("itemId", "")).lower()
+            or q in str(it.get("description") or "").lower()
+        ]
+    total = len(items)
+    start = max(0, offset)
+    if limit is not None and limit >= 0:
+        sliced = items[start:start + limit]
+    else:
+        sliced = items[start:]
+    projected = dict(result)
+    projected["items"] = sliced
+    projected["itemsTotal"] = total
+    projected["itemsReturned"] = len(sliced)
+    return projected
+
+
 def _cleanup_stale_generation_jobs(db: Session, stale_after_seconds: float = GENERATION_STALE_TIMEOUT_SECONDS) -> int:
     """Mark orphaned queued/running generation jobs as failed after heartbeat timeout."""
     now_ts = time.time()
@@ -485,8 +518,10 @@ def _run_mapping_generation_job(job_id: int):
         # never be regenerated or discarded. Exclude them from the bulk delete and
         # skip them in the generation loop below.
         approved_item_ids, approved_pairs = _load_approved_protection(db)
+        # Group-applied rows are preserved like local overrides (managed by the
+        # apply-group-features job, not global regeneration).
         _del_q = db.query(models.WorkspaceMapping).filter(
-            models.WorkspaceMapping.mapped_from != "local"
+            models.WorkspaceMapping.mapped_from.notin_(["local", "group"])
         )
         if approved_item_ids:
             _del_q = _del_q.filter(
@@ -502,14 +537,14 @@ def _run_mapping_generation_job(job_id: int):
         _del_q.delete(synchronize_session=False)
         db.commit()
 
-        # Collect (item_id, feature_id) pairs that have local overrides so the
-        # generation loop can skip them entirely.
+        # Collect (item_id, feature_id) pairs that have local or group overrides so
+        # the generation loop can skip them entirely.
         _local_pairs_raw = (
             db.query(
                 models.WorkspaceMapping.legacy_item_id,
                 models.WorkspaceMapping.legacy_feature_id,
             )
-            .filter(models.WorkspaceMapping.mapped_from == "local")
+            .filter(models.WorkspaceMapping.mapped_from.in_(["local", "group"]))
             .distinct()
             .all()
         )
@@ -2441,23 +2476,23 @@ def _regenerate_item_preserving_local(item_id: str, user_id: str, username: str,
         db, item_id=item_id, include_local=False
     )
 
-    # Collect (item, feature) pairs with local overrides so we skip them entirely.
+    # Collect (item, feature) pairs with local or group overrides so we skip them entirely.
     _local_pairs_raw = (
         db.query(models.WorkspaceMapping.legacy_feature_id)
         .filter(
             models.WorkspaceMapping.legacy_item_id == item_id,
-            models.WorkspaceMapping.mapped_from == "local",
+            models.WorkspaceMapping.mapped_from.in_(["local", "group"]),
         )
         .distinct()
         .all()
     )
     local_override_features: Set[str] = {r[0] for r in _local_pairs_raw}
 
-    # Delete only regenerable rows: this item's rows that are not local overrides
+    # Delete only regenerable rows: this item's rows that are not local/group overrides
     # and not protected by an approved (item, feature) pair.
     _del_q = db.query(models.WorkspaceMapping).filter(
         models.WorkspaceMapping.legacy_item_id == item_id,
-        models.WorkspaceMapping.mapped_from != "local",
+        models.WorkspaceMapping.mapped_from.notin_(["local", "group"]),
     )
     if approved_pairs:
         _approved_features_for_item = [f for (i, f) in approved_pairs if i == item_id]
@@ -2683,10 +2718,10 @@ def revert_all_to_global(
     if getattr(current_user, "role", "user") != "admin":
         raise HTTPException(status_code=403, detail="admin only")
 
-    # Delete all local override rows so regeneration replaces them
+    # Delete all local and group override rows so regeneration replaces them
     deleted = (
         db.query(models.WorkspaceMapping)
-        .filter(models.WorkspaceMapping.mapped_from == "local")
+        .filter(models.WorkspaceMapping.mapped_from.in_(["local", "group"]))
         .delete(synchronize_session=False)
     )
     db.commit()
@@ -4189,6 +4224,9 @@ def get_dashboard_metrics(
     priority: Optional[int] = Query(None, alias="priority"),
     includeExcluded: bool = Query(False, alias="includeExcluded"),
     forceRecompute: bool = Query(False, alias="forceRecompute"),
+    itemSearch: Optional[str] = Query(None, alias="itemSearch"),
+    itemLimit: int = Query(200, alias="itemLimit", ge=0, le=5000),
+    itemOffset: int = Query(0, alias="itemOffset", ge=0),
     db: Session = Depends(get_db),
 ):
     selected_product_type = productType or productLine
@@ -4198,7 +4236,7 @@ def get_dashboard_metrics(
     fingerprint = _data_fingerprint(db)
 
     if not forceRecompute and cache_key in _metrics_cache and _metrics_cache_fingerprint.get(cache_key) == fingerprint:
-        return _metrics_cache[cache_key]
+        return _project_dashboard_items(_metrics_cache[cache_key], itemSearch, itemOffset, itemLimit)
 
     # --- Get included attribute types from mappingTypeConfig ---
     included_type_set = _get_included_type_set(db)
@@ -4231,7 +4269,7 @@ def get_dashboard_metrics(
         }
         _metrics_cache[cache_key] = empty
         _metrics_cache_fingerprint[cache_key] = fingerprint
-        return empty
+        return _project_dashboard_items(empty, itemSearch, itemOffset, itemLimit)
 
     bom_info: Dict[str, Dict[str, str]] = {}
     approved_items = 0
@@ -4405,7 +4443,7 @@ def get_dashboard_metrics(
     _metrics_cache[cache_key] = result
     _metrics_cache_fingerprint[cache_key] = fingerprint
 
-    return result
+    return _project_dashboard_items(result, itemSearch, itemOffset, itemLimit)
 
 
 @router.get("/item-statuses")
@@ -8794,6 +8832,8 @@ def _run_apply_group_feature_job(job_id: int):
                 row.new_value = new_value
                 row.attribute_type = attr_type
                 row.mapped_from = mapped_from
+                # Clear any group-applied not-required status so a re-run reflects current group features.
+                row.value_status = None
                 row.updated_at = now_row
                 reverted += 1
             # Heartbeat + free memory each chunk so the job isn't misdetected as stale and
@@ -8807,14 +8847,14 @@ def _run_apply_group_feature_job(job_id: int):
         # Step 2 — apply current group_features mappings.
         gf_rows = db.query(models.GroupFeature).all()
 
-        # Precedence: when the same (feature_group, feature_id, option) has both a
-        # discontinued row and a non-discontinued (e.g. in_progress) row, the
-        # non-discontinued row wins. Collect keys with at least one non-discontinued
-        # row so discontinued duplicates are skipped below.
-        non_discontinued_keys: Set[Tuple[str, str, str]] = set()
+        # Precedence: when the same (feature_group, feature_id, option) has both an
+        # inactive row (discontinued/ignored -> NOT REQUIRED) and an active row
+        # (in_progress/review/approved), the active row wins. Collect keys with at
+        # least one active row so inactive duplicates are skipped below.
+        active_keys: Set[Tuple[str, str, str]] = set()
         for gf in gf_rows:
-            if str(gf.value_status or "").strip().lower() != "discontinued":
-                non_discontinued_keys.add((
+            if str(gf.value_status or "").strip().lower() not in ("discontinued", "ignored"):
+                active_keys.add((
                     str(gf.feature_group or "").strip(),
                     str(gf.feature_id or "").strip(),
                     str(gf.option or ""),
@@ -8847,11 +8887,11 @@ def _run_apply_group_feature_job(job_id: int):
             target_attr = (gf.target_attribute or "").strip()
             gf_value_status = str(gf.value_status or "").strip().lower()
 
-            # A discontinued row is superseded when a non-discontinued row exists
-            # for the same option (in_progress wins over discontinued).
+            # An inactive row (discontinued/ignored) is superseded when an active row
+            # exists for the same option (in_progress/review/approved wins).
             superseded = (
-                gf_value_status == "discontinued"
-                and (fg, sub_feature, option) in non_discontinued_keys
+                gf_value_status in ("discontinued", "ignored")
+                and (fg, sub_feature, option) in active_keys
             )
             item_ids = (
                 items_by_group.get(fg)
@@ -8879,9 +8919,11 @@ def _run_apply_group_feature_job(job_id: int):
                     ):
                         continue
                     row.new_attribute_id = target_attr
-                    row.new_value = "NOT REQUIRED" if gf_value_status == "discontinued" else (gf.target_value or "")
-                    if gf_value_status == "discontinued":
-                        row.value_status = "discontinued"
+                    if gf_value_status in ("discontinued", "ignored"):
+                        row.new_value = "NOT REQUIRED"
+                        row.value_status = gf_value_status
+                    else:
+                        row.new_value = gf.target_value or ""
                     row.mapped_from = "group"
                     row.modified_by = "apply_group_feature"
                     row.modified_at = time.time()

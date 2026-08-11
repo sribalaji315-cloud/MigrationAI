@@ -29,6 +29,11 @@ export interface MLPrediction {
   confidence: number;
 }
 
+export interface TargetSuggestion {
+  targetId: string;
+  confidence: number;
+}
+
 export interface MLSettings {
   useSynonymAssist: boolean;
   synonymThreshold: number;
@@ -115,7 +120,7 @@ export interface GlobalMapping {
   // Per-legacy-value metadata (condition/feasibility/valueStatus) sourced from workspace_mappings rows.
   valueMeta?: Record<string, { condition?: string | null; feasibility?: string | null; valueStatus?: string | null }>;
   attributeType: MappingAttributeType;
-  mappedFrom?: 'global' | 'local';
+  mappedFrom?: 'global' | 'local' | 'group';
   status?: 'active' | 'deprecated' | 'ignored';
   ignoredValues?: string[];
 }
