@@ -802,6 +802,11 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
       const itemChanged = prevItemIdRef.current !== item.itemId;
       prevItemIdRef.current = item.itemId;
 
+      // Same item with unsaved edits: keep staged state so a background prop refresh can't wipe it.
+      if (!itemChanged && isEditingRef.current) {
+        return;
+      }
+
       isEditingRef.current = false;
       setStagedClassId(assignedClassId || 'UNCLASSIFIED');
       previousClassIdRef.current = assignedClassId || null;

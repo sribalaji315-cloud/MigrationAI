@@ -166,24 +166,14 @@ const App: React.FC = () => {
     await loadSidebarItems({ ...sidebarAdminFilters, unmappedOnly: showUnmappedOnlyInSidebar || undefined }, page, sidebarSearchQuery);
   }, [loadSidebarItems, sidebarAdminFilters, sidebarSearchQuery, showUnmappedOnlyInSidebar]);
 
-  // WebSocket: real-time collaboration events (ref avoids stale closure)
+  // WebSocket: real-time progress only. Background data reloads are disabled so
+  // in-progress edits are never clobbered; refresh happens only on user actions.
   const fetchFromDBRef = useRef<() => void>(() => {});
   const handleWsEvent = useCallback((event: WsEvent) => {
-    if (event.type === 'lock_change' || event.type === 'data_sync') {
-      fetchFromDBRef.current();
-    } else if (event.type === 'approval_change') {
-      fetchFromDBRef.current();
-    } else if (event.type === 'generation_progress') {
-      if (event.payload?.status === 'completed') {
-        fetchFromDBRef.current();
-      }
-    } else if (event.type === 'ml_prediction_progress') {
+    if (event.type === 'ml_prediction_progress') {
       const p = event.payload;
       if (p) {
         setMlPredictionProgress({ status: p.status, progress: p.progress ?? 0, total: p.total ?? 0, processed: p.processed ?? 0 });
-        if (p.status === 'completed') {
-          fetchFromDBRef.current();
-        }
       }
     }
   }, []);
@@ -661,9 +651,6 @@ const App: React.FC = () => {
           setMlPredictionProgress({ status: status.status, progress: status.progress, total: status.total, processed: status.processed });
           if (status.status === 'completed' || status.status === 'failed' || status.status === 'idle') {
             clearInterval(pollInterval);
-            if (status.status === 'completed') {
-              handleFetchFromDB();
-            }
           }
         } catch {
           clearInterval(pollInterval);
