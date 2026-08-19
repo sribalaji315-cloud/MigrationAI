@@ -237,9 +237,10 @@ interface InlineDropdownProps {
   placeholder?: string;
   emptyColor?: string;
   autoOpen?: boolean;
+  allowFreeText?: boolean;
 }
 
-const InlineSearchDropdown: React.FC<InlineDropdownProps> = ({ value, onSave, fetchOptions, suggestions, placeholder, emptyColor, autoOpen }) => {
+const InlineSearchDropdown: React.FC<InlineDropdownProps> = ({ value, onSave, fetchOptions, suggestions, placeholder, emptyColor, autoOpen, allowFreeText }) => {
   const [open, setOpen] = useState(!!autoOpen);
   const [search, setSearch] = useState('');
   const [options, setOptions] = useState<{ label: string; description?: string }[]>([]);
@@ -313,6 +314,12 @@ const InlineSearchDropdown: React.FC<InlineDropdownProps> = ({ value, onSave, fe
     return result;
   }, [suggestions, options]);
 
+  // When free text is allowed, expose the typed value as a selectable option if
+  // it doesn't already match one of the fetched/suggested options.
+  const trimmedSearch = search.trim();
+  const showFreeText = !!allowFreeText && trimmedSearch.length > 0
+    && !mergedOptions.some(o => o.label.toUpperCase() === trimmedSearch.toUpperCase());
+
   if (!open) {
     return (
       <span
@@ -332,7 +339,15 @@ const InlineSearchDropdown: React.FC<InlineDropdownProps> = ({ value, onSave, fe
         type="text"
         value={search}
         onChange={e => handleSearch(e.target.value)}
-        placeholder="Search…"
+        onKeyDown={e => {
+          if (e.key === 'Enter' && allowFreeText && trimmedSearch.length > 0) {
+            e.preventDefault();
+            handleSelect(trimmedSearch);
+          } else if (e.key === 'Escape') {
+            setOpen(false);
+          }
+        }}
+        placeholder={allowFreeText ? 'Search or type any value…' : 'Search…'}
         className="w-full px-1.5 py-0.5 border border-blue-400 rounded text-xs focus:outline-none focus:ring-1 focus:ring-blue-500 min-w-[120px]"
       />
       <div className="absolute top-full left-0 mt-0.5 w-64 bg-white border border-slate-200 rounded-md shadow-lg max-h-48 overflow-auto">
@@ -341,10 +356,19 @@ const InlineSearchDropdown: React.FC<InlineDropdownProps> = ({ value, onSave, fe
             <div className="w-3 h-3 border-2 border-blue-400 border-t-transparent rounded-full animate-spin" />
             Loading…
           </div>
-        ) : mergedOptions.length === 0 ? (
+        ) : mergedOptions.length === 0 && !showFreeText ? (
           <div className="px-3 py-2 text-xs text-slate-400">No matches</div>
         ) : (
           <>
+            {showFreeText && (
+              <div
+                onClick={() => handleSelect(trimmedSearch)}
+                className="px-3 py-1.5 hover:bg-blue-50 cursor-pointer text-xs flex items-center justify-between bg-blue-50/50 border-l-2 border-blue-400"
+              >
+                <span className="truncate">Use "{trimmedSearch}"</span>
+                <span className="text-[9px] text-slate-400 ml-2 shrink-0">custom value</span>
+              </div>
+            )}
             {mergedOptions.map((o, i) => (
               <div
                 key={`${o.label}-${i}`}
@@ -480,6 +504,7 @@ const ALL_COLUMNS: ColDef[] = [
       fetchOptions={(search) => cb.fetchValOptions(r.targetAttribute!, search)}
       onSave={(val) => cb.onUpdateRow(r.id, { targetValue: val })}
       placeholder="Set value"
+      allowFreeText
     />;
   }},
   { key: 'status', label: 'Status', sortKey: 'valueStatus', align: 'center', render: (r, cb) => {
@@ -682,7 +707,7 @@ const GroupFeatures: React.FC<GroupFeaturesProps> = ({ currentUser, onClose }) =
   }, []);
 
   const fetchValOptions = useCallback(async (attributeId: string, search: string): Promise<{ label: string; description?: string }[]> => {
-    const result = await dbService.fetchGroupFeatureAttributeValues(attributeId, search || undefined, 20);
+    const result = await dbService.fetchGroupFeatureAttributeValues(attributeId, search || undefined, 50);
     return result.items.map(v => ({ label: v.value, description: v.description }));
   }, []);
 

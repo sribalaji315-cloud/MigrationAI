@@ -8568,8 +8568,12 @@ def trigger_group_feature_mapping(
     if active:
         return {"ok": True, "jobId": int(active.id)}
 
-    # Clear stale target values so re-mapping starts fresh
-    db.query(models.GroupFeature).update(
+    # Clear stale target values so re-mapping starts fresh.
+    # Only touch in_progress rows; approved/discontinued/review/ignored rows
+    # keep their curated target attribute/value.
+    db.query(models.GroupFeature).filter(
+        models.GroupFeature.value_status == "in_progress"
+    ).update(
         {"target_attribute": None, "target_value": None},
         synchronize_session=False,
     )
@@ -8671,8 +8675,14 @@ def _run_group_feature_mapping_job(job_id: int):
             target_attr = str(getattr(gm, "new_attribute_id", "") or "").strip()
             value_mappings = getattr(gm, "value_mappings", {}) or {}
 
-            # Update all group_feature rows for this feature_id
-            gf_rows = db.query(models.GroupFeature).filter(models.GroupFeature.feature_id == fid).all()
+            # Update only in_progress group_feature rows for this feature_id;
+            # approved/discontinued/review/ignored rows are left untouched.
+            gf_rows = (
+                db.query(models.GroupFeature)
+                .filter(models.GroupFeature.feature_id == fid)
+                .filter(models.GroupFeature.value_status == "in_progress")
+                .all()
+            )
             for gf in gf_rows:
                 gf.target_attribute = target_attr if target_attr else None
                 option = (gf.option or "").strip()
@@ -9672,34 +9682,58 @@ def get_group_feature_classification_attributes(
 def get_group_feature_attribute_values(
     attributeId: str,
     search: Optional[str] = None,
-    limit: int = 20,
+    limit: int = 50,
     db: Session = Depends(get_db),
 ):
-    """Return allowed values for a given attribute across all classifications."""
+    """Return allowed values for mapping.
+
+    The target attribute's own allowed values are returned first (priority).
+    When a search term is supplied and the attribute doesn't cover it, values
+    from any other attribute that match the search are appended as a fallback
+    so the user can find and map any value.
+    """
     attr_key = attributeId.strip().upper().replace(" ", "")
     search_lower = (search or "").strip().lower()[:200]
     all_cls = db.query(models.Classification).all()
-    value_set: Dict[str, str] = {}  # upper key -> canonical
-    value_desc: Dict[str, str] = {}
+
+    own_set: Dict[str, str] = {}   # values belonging to the target attribute
+    own_desc: Dict[str, str] = {}
+    other_set: Dict[str, str] = {}  # matching values from any other attribute
+    other_src: Dict[str, str] = {}  # value key -> source attribute id
     for cls_row in all_cls:
         for attr in (cls_row.attributes or []):
             aid = attr.get("attributeId") or attr.get("attribute_id") or ""
-            if not aid or aid.upper().replace(" ", "") != attr_key:
+            if not aid:
                 continue
+            is_own = aid.upper().replace(" ", "") == attr_key
             for v in (attr.get("allowedValues") or []):
                 if not v:
                     continue
                 vkey = v.upper().strip()
                 if search_lower and search_lower not in v.lower():
                     continue
-                if vkey not in value_set:
-                    value_set[vkey] = v
-                    descs = attr.get("valueDescriptions") or {}
-                    value_desc[vkey] = descs.get(v, "")
-    sorted_vals = sorted(value_set.keys())
+                if is_own:
+                    if vkey not in own_set:
+                        own_set[vkey] = v
+                        descs = attr.get("valueDescriptions") or {}
+                        own_desc[vkey] = descs.get(v, "")
+                elif vkey not in other_set:
+                    other_set[vkey] = v
+                    other_src[vkey] = aid
+
     items = []
-    for vkey in sorted_vals[:limit]:
-        items.append({"value": value_set[vkey], "description": value_desc.get(vkey, "")})
+    for vkey in sorted(own_set.keys())[:limit]:
+        items.append({"value": own_set[vkey], "description": own_desc.get(vkey, ""), "inAttribute": True})
+
+    # Global fallback: only when searching, and only to fill remaining slots.
+    if search_lower and len(items) < limit:
+        for vkey in sorted(other_set.keys()):
+            if vkey in own_set:
+                continue
+            items.append({"value": other_set[vkey], "description": f"from {other_src[vkey]}", "inAttribute": False})
+            if len(items) >= limit:
+                break
+
     return {"items": items}
 
 

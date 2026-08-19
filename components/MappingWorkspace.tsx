@@ -1161,14 +1161,16 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
   const attributeCandidateValues = useMemo(() => {
     const byAttr: Record<string, string[]> = {};
 
-    // Collect values from global mappings (target-side values)
+    // Collect values from global mappings (target-side values).
+    // Key by normalized attribute id so classification allowedValues (which may
+    // use a different casing, e.g. 'Depth') unify with global-mapping ids ('DEPTH').
     engineeringGlobalMappings.forEach(m => {
-      const attrId = m.newAttributeId;
-      if (!attrId) return;
-      if (!byAttr[attrId]) byAttr[attrId] = [];
+      const key = normalizeAttrId(m.newAttributeId);
+      if (!key) return;
+      if (!byAttr[key]) byAttr[key] = [];
       Object.values(m.valueMappings || {}).forEach(val => {
         if (!val) return;
-        if (!byAttr[attrId].includes(val)) byAttr[attrId].push(val);
+        if (!byAttr[key].includes(val)) byAttr[key].push(val);
       });
     });
 
@@ -1176,7 +1178,9 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
     mergedClasses.forEach(cls => {
       cls.attributes.forEach(attr => {
         if (!attr.allowedValues || attr.allowedValues.length === 0) return;
-        const list = (byAttr[attr.attributeId] = byAttr[attr.attributeId] || []);
+        const key = normalizeAttrId(attr.attributeId);
+        if (!key) return;
+        const list = (byAttr[key] = byAttr[key] || []);
         attr.allowedValues.forEach(v => {
           if (!list.includes(v)) list.push(v);
         });
@@ -1186,18 +1190,16 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
     return byAttr;
   }, [engineeringGlobalMappings, mergedClasses]);
 
-  // Fetch allowed values for a target attribute that has no locally-known
-  // candidate values (typically because it was selected via cross-class search
-  // and its owning classification isn't loaded). Results are cached by
-  // normalized attribute id so the value dropdown can offer real options.
+  // Fetch the full set of allowed values for a target attribute across all
+  // classifications. Used to backfill the value dropdown so it offers every
+  // allowed value (not just those from loaded classes or prior mappings).
+  // Results are cached by normalized attribute id.
   const fetchAttributeValuesIfNeeded = useCallback((attrId: string) => {
     if (!attrId) return;
     const upper = attrId.toUpperCase();
     if (upper === 'UNMAPPED' || upper === 'NOT REQUIRED') return;
     const key = normalizeAttrId(attrId);
     if (!key) return;
-    // Already have local candidates for this attribute → no fetch needed.
-    if ((attributeCandidateValues[attrId] || []).length > 0) return;
     // Already fetched or in-flight.
     if (fetchedAttributeValues[key] || fetchingAttrValuesRef.current.has(key)) return;
     fetchingAttrValuesRef.current.add(key);
@@ -1208,7 +1210,7 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
       })
       .catch(err => console.warn(`Failed to fetch values for attribute '${attrId}':`, err))
       .finally(() => { fetchingAttrValuesRef.current.delete(key); });
-  }, [attributeCandidateValues, fetchedAttributeValues]);
+  }, [fetchedAttributeValues]);
 
   // Backfill allowed values for target attributes already selected (via global
   // or local mappings) whose values aren't locally known, so the value dropdown
@@ -2125,20 +2127,23 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
               }
             }
 
-            let candidateValuesForAttribute = attributeCandidateValues[selectedAttribute] || [];
-            if (useNewClassTargetMapping && (stagedClassId || 'UNCLASSIFIED') !== 'UNCLASSIFIED') {
+            let candidateValuesForAttribute = attributeCandidateValues[normalizeAttrId(selectedAttribute)] || [];
+            if (usingClassScope) {
               const activeClass = classes.find(c => c.classId === (stagedClassId || 'UNCLASSIFIED'));
               const attrDef = activeClass?.attributes.find(a => normalizeAttrId(a.attributeId) === normalizeAttrId(selectedAttribute));
               if (attrDef && attrDef.allowedValues && attrDef.allowedValues.length > 0) {
                 candidateValuesForAttribute = attrDef.allowedValues;
               }
-            }
-            // Fall back to on-demand fetched values for attributes whose owning
-            // classification isn't loaded (e.g. selected via cross-class search).
-            if (candidateValuesForAttribute.length === 0 && selectedAttribute && selectedAttribute !== 'UNMAPPED' && selectedAttribute !== 'NOT REQUIRED') {
+            } else if (selectedAttribute && selectedAttribute !== 'UNMAPPED' && selectedAttribute !== 'NOT REQUIRED') {
+              // Not scoped to a single class: union locally-known values with the
+              // comprehensive backend list so every allowed value for the
+              // attribute (across all classifications) is offered, not just
+              // previously-mapped ones.
               const fetched = fetchedAttributeValues[normalizeAttrId(selectedAttribute)];
               if (fetched && fetched.length > 0) {
-                candidateValuesForAttribute = fetched;
+                const merged = [...candidateValuesForAttribute];
+                fetched.forEach(v => { if (!merged.includes(v)) merged.push(v); });
+                candidateValuesForAttribute = merged;
               }
             }
             // Ensure NOT REQUIRED is always available as a value option
@@ -2579,7 +2584,7 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
                                     tone={toneForManual}
                                     value={rawValue}
                                     options={(() => {
-                                      let base = attributeCandidateValues[attr.attributeId] || [];
+                                      let base = attributeCandidateValues[normalizeAttrId(attr.attributeId)] || [];
                                       if (useNewClassTargetMapping && attr.allowedValues && attr.allowedValues.length > 0) {
                                         base = attr.allowedValues;
                                       }
