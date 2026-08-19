@@ -1054,7 +1054,12 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
     if (!item || !isLockedByMe) return;
     const currentlyApproved = !!approvalState?.features?.[featureId];
     try {
-      const next = await dbService.setFeatureApproval(item.itemId, featureId, !currentlyApproved);
+      const next = await dbService.setFeatureApproval(
+        item.itemId,
+        featureId,
+        !currentlyApproved,
+        !currentlyApproved ? displayedAttrByFeature[featureId] : undefined,
+      );
       setApprovalState(next);
     } catch (e: any) {
       alert(`Approval failed: ${e.message}`);
@@ -1070,7 +1075,11 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
       if (!currentlyApproved && isEditingRef.current) {
         await commitToSystem();
       }
-      const next = await dbService.setItemApproval(item.itemId, !currentlyApproved);
+      const next = await dbService.setItemApproval(
+        item.itemId,
+        !currentlyApproved,
+        !currentlyApproved ? displayedAttrByFeature : undefined,
+      );
       setApprovalState(next);
     } catch (e: any) {
       alert(`Approval failed: ${e.message}`);
@@ -1367,6 +1376,54 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
       totalValues: totalValueCount,
     };
   }, [item, engineeringGlobalMappings, stagedLocalMappings, targetAttributes, includedMappingTypeSet, allGlobalMappingsByFeature]);
+
+  // Displayed target attribute per feature (mirrors the render-loop selection logic).
+  // Used to persist the shown attribute onto the DB when a feature/item is approved so
+  // ambiguous "multiple" features stop reading as unmapped once confirmed.
+  const displayedAttrByFeature = useMemo(() => {
+    const result: Record<string, string> = {};
+    if (!item) return result;
+    const globalByFeature: Record<string, GlobalMapping[]> = {};
+    engineeringGlobalMappings.forEach(m => {
+      m.legacyFeatureIds.forEach(fid => {
+        (globalByFeature[fid] = globalByFeature[fid] || []).push(m);
+      });
+    });
+    const localByFeature: Record<string, any> = {};
+    stagedLocalMappings.forEach(m => {
+      m.legacyFeatureIds.forEach(fid => { localByFeature[fid] = m; });
+    });
+    const usingClassScope = useNewClassTargetMapping && (stagedClassId || 'UNCLASSIFIED') !== 'UNCLASSIFIED';
+    item.features.forEach(f => {
+      const globalMappingsForFeature = globalByFeature[f.featureId] || [];
+      const localOverride = localByFeature[f.featureId];
+      let attributeOptions: string[] = [];
+      globalMappingsForFeature.forEach(gm => {
+        const parts = (gm.newAttributeId || '').replace(/\s+/g, '').split(';').map(a => a.trim()).filter(a => a && a !== 'UNMAPPED');
+        attributeOptions.push(...parts);
+      });
+      attributeOptions = Array.from(new Set(attributeOptions));
+      let defaultGlobalAttribute = attributeOptions.length > 0 ? attributeOptions[0] : 'UNMAPPED';
+      if (usingClassScope) {
+        const matchedForClass = attributeOptions.filter(a => {
+          const key = normalizeAttrId(a);
+          return key && classAttributeKeys.has(key);
+        });
+        if (matchedForClass.length > 0) defaultGlobalAttribute = matchedForClass[0];
+      }
+      let selectedAttribute = localOverride?.newAttributeId || defaultGlobalAttribute;
+      if (usingClassScope) {
+        const selectedKey = normalizeAttrId(selectedAttribute);
+        if (selectedAttribute && selectedAttribute !== 'UNMAPPED' && selectedAttribute !== 'NOT REQUIRED' && (!selectedKey || !classAttributeKeys.has(selectedKey))) {
+          selectedAttribute = 'UNMAPPED';
+        }
+      }
+      if (selectedAttribute && selectedAttribute !== 'UNMAPPED' && selectedAttribute !== 'NOT REQUIRED') {
+        result[f.featureId] = selectedAttribute;
+      }
+    });
+    return result;
+  }, [item, engineeringGlobalMappings, stagedLocalMappings, useNewClassTargetMapping, stagedClassId, classAttributeKeys]);
 
   const ignoredFeatureIds = useMemo(() => {
     const ignored = new Set<string>();

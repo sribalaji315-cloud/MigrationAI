@@ -2913,6 +2913,56 @@ def get_item_approval_state(
     return _approval_state_for_item(item_id, db)
 
 
+def _persist_confirmed_attributes(
+    db: Session,
+    item_id: str,
+    feature_ids: List[str],
+    confirmed: Dict[str, str],
+    actor_id: Optional[int],
+) -> int:
+    """Persist the UI-displayed target attribute onto an item's WorkspaceMapping rows
+    whose ``new_attribute_id`` is still blank (ambiguous multi-candidate features), so an
+    approved feature reflects a concrete saved mapping instead of a blank column.
+
+    Uses the caller-supplied attribute per feature; falls back to the top global-mapping
+    candidate. Rows are marked ``mapped_from='local'`` so the value survives regeneration
+    and apply-group-features reverts. Returns the number of rows updated.
+    """
+    feature_ids = [str(f or "").strip() for f in feature_ids if str(f or "").strip()]
+    if not feature_ids:
+        return 0
+    candidates_by_feature = _build_all_candidates_by_feature(
+        db.query(models.GlobalMapping).filter(models.GlobalMapping.status == "active").all()
+    )
+    now = time.time()
+    updated = 0
+    for fid in feature_ids:
+        attr = str(confirmed.get(fid) or "").strip()
+        if not attr:
+            cands = candidates_by_feature.get(fid) or []
+            attr = cands[0] if cands else ""
+        if not attr or attr in ("UNMAPPED", "NOT REQUIRED"):
+            continue
+        rows = (
+            db.query(models.WorkspaceMapping)
+            .filter(models.WorkspaceMapping.legacy_item_id == item_id)
+            .filter(models.WorkspaceMapping.legacy_feature_id == fid)
+            .all()
+        )
+        for row in rows:
+            if str(row.mapped_from or "") == "local":
+                continue
+            if str(row.new_attribute_id or "").strip():
+                continue
+            row.new_attribute_id = attr
+            row.mapped_from = "local"
+            row.modified_by = str(actor_id) if actor_id is not None else None
+            row.modified_at = now
+            row.updated_at = now
+            updated += 1
+    return updated
+
+
 @router.post("/workspace-mappings/{item_id}/feature-approval")
 async def set_feature_approval(
     item_id: str,
@@ -2958,6 +3008,15 @@ async def set_feature_approval(
             bom_item.approved_by_user_id = None
             bom_item.approved_by_username = None
             bom_item.approved_at = None
+
+    if approved:
+        _persist_confirmed_attributes(
+            db,
+            item_id,
+            [feature_id],
+            {feature_id: str(payload.get("confirmedAttribute") or "").strip()},
+            current_user_id,
+        )
 
     db.commit()
     await broadcast_approval_change(item_id, actor_id=current_user_id)
@@ -3012,6 +3071,17 @@ async def set_item_approval(
         bom_item.approved_by_user_id = current_user_id
         bom_item.approved_by_username = username
         bom_item.approved_at = now
+
+        confirmed = payload.get("confirmedAttributes") or {}
+        if not isinstance(confirmed, dict):
+            confirmed = {}
+        _persist_confirmed_attributes(
+            db,
+            item_id,
+            list(feature_ids),
+            {str(k): str(v) for k, v in confirmed.items()},
+            current_user_id,
+        )
     else:
         bom_item.approved_for_migration = 0
         bom_item.approved_by_user_id = None

@@ -577,14 +577,14 @@ export const dbService = {
     return resp.json();
   },
 
-  async setFeatureApproval(itemId: string, featureId: string, approved: boolean): Promise<ItemApprovalState> {
+  async setFeatureApproval(itemId: string, featureId: string, approved: boolean, confirmedAttribute?: string): Promise<ItemApprovalState> {
     if (!SQL_ENDPOINT) throw new Error('Database connection not available.');
     const resp = await this._fetchWithRefresh(
       `${SQL_ENDPOINT}/workspace-mappings/${encodeURIComponent(itemId)}/feature-approval`,
       {
         method: 'POST',
         headers: { ...this._authHeaders(), 'Content-Type': 'application/json' },
-        body: JSON.stringify({ featureId, approved }),
+        body: JSON.stringify({ featureId, approved, ...(confirmedAttribute ? { confirmedAttribute } : {}) }),
       },
     );
     if (!resp.ok) {
@@ -595,14 +595,14 @@ export const dbService = {
     return resp.json();
   },
 
-  async setItemApproval(itemId: string, approved: boolean): Promise<ItemApprovalState> {
+  async setItemApproval(itemId: string, approved: boolean, confirmedAttributes?: Record<string, string>): Promise<ItemApprovalState> {
     if (!SQL_ENDPOINT) throw new Error('Database connection not available.');
     const resp = await this._fetchWithRefresh(
       `${SQL_ENDPOINT}/bom/items/${encodeURIComponent(itemId)}/approval`,
       {
         method: 'POST',
         headers: { ...this._authHeaders(), 'Content-Type': 'application/json' },
-        body: JSON.stringify({ approved }),
+        body: JSON.stringify({ approved, ...(confirmedAttributes && Object.keys(confirmedAttributes).length ? { confirmedAttributes } : {}) }),
       },
     );
     if (!resp.ok) {
