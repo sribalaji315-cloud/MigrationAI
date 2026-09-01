@@ -457,8 +457,10 @@ def _load_approved_protection(db: Session) -> Tuple[Set[str], Set[Tuple[str, str
       - ``approved_pairs`` are ``(item_id, feature_id)`` tuples that have an
         ItemFeatureApproval row (protects that single feature).
 
-    Both mapping generation and apply-group-feature must leave any workspace
-    mapping matching these sets untouched.
+    Mapping generation leaves any workspace mapping matching these sets untouched.
+    (The apply-group-feature job intentionally does NOT honor these sets: group
+    features are the single source of truth for their rows and override approved
+    items/features too.)
     """
     approved_item_ids: Set[str] = {
         r[0]
@@ -537,18 +539,23 @@ def _run_mapping_generation_job(job_id: int):
         _del_q.delete(synchronize_session=False)
         db.commit()
 
-        # Collect (item_id, feature_id) pairs that have local or group overrides so
-        # the generation loop can skip them entirely.
+        # Collect (item_id, feature_id, value) triples that already have a local or
+        # group override. Generation preserves those exact rows and only fills the
+        # gaps, so every bom feature+value pair ends up in the workspace mapping
+        # table without clobbering group/local curation.
         _local_pairs_raw = (
             db.query(
                 models.WorkspaceMapping.legacy_item_id,
                 models.WorkspaceMapping.legacy_feature_id,
+                models.WorkspaceMapping.legacy_value,
             )
             .filter(models.WorkspaceMapping.mapped_from.in_(["local", "group"]))
             .distinct()
             .all()
         )
-        local_override_pairs: set = {(r[0], r[1]) for r in _local_pairs_raw}
+        override_value_keys: set = {
+            (r[0], r[1], str(r[2] or "")) for r in _local_pairs_raw
+        }
 
         item_id_by_pk = {
             row_id: item_id
@@ -627,11 +634,6 @@ def _run_mapping_generation_job(job_id: int):
 
             feat_feature_id = str(getattr(feat, "feature_id", "") or "").strip()
 
-            # Skip features that have local overrides — those are user-managed.
-            if (legacy_item_id, feat_feature_id) in local_override_pairs:
-                processed_features += 1
-                continue
-
             # Skip approved items (all features) and approved features so their
             # existing mappings are preserved rather than regenerated.
             if (
@@ -674,6 +676,11 @@ def _run_mapping_generation_job(job_id: int):
 
             signed_ts = job.started_at or time.time()
             if not values:
+                # Preserve an existing local/group override for the attribute-only
+                # (blank value) row rather than regenerating it.
+                if (legacy_item_id, feat_feature_id, "") in override_value_keys:
+                    processed_features += 1
+                    continue
                 row_metadata = _resolve_workspace_revert_metadata(
                     preserved_revert_metadata,
                     legacy_item_id,
@@ -705,6 +712,10 @@ def _run_mapping_generation_job(job_id: int):
                 generated_rows += 1
             else:
                 for legacy_value in values:
+                    # Preserve an existing local/group override for this value;
+                    # generation only fills values that have no override row yet.
+                    if (legacy_item_id, feat_feature_id, str(legacy_value)) in override_value_keys:
+                        continue
                     # Determine per-value exclusion status
                     val_status = None
                     if feature_gm_status:
@@ -2476,9 +2487,13 @@ def _regenerate_item_preserving_local(item_id: str, user_id: str, username: str,
         db, item_id=item_id, include_local=False
     )
 
-    # Collect (item, feature) pairs with local or group overrides so we skip them entirely.
+    # Collect (feature, value) overrides so we preserve those exact rows and only
+    # regenerate the values that have no local/group override yet.
     _local_pairs_raw = (
-        db.query(models.WorkspaceMapping.legacy_feature_id)
+        db.query(
+            models.WorkspaceMapping.legacy_feature_id,
+            models.WorkspaceMapping.legacy_value,
+        )
         .filter(
             models.WorkspaceMapping.legacy_item_id == item_id,
             models.WorkspaceMapping.mapped_from.in_(["local", "group"]),
@@ -2486,7 +2501,7 @@ def _regenerate_item_preserving_local(item_id: str, user_id: str, username: str,
         .distinct()
         .all()
     )
-    local_override_features: Set[str] = {r[0] for r in _local_pairs_raw}
+    override_value_keys: Set[tuple] = {(r[0], str(r[1] or "")) for r in _local_pairs_raw}
 
     # Delete only regenerable rows: this item's rows that are not local/group overrides
     # and not protected by an approved (item, feature) pair.
@@ -2533,9 +2548,7 @@ def _regenerate_item_preserving_local(item_id: str, user_id: str, username: str,
     for feat in features:
         feat_feature_id = str(getattr(feat, "feature_id", "") or "").strip()
 
-        # Skip features preserved as local overrides or protected by approval.
-        if feat_feature_id in local_override_features:
-            continue
+        # Skip features protected by approval.
         if (item_id, feat_feature_id) in approved_pairs:
             continue
 
@@ -2568,7 +2581,21 @@ def _regenerate_item_preserving_local(item_id: str, user_id: str, username: str,
         else:
             values = []
 
+        # Preserve values already owned by a local/group override; regenerate the rest.
+        source_had_values = bool(values)
+        values = [
+            v for v in values
+            if (feat_feature_id, str(v)) not in override_value_keys
+        ]
+
+        if source_had_values and not values:
+            # Every source value is already covered by an override row.
+            continue
+
         if not values:
+            if (feat_feature_id, "") in override_value_keys:
+                # Attribute-only row already exists as an override; keep it.
+                continue
             row_metadata = _resolve_workspace_revert_metadata(
                 preserved_revert_metadata,
                 item_id,
@@ -8841,8 +8868,11 @@ def _run_apply_group_feature_job(job_id: int):
       (a) a WorkspaceMapping row with legacy_feature_id == feature_group (group presence), AND
       (b) a WorkspaceMapping row with legacy_feature_id == feature_id AND legacy_value == option.
     The target is written onto the sub-feature row (b): new_attribute_id/new_value come from
-    the group row and mapped_from='group'. Rows with mapped_from='local' are never touched.
-    Group rows with an empty target_attribute are skipped.
+    the group row and mapped_from='group'. Applying a group feature takes ownership of the
+    matched row and converts it to a group mapping, overriding any prior mapped_from='local'
+    value AND any approved item/feature — group feature mappings are maintained solely in the
+    group_features table. A matched row is written as 'NOT REQUIRED' when the group row is
+    discontinued/ignored OR the workspace row's feasibility is 'No'.
     """
     db = SessionLocal()
     try:
@@ -8864,10 +8894,6 @@ def _run_apply_group_feature_job(job_id: int):
         # Heartbeat after index build (before the potentially large revert pass).
         job.updated_at = time.time()
         db.commit()
-
-        # Approved items (all features) and approved features must not be touched by
-        # either the revert pass or the apply pass below.
-        approved_item_ids, approved_pairs = _load_approved_protection(db)
 
         # Step 1 — revert previously applied group rows to their global baseline so a re-run
         # reflects the current group_features (stale group mappings are undone). Local rows
@@ -8896,12 +8922,6 @@ def _run_apply_group_feature_job(job_id: int):
             now_row = time.time()
             for row in chunk:
                 last_id = row.id
-                # Never revert rows belonging to approved items / approved features.
-                if (
-                    row.legacy_item_id in approved_item_ids
-                    or (row.legacy_item_id, str(row.legacy_feature_id or "").strip()) in approved_pairs
-                ):
-                    continue
                 target_attr, new_value, attr_type, mapped_from = _global_baseline_for_row(
                     str(row.legacy_feature_id or "").strip(),
                     str(row.legacy_value or ""),
@@ -8927,18 +8947,49 @@ def _run_apply_group_feature_job(job_id: int):
         # Step 2 — apply current group_features mappings.
         gf_rows = db.query(models.GroupFeature).all()
 
-        # Precedence: when the same (feature_group, feature_id, option) has both an
-        # inactive row (discontinued/ignored -> NOT REQUIRED) and an active row
-        # (in_progress/review/approved), the active row wins. Collect keys with at
-        # least one active row so inactive duplicates are skipped below.
-        active_keys: Set[Tuple[str, str, str]] = set()
+        # Precedence: when the same (feature_group, feature_id, option) has multiple
+        # group rows, exactly ONE winner is applied, chosen by status priority so an
+        # APPROVED row beats review/in_progress, and any active status beats
+        # discontinued/ignored (which otherwise map to NOT REQUIRED). Ties keep the
+        # first-seen row. Non-winner rows for the same key are skipped below.
+        def _status_rank(status: Optional[str]) -> int:
+            s = str(status or "").strip().lower()
+            if s == "approved":
+                return 5
+            if s == "review":
+                return 4
+            if s == "in_progress":
+                return 3
+            if s in ("discontinued", "ignored"):
+                return 1
+            return 2  # any other non-inactive status
+
+        winner_idx_by_key: Dict[Tuple[str, str, str], int] = {}
+        best_rank_by_key: Dict[Tuple[str, str, str], int] = {}
+        for idx_gf, gf in enumerate(gf_rows):
+            key = (
+                str(gf.feature_group or "").strip(),
+                str(gf.feature_id or "").strip(),
+                str(gf.option or ""),
+            )
+            rank = _status_rank(gf.value_status)
+            if rank > best_rank_by_key.get(key, -1):
+                best_rank_by_key[key] = rank
+                winner_idx_by_key[key] = idx_gf
+
+        # Per (feature_group, feature_id): the distinct target attributes among ACTIVE
+        # rows. When a feature has exactly one active attribute, discontinued/ignored
+        # options (which map to NOT REQUIRED) reuse it so the whole feature stays under
+        # a single target attribute instead of spawning a phantom second attribute.
+        active_attrs_by_feature: Dict[Tuple[str, str], Set[str]] = {}
         for gf in gf_rows:
-            if str(gf.value_status or "").strip().lower() not in ("discontinued", "ignored"):
-                active_keys.add((
-                    str(gf.feature_group or "").strip(),
-                    str(gf.feature_id or "").strip(),
-                    str(gf.option or ""),
-                ))
+            if str(gf.value_status or "").strip().lower() in ("discontinued", "ignored"):
+                continue
+            ta = (gf.target_attribute or "").strip()
+            if not ta:
+                continue
+            fk = (str(gf.feature_group or "").strip(), str(gf.feature_id or "").strip())
+            active_attrs_by_feature.setdefault(fk, set()).add(ta)
 
         # Distinct feature_group names -> set of items that contain that group
         # (presence only; the group row's value is irrelevant).
@@ -8967,15 +9018,15 @@ def _run_apply_group_feature_job(job_id: int):
             target_attr = (gf.target_attribute or "").strip()
             gf_value_status = str(gf.value_status or "").strip().lower()
 
-            # An inactive row (discontinued/ignored) is superseded when an active row
-            # exists for the same option (in_progress/review/approved wins).
-            superseded = (
-                gf_value_status in ("discontinued", "ignored")
-                and (fg, sub_feature, option) in active_keys
-            )
+            # Only the status-priority winner for this (feature_group, feature_id,
+            # option) is applied; all other rows for the same key are skipped.
+            superseded = winner_idx_by_key.get((fg, sub_feature, option)) != i
+            is_inactive = gf_value_status in ("discontinued", "ignored")
+            # Active rows need a target attribute to map; discontinued/ignored rows
+            # apply NOT REQUIRED even without one so the sub-feature is fully group-owned.
             item_ids = (
                 items_by_group.get(fg)
-                if (fg and sub_feature and target_attr and not superseded)
+                if (fg and sub_feature and (target_attr or is_inactive) and not superseded)
                 else None
             )
             if item_ids:
@@ -8988,22 +9039,34 @@ def _run_apply_group_feature_job(job_id: int):
                         .filter(models.WorkspaceMapping.legacy_item_id.in_(chunk))
                         .filter(models.WorkspaceMapping.legacy_feature_id == sub_feature)
                         .filter(models.WorkspaceMapping.legacy_value == option)
-                        .filter(models.WorkspaceMapping.mapped_from != "local")
                         .all()
                     )
+                # For an inactive (NOT REQUIRED) winner, keep the feature under a single
+                # target attribute by preferring the feature's sole active attribute;
+                # this avoids a phantom second attribute + MULTIPLE tag in the workspace.
+                effective_attr = target_attr
+                if is_inactive:
+                    feat_active_attrs = active_attrs_by_feature.get((fg, sub_feature)) or set()
+                    if len(feat_active_attrs) == 1:
+                        effective_attr = next(iter(feat_active_attrs))
                 for row in matched_rows:
-                    # Do not apply group targets onto approved items / approved features.
-                    if (
-                        row.legacy_item_id in approved_item_ids
-                        or (row.legacy_item_id, sub_feature) in approved_pairs
-                    ):
-                        continue
-                    row.new_attribute_id = target_attr
-                    if gf_value_status in ("discontinued", "ignored"):
+                    # Only overwrite the attribute when we have one; a discontinued/ignored
+                    # row with no resolvable attribute keeps the existing attr.
+                    if effective_attr:
+                        row.new_attribute_id = effective_attr
+                    row_infeasible = str(row.feasibility or "").strip().lower() == "no"
+                    if is_inactive:
                         row.new_value = "NOT REQUIRED"
                         row.value_status = gf_value_status
+                    elif row_infeasible:
+                        # Feasibility 'No' -> value is not required regardless of the group target.
+                        row.new_value = "NOT REQUIRED"
+                        row.value_status = None
                     else:
                         row.new_value = gf.target_value or ""
+                        # Clear any stale discontinued/NOT-REQUIRED status carried over
+                        # from a prior local row so the active target is shown cleanly.
+                        row.value_status = None
                     row.mapped_from = "group"
                     row.modified_by = "apply_group_feature"
                     row.modified_at = time.time()

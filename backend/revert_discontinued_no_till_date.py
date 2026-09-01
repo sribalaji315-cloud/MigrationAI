@@ -36,15 +36,28 @@ def _trim(value: Optional[str]) -> str:
 def _load_keys(csv_path: Path) -> Set[Key]:
     keys: Set[Key] = set()
     with csv_path.open("r", encoding="utf-8-sig", newline="") as fh:
-        reader = csv.DictReader(fh)
-        headers = {h.strip() for h in (reader.fieldnames or [])}
-        if "Feature" not in headers or "Option" not in headers:
-            raise SystemExit(f"CSV must have 'Feature' and 'Option' headers; got {sorted(headers)}")
-        for row in reader:
-            feature = _trim(row.get("Feature"))
-            option = _trim(row.get("Option"))
-            if feature:
-                keys.add((feature, option))
+        rows = list(csv.reader(fh))
+
+    # Skip any preamble lines until the 'Feature,Option' header row is found.
+    header_idx = None
+    for idx, cells in enumerate(rows):
+        trimmed = [c.strip() for c in cells]
+        if "Feature" in trimmed and "Option" in trimmed:
+            header_idx = idx
+            break
+    if header_idx is None:
+        raise SystemExit("CSV must contain a 'Feature,Option' header row")
+
+    header = [c.strip() for c in rows[header_idx]]
+    feature_col = header.index("Feature")
+    option_col = header.index("Option")
+    for cells in rows[header_idx + 1:]:
+        if feature_col >= len(cells):
+            continue
+        feature = _trim(cells[feature_col])
+        option = _trim(cells[option_col]) if option_col < len(cells) else ""
+        if feature:
+            keys.add((feature, option))
     return keys
 
 

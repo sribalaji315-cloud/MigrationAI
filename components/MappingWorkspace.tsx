@@ -1544,6 +1544,8 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
   const handleUpdateLinkage = (featureId: string, attrId: string) => {
     if (!canEdit) return;
     if (!item) return;
+    // Group-sourced mappings are managed in the Group Features table, not here.
+    if (stagedLocalMappings.some(m => m.legacyFeatureIds.includes(featureId) && m.mappedFrom === 'group')) return;
     isEditingRef.current = true;
     clearApprovalForFeatureLocally(featureId);
 
@@ -1630,6 +1632,8 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
 
   const handleUpdateValue = (featureId: string, legacyVal: string, newVal: string) => {
     if (!canEdit) return;
+    // Group-sourced mappings are managed in the Group Features table, not here.
+    if (stagedLocalMappings.some(m => m.legacyFeatureIds.includes(featureId) && m.mappedFrom === 'group')) return;
     isEditingRef.current = true;
     clearApprovalForFeatureLocally(featureId);
     setStagedLocalMappings(prev => {
@@ -2013,7 +2017,29 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
             const localByFeature: Record<string, any> = {};
             stagedLocalMappings.forEach(m => {
               m.legacyFeatureIds.forEach(fid => {
-                localByFeature[fid] = m;
+                const existing = localByFeature[fid];
+                if (!existing) {
+                  localByFeature[fid] = m;
+                  return;
+                }
+                if (existing.mappedFrom === 'group' && m.mappedFrom !== 'group') {
+                  return;
+                }
+                if (m.mappedFrom !== 'group') {
+                  localByFeature[fid] = m;
+                  return;
+                }
+                if (existing.mappedFrom !== 'group') {
+                  localByFeature[fid] = m;
+                  return;
+                }
+                localByFeature[fid] = {
+                  ...existing,
+                  newAttributeId: existing.newAttributeId || m.newAttributeId || '',
+                  valueMappings: { ...existing.valueMappings, ...m.valueMappings },
+                  valueMeta: { ...existing.valueMeta, ...m.valueMeta },
+                  mappedFrom: 'group',
+                };
               });
             });
 
@@ -2068,7 +2094,25 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
             }
 
             // Always show the dropdown when the item is locked (server handles search)
-            const hasMultipleOptions = globalCandidates.length > 1;
+            // MULTIPLE flag: for group-sourced features, count distinct target
+            // attributes from the group table only (not the global mapping candidates).
+            const groupMappingsForFeature = stagedLocalMappings.filter(
+              m => (m.legacyFeatureIds || []).includes(f.featureId) && m.mappedFrom === 'group'
+            );
+            let multipleCandidates = globalCandidates;
+            if (groupMappingsForFeature.length > 0) {
+              const groupAttrs = new Set<string>();
+              groupMappingsForFeature.forEach(gm => {
+                (gm.newAttributeId || '')
+                  .replace(/\s+/g, '')
+                  .split(';')
+                  .map(a => a.trim())
+                  .filter(a => a && a !== 'UNMAPPED' && a !== 'NOT REQUIRED')
+                  .forEach(a => groupAttrs.add(a));
+              });
+              multipleCandidates = Array.from(groupAttrs);
+            }
+            const hasMultipleOptions = multipleCandidates.length > 1;
 
             // The currently selected attribute is the local override, OR the default global attribute
             let selectedAttribute = localOverride?.newAttributeId || defaultGlobalAttribute;
@@ -2154,6 +2198,8 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
             // and user hasn't confirmed via local override yet. Group-applied rows
             // count as confirmed (rendered green, like a local override).
             const isUserConfirmed = localOverride?.mappedFrom === 'local' || localOverride?.mappedFrom === 'group';
+            // Group-sourced mappings are owned by the Group Features table and are read-only here.
+            const isGroupLocked = localOverride?.mappedFrom === 'group';
             const attributeTone: Tone = selectedAttribute === 'UNMAPPED'
               ? 'unmapped'
               : selectedAttribute === 'NOT REQUIRED'
@@ -2267,7 +2313,7 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
 
                       {/* Target Attribute Selector/Display */}
                       <div className="w-full max-w-xs">
-                        {isLockedByMe ? (
+                        {isLockedByMe && !isGroupLocked ? (
                           <SearchableSelect
                             tone={attributeTone}
                             value={selectedAttribute}
@@ -2377,7 +2423,7 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
 
                             {/* Target value */}
                             <div>
-                              {isReadOnly ? (
+                              {(isReadOnly || isGroupLocked) ? (
                                 <div className={`px-3 py-2 rounded-lg text-[9px] font-black uppercase tracking-tight truncate ${valuePalette.valueReadonly}`}>
                                   {valueTone === 'notRequired' ? 'N/A' : mappedValue || '—'}
                                 </div>
@@ -2387,7 +2433,7 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
                                     tone={valueTone}
                                     value={mappedValue}
                                     options={candidateValuesForAttribute}
-                                    disabled={isReadOnly}
+                                    disabled={isReadOnly || isGroupLocked}
                                     onChange={(newVal) => handleUpdateValue(f.featureId, v, newVal)}
                                   />
                                 </div>
