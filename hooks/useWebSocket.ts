@@ -40,7 +40,15 @@ export function useWebSocket(
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     const httpBase = resolveHttpBase();
     const host = new URL(httpBase).host;
-    const url = `${protocol}//${host}/ws/${encodeURIComponent(clientId)}`;
+    // The backend authenticates the handshake from this token and derives identity from it.
+    let token = '';
+    try {
+      token = window.localStorage.getItem('erp_migrator_token') || '';
+    } catch {
+      token = '';
+    }
+    if (!token) return;
+    const url = `${protocol}//${host}/ws/${encodeURIComponent(clientId)}?token=${encodeURIComponent(token)}`;
 
     const ws = new WebSocket(url);
     wsRef.current = ws;

@@ -1,5 +1,6 @@
-fastapi==0.115.7
+fastapi==0.118.0
+starlette==0.48.0
 uvicorn==0.34.0
 scikit-learn==1.8.0
 joblib==1.4.2
-python-dotenv==1.0.1
+python-dotenv==1.2.2

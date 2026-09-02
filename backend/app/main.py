@@ -12,7 +12,7 @@ from .api.websocket import manager
 from .db.session import engine, Base, SessionLocal
 from .db import models
 from .core.config import settings
-from .core.security import cleanup_expired_blacklist
+from .core.security import cleanup_expired_blacklist, get_user_from_token
 
 # --- Structured logging ---
 logging.basicConfig(
@@ -69,10 +69,30 @@ def root():
     return {"ok": True}
 
 
+@app.get("/health")
+def health():
+    return {"ok": True}
+
+
 @app.websocket("/ws/{client_id}")
 async def websocket_endpoint(websocket: WebSocket, client_id: str):
-    """WebSocket endpoint for real-time collaboration events."""
-    await manager.connect(websocket, client_id)
+    """WebSocket endpoint for real-time collaboration events.
+
+    The access token must be supplied as a ``?token=`` query parameter; the
+    connection identity is derived from the verified token, not the URL path.
+    """
+    token = websocket.query_params.get("token", "")
+    db = SessionLocal()
+    try:
+        user = get_user_from_token(token, db)
+    finally:
+        db.close()
+    if user is None:
+        await websocket.close(code=1008)  # policy violation
+        return
+
+    verified_client_id = f"USR-{user.id}"
+    await manager.connect(websocket, verified_client_id)
     try:
         while True:
             # Keep connection alive; clients can send pings
@@ -81,7 +101,7 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
             if data == "ping":
                 await websocket.send_text("pong")
     except WebSocketDisconnect:
-        await manager.disconnect(client_id)
+        await manager.disconnect(verified_client_id, websocket)
 
 
 @app.on_event("startup")

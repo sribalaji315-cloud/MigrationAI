@@ -9,7 +9,6 @@ class Token(BaseModel):
 class UserCreate(BaseModel):
     username: str
     password: str
-    role: Optional[str] = "user"
 
 class UserOut(BaseModel):
     id: int

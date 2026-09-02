@@ -47,10 +47,11 @@ def register(user_in: UserCreate, request: Request, db: Session = Depends(get_db
     user = db.query(models.User).filter(models.User.username == user_in.username).first()
     if user:
         raise HTTPException(status_code=400, detail="Username already registered")
+    # Role is never taken from the request; new accounts are always plain users.
     user = models.User(
         username=user_in.username, 
         password_hash=get_password_hash(user_in.password), 
-        role=user_in.role,
+        role="user",
         approval_status="pending"
     )
     db.add(user)

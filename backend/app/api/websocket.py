@@ -19,55 +19,83 @@ class ConnectionManager:
     """Manages WebSocket connections and broadcasts events to all connected clients."""
 
     def __init__(self):
-        self._connections: Dict[str, WebSocket] = {}  # keyed by user_id or connection_id
+        # One user may hold several live sockets (multiple tabs/devices).
+        self._connections: Dict[str, Set[WebSocket]] = {}  # keyed by user_id
         self._lock = asyncio.Lock()
 
     async def connect(self, websocket: WebSocket, client_id: str):
         await websocket.accept()
         async with self._lock:
-            self._connections[client_id] = websocket
-        logger.info("ws_connect client=%s total=%d", client_id, len(self._connections))
+            self._connections.setdefault(client_id, set()).add(websocket)
+            total = sum(len(s) for s in self._connections.values())
+        logger.info("ws_connect client=%s total=%d", client_id, total)
 
-    async def disconnect(self, client_id: str):
+    async def disconnect(self, client_id: str, websocket: Optional[WebSocket] = None):
         async with self._lock:
-            self._connections.pop(client_id, None)
-        logger.info("ws_disconnect client=%s total=%d", client_id, len(self._connections))
+            sockets = self._connections.get(client_id)
+            if sockets is not None:
+                if websocket is not None:
+                    sockets.discard(websocket)
+                else:
+                    sockets.clear()
+                if not sockets:
+                    self._connections.pop(client_id, None)
+            total = sum(len(s) for s in self._connections.values())
+        logger.info("ws_disconnect client=%s total=%d", client_id, total)
 
     async def broadcast(self, event_type: str, payload: dict, exclude: Optional[str] = None):
         """Send an event to all connected clients, optionally excluding one."""
         message = json.dumps({"type": event_type, "payload": payload, "ts": time.time()})
         async with self._lock:
-            targets = list(self._connections.items())
+            targets = [
+                (client_id, ws)
+                for client_id, sockets in self._connections.items()
+                for ws in sockets
+            ]
 
-        stale: list[str] = []
+        stale: list[tuple[str, WebSocket]] = []
         for client_id, ws in targets:
             if client_id == exclude:
                 continue
             try:
                 await ws.send_text(message)
             except Exception:
-                stale.append(client_id)
+                stale.append((client_id, ws))
 
         if stale:
             async with self._lock:
-                for cid in stale:
-                    self._connections.pop(cid, None)
+                for cid, ws in stale:
+                    sockets = self._connections.get(cid)
+                    if sockets is not None:
+                        sockets.discard(ws)
+                        if not sockets:
+                            self._connections.pop(cid, None)
 
     async def send_to(self, client_id: str, event_type: str, payload: dict):
-        """Send an event to a specific client."""
+        """Send an event to every socket held by a specific client."""
         async with self._lock:
-            ws = self._connections.get(client_id)
-        if ws:
+            sockets = list(self._connections.get(client_id, set()))
+        if not sockets:
+            return
+        message = json.dumps({"type": event_type, "payload": payload, "ts": time.time()})
+        stale: list[WebSocket] = []
+        for ws in sockets:
             try:
-                message = json.dumps({"type": event_type, "payload": payload, "ts": time.time()})
                 await ws.send_text(message)
             except Exception:
-                async with self._lock:
-                    self._connections.pop(client_id, None)
+                stale.append(ws)
+        if stale:
+            async with self._lock:
+                remaining = self._connections.get(client_id)
+                if remaining is not None:
+                    for ws in stale:
+                        remaining.discard(ws)
+                    if not remaining:
+                        self._connections.pop(client_id, None)
 
     @property
     def active_count(self) -> int:
-        return len(self._connections)
+        return sum(len(s) for s in self._connections.values())
 
 
 # Singleton instance

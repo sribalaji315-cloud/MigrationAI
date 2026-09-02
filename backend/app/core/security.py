@@ -69,6 +69,9 @@ def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(
         jti: str = payload.get("jti")
         if username is None:
             raise credentials_exception
+        # Only access tokens authorise API calls; refresh tokens are rejected here.
+        if payload.get("type") != "access":
+            raise credentials_exception
     except JWTError:
         raise credentials_exception
 
@@ -81,6 +84,35 @@ def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(
     user = db.query(models.User).filter(models.User.username == username).first()
     if user is None:
         raise credentials_exception
+    # A revoked/pending account must lose access immediately, not only at next login.
+    if getattr(user, "approval_status", "approved") != "approved":
+        raise credentials_exception
+    return user
+
+
+def get_user_from_token(token: str, db: Session):
+    """Validate a raw access-token string (e.g. from a WebSocket query param).
+
+    Returns the user when the token is a valid, non-blacklisted access token for
+    an approved account; otherwise None. Never raises.
+    """
+    if not token:
+        return None
+    try:
+        payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[ALGORITHM])
+    except JWTError:
+        return None
+    if payload.get("type") != "access":
+        return None
+    username = payload.get("sub")
+    jti = payload.get("jti")
+    if not username:
+        return None
+    if jti and db.query(models.TokenBlacklist).filter(models.TokenBlacklist.jti == jti).first():
+        return None
+    user = db.query(models.User).filter(models.User.username == username).first()
+    if user is None or getattr(user, "approval_status", "approved") != "approved":
+        return None
     return user
 
 

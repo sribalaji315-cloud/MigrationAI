@@ -12,7 +12,7 @@ from ..core.security import get_current_user
 from .websocket import broadcast_lock_change, broadcast_mapping_update, broadcast_generation_progress, broadcast_sync, broadcast_approval_change
 
 logger = logging.getLogger("erp_migrator")
-router = APIRouter(tags=["state"])
+router = APIRouter(tags=["state"], dependencies=[Depends(get_current_user)])
 
 MAX_SEARCH_LENGTH = 100
 MAX_EXPORT_ROWS = 100_000
@@ -946,8 +946,11 @@ def _run_feature_combination_job(job_id: int):
         # Build included attribute type filter (mirrors footprint generation logic)
         included_type_set = _get_included_type_set(scan_db)
         attr_type_filter_sql = ""
+        attr_type_params: Dict[str, Any] = {}
         if included_type_set:
-            type_placeholders = ",".join(f"'{t}'" for t in included_type_set)
+            # Bind each type as a named parameter; never interpolate user-controlled values.
+            type_placeholders = ",".join(f":mt{i}" for i in range(len(included_type_set)))
+            attr_type_params = {f"mt{i}": t for i, t in enumerate(included_type_set)}
             attr_type_filter_sql = f"AND LOWER(TRIM(attribute_type)) IN ({type_placeholders})"
 
         # -----------------------------------------------------------------
@@ -999,7 +1002,7 @@ def _run_feature_combination_job(job_id: int):
                               AND TRIM(legacy_feature_id) != ''
                               {attr_type_filter_sql}
                             ORDER BY val"""),
-                {"item_id": rep_item_id, "fid": fid},
+                {"item_id": rep_item_id, "fid": fid, **attr_type_params},
             ).fetchall()
             combo_values[(fid, fp)] = sorted(set(r[0] for r in val_rows))
 
@@ -2096,11 +2099,6 @@ def list_consolidation_plans(
             for p in plans
         ]
     }
-
-
-@router.get("/health")
-def health():
-    return {"ok": True}
 
 
 @router.post("/mapping-generation/trigger")
@@ -3752,6 +3750,9 @@ async def sync_state(payload: StateIn, db: Session = Depends(get_db), current_us
             raise HTTPException(status_code=403, detail="Only admins may sync BOM data")
         if "mappings" in incoming and incoming.get("mappings"):
             raise HTTPException(status_code=403, detail="Only admins may sync global mappings")
+        # mappingTypeConfig feeds raw SQL filters; non-admins may still save their
+        # own mappings, so drop the key rather than failing the whole sync.
+        incoming.pop("mappingTypeConfig", None)
 
     # peel off BOM, mappings and localMappings so they are stored in dedicated tables
     bom_payload = incoming.pop("bom", None)
@@ -7590,8 +7591,11 @@ def _run_merge_batch_job(job_id: int):
         # But attribute_footprint only considers included types from config
         included_type_set = _get_included_type_set(db)
         attr_type_filter_sql = ""
+        attr_type_params: Dict[str, Any] = {}
         if included_type_set:
-            type_placeholders = ",".join(f"'{t}'" for t in included_type_set)
+            # Bind each type as a named parameter; never interpolate user-controlled values.
+            type_placeholders = ",".join(f":mt{i}" for i in range(len(included_type_set)))
+            attr_type_params = {f"mt{i}": t for i, t in enumerate(included_type_set)}
             attr_type_filter_sql = f"AND LOWER(TRIM(attribute_type)) IN ({type_placeholders})"
 
         # Step 2: clear existing merged workspace mappings
@@ -7674,7 +7678,8 @@ def _run_merge_batch_job(job_id: int):
                           {attr_type_filter_sql}
                         ORDER BY legacy_item_id, attr_id
                     )
-                    GROUP BY legacy_item_id""")
+                    GROUP BY legacy_item_id"""),
+                attr_type_params,
             ).fetchall()
 
             attr_fp_map: Dict[str, str] = {}
@@ -7702,7 +7707,8 @@ def _run_merge_batch_job(job_id: int):
                           {attr_type_filter_sql}
                         ORDER BY legacy_item_id, attr_id, val
                     )
-                    GROUP BY legacy_item_id, attr_id""")
+                    GROUP BY legacy_item_id, attr_id"""),
+                attr_type_params,
             ).fetchall()
 
             # Build map: (item_id, attr_id) -> hash, also collect flat value list per item
@@ -7728,7 +7734,8 @@ def _run_merge_batch_job(job_id: int):
                           {attr_type_filter_sql}
                         ORDER BY legacy_item_id, feat_id
                     )
-                    GROUP BY legacy_item_id""")
+                    GROUP BY legacy_item_id"""),
+                attr_type_params,
             ).fetchall()
 
             legacy_feat_fp_map: Dict[str, str] = {}
@@ -7755,7 +7762,8 @@ def _run_merge_batch_job(job_id: int):
                           {attr_type_filter_sql}
                         ORDER BY legacy_item_id, feat_id, val
                     )
-                    GROUP BY legacy_item_id, feat_id""")
+                    GROUP BY legacy_item_id, feat_id"""),
+                attr_type_params,
             ).fetchall()
 
             legacy_val_fp_map: Dict[tuple, str] = {}

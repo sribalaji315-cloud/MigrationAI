@@ -8,7 +8,7 @@ from ..db.session import get_db
 from ..schemas import ClassificationCreate, ClassificationOut, ClassAttributeOut
 from ..core.security import get_current_user
 
-router = APIRouter(tags=["classifications"])
+router = APIRouter(tags=["classifications"], dependencies=[Depends(get_current_user)])
 
 
 def _normalize_key(value: str) -> str:

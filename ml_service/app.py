@@ -95,17 +95,21 @@ app.add_middleware(
 )
 
 
-def is_protected_path(path: str) -> bool:
+def is_protected_path(path: str, method: str = "GET") -> bool:
     if path == "/predict":
         return True
     if not path.startswith("/api/"):
         return False
-    return path not in {"/api/local/config", "/api/local/status"}
+    # Reading status/config exposes no secret; only mutating local config
+    # (which rewrites CORS/port in .env) and all other /api/ routes need the key.
+    if path in ("/api/local/status", "/api/local/config") and method.upper() in ("GET", "HEAD", "OPTIONS"):
+        return False
+    return True
 
 
 @app.middleware("http")
 async def require_api_key(request: Request, call_next):
-    if not API_KEY or not is_protected_path(request.url.path):
+    if not API_KEY or not is_protected_path(request.url.path, request.method):
         return await call_next(request)
 
     auth_header = request.headers.get("Authorization", "")
@@ -1178,7 +1182,6 @@ def extract_description_from_prompt(prompt: str) -> str:
 def local_control_panel_payload(request: Request) -> Dict[str, Any]:
     base_url = str(request.base_url).rstrip("/")
     return {
-        "apiKey": API_KEY,
         "allowedOrigin": ALLOWED_ORIGIN,
         "configuredPort": int(str(LOCAL_PORT or ENV_DEFAULTS["LOCAL_PORT"])),
         "currentBaseUrl": base_url,

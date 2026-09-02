@@ -13,7 +13,7 @@ from ..db import models
 from ..db.session import get_db
 from ..schemas import ValueListGroupOut, ValueListRowCreate, ValueListRowOut
 
-router = APIRouter(tags=["valuelists"])
+router = APIRouter(tags=["valuelists"], dependencies=[Depends(get_current_user)])
 
 
 # ---------------------------------------------------------------------------
