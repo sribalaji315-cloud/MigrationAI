@@ -10,7 +10,7 @@ import threading
 import time
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile, status
 from fastapi.responses import Response
 
 from ..core.security import get_current_user
@@ -40,16 +40,19 @@ def _require_admin(current_user: models.User) -> None:
 
 @router.post("/swing-feasibility")
 def import_swing_feasibility(
+    request: Request,
     dry_run: bool = Query(False, alias="dryRun"),
     current_user: models.User = Depends(get_current_user),
 ):
     _require_admin(current_user)
+    request_id = getattr(request.state, "request_id", "")
 
     config_path = _BACKEND_ROOT / "import_config_swing_feasibility.json"
     if not config_path.exists():
+        logger.error("req=%s swing feasibility config missing: %s", request_id, config_path)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Import config not found: {config_path}",
+            detail=f"Import configuration is missing (request {request_id})",
         )
 
     output = io.StringIO()
@@ -58,20 +61,21 @@ def import_swing_feasibility(
         with contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
             run_import(cfg, dry_run=dry_run)
     except SystemExit as exc:
-        message = str(exc) or output.getvalue().strip() or "Swing feasibility import failed"
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=message) from exc
+        logger.warning("req=%s swing feasibility import aborted: %s\n%s", request_id, exc, output.getvalue())
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Swing feasibility import failed (request {request_id})",
+        ) from exc
     except Exception as exc:
-        detail = output.getvalue().strip()
-        if detail:
-            detail = f"{detail}\n{exc}"
-        else:
-            detail = str(exc)
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=detail) from exc
+        logger.exception("req=%s swing feasibility import failed\n%s", request_id, output.getvalue())
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Swing feasibility import failed (request {request_id})",
+        ) from exc
 
     return {
         "ok": True,
         "dryRun": dry_run,
-        "sourceDbPath": cfg.get("source_db_path"),
         "summary": output.getvalue().strip(),
     }
 
@@ -110,6 +114,36 @@ def _save_upload_temp(data: bytes, suffix: str = ".xlsx") -> str:
     fd, path = tempfile.mkstemp(suffix=suffix, prefix="swing_")
     with os.fdopen(fd, "wb") as fh:
         fh.write(data)
+    return path
+
+
+# Cap uploads so a single large file can't exhaust container memory/disk.
+MAX_UPLOAD_BYTES = int(os.environ.get("MAX_UPLOAD_BYTES", str(50 * 1024 * 1024)))
+
+
+async def _stream_upload_to_temp(upload: UploadFile, suffix: str, max_bytes: int = MAX_UPLOAD_BYTES) -> str:
+    """Stream an upload to a temp file in 1 MB chunks, aborting past ``max_bytes``."""
+    fd, path = tempfile.mkstemp(suffix=suffix, prefix="upload_")
+    total = 0
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            while True:
+                chunk = await upload.read(1024 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > max_bytes:
+                    raise HTTPException(
+                        status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                        detail=f"Upload exceeds the {max_bytes} byte limit",
+                    )
+                fh.write(chunk)
+    except Exception:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        raise
     return path
 
 
@@ -182,10 +216,15 @@ async def upload_and_run_swing_expansion(
         _swing_job.update(_new_swing_job())
         _swing_job.update({"status": "queued", "phase": "queued", "dryRun": dry_run})
 
-    item_bytes = await item_file.read()
-    group_bytes = await group_file.read()
-    item_path = _save_upload_temp(item_bytes)
-    group_path = _save_upload_temp(group_bytes)
+    item_path = await _stream_upload_to_temp(item_file, ".xlsx")
+    try:
+        group_path = await _stream_upload_to_temp(group_file, ".xlsx")
+    except Exception:
+        try:
+            os.remove(item_path)
+        except OSError:
+            pass
+        raise
 
     thread = threading.Thread(
         target=_run_swing_job, args=(item_path, group_path, dry_run), daemon=True
@@ -356,8 +395,7 @@ async def upload_and_import_item_features(
         _item_features_job.update(_new_item_features_job())
         _item_features_job.update({"status": "queued", "phase": "queued", "dryRun": dry_run})
 
-    data = await file.read()
-    csv_path = _save_upload_temp(data, suffix=".csv")
+    csv_path = await _stream_upload_to_temp(file, ".csv")
 
     thread = threading.Thread(
         target=_run_item_features_job, args=(csv_path, parsed_mapping, dry_run), daemon=True

@@ -1,4 +1,5 @@
 import { useEffect, useRef, useCallback } from 'react';
+import { dbService } from '../services/dbService';
 
 export interface WsEvent {
   type: 'lock_change' | 'mapping_update' | 'generation_progress' | 'data_sync' | 'approval_change' | 'ml_prediction_progress';
@@ -74,8 +75,12 @@ export function useWebSocket(
 
     ws.onclose = () => {
       clearInterval(pingTimer.current);
-      // Auto-reconnect
-      reconnectTimer.current = setTimeout(connect, RECONNECT_DELAY_MS);
+      // A rejected/expired token is the common cause, so refresh before retrying
+      // (keeps an idle tab from looping forever on a stale token).
+      reconnectTimer.current = setTimeout(async () => {
+        try { await dbService.refreshAccessToken(); } catch { /* best effort */ }
+        connect();
+      }, RECONNECT_DELAY_MS);
     };
 
     ws.onerror = () => {

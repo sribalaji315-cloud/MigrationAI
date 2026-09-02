@@ -9183,7 +9183,7 @@ def list_group_features(
     targetAttribute: Optional[str] = None,
     targetValue: Optional[str] = None,
     sortBy: Optional[str] = None,
-    sortDir: Optional[str] = Query(None, regex="^(asc|desc)$"),
+    sortDir: Optional[str] = Query(None, pattern="^(asc|desc)$"),
     limit: int = Query(100, ge=1, le=5000),
     offset: int = Query(0, ge=0),
     db: Session = Depends(get_db),

@@ -1,0 +1,17 @@
+# Production TLS termination + reverse proxy.
+# Replace app.example.com / api.example.com with your real domains; Caddy
+# provisions and renews Let's Encrypt certificates automatically.
+
+app.example.com {
+	encode gzip
+	# HSTS: force HTTPS for a year, including subdomains.
+	header Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+	reverse_proxy frontend:80
+}
+
+api.example.com {
+	encode gzip
+	header Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+	# WebSocket + REST both handled by the backend.
+	reverse_proxy backend:8000
+}

@@ -1,36 +1,103 @@
 import time
 from collections import defaultdict
 from datetime import timedelta
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Body, Depends, HTTPException, Request, Response, status
 from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy.orm import Session
 from ..db import models
 from ..db.session import get_db
 from ..schemas import UserCreate, Token, UserOut, UserUpdate
 from passlib.context import CryptContext
-from ..core.security import create_access_token, create_refresh_token, get_current_user, oauth2_scheme, blacklist_token, ALGORITHM
+from ..core.security import (
+    create_access_token,
+    create_refresh_token,
+    get_current_user,
+    oauth2_scheme,
+    blacklist_token,
+    ALGORITHM,
+    REFRESH_TOKEN_EXPIRE_DAYS,
+)
 from ..core.config import settings
+
+try:
+    import redis as _redis_lib
+except ImportError:  # redis is optional; falls back to in-process limiting
+    _redis_lib = None
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 router = APIRouter(prefix="/auth", tags=["auth"])
 
-# --- In-memory rate limiter for auth endpoints ---
-_login_attempts: dict = defaultdict(list)  # ip -> [timestamp, ...]
+REFRESH_COOKIE = "refresh_token"
+REFRESH_COOKIE_PATH = "/auth"
+
+# --- Rate limiter for auth endpoints (Redis-backed when configured) ---
+_login_attempts: dict = defaultdict(list)  # key -> [timestamp, ...]
 _RATE_LIMIT_WINDOW = 60  # seconds
 _RATE_LIMIT_MAX = 5  # max attempts per window
+_redis_client = None
 
 
-def _check_rate_limit(request: Request):
-    ip = request.client.host if request.client else "unknown"
+def _get_redis():
+    global _redis_client
+    if not settings.REDIS_URL or _redis_lib is None:
+        return None
+    if _redis_client is None:
+        _redis_client = _redis_lib.from_url(settings.REDIS_URL, decode_responses=True)
+    return _redis_client
+
+
+def _client_ip(request: Request) -> str:
+    if settings.TRUST_PROXY_HEADERS:
+        xff = request.headers.get("x-forwarded-for", "")
+        if xff:
+            return xff.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
+def _check_rate_limit(request: Request, username: str = ""):
+    key = f"{_client_ip(request)}|{(username or '').strip().lower()}"
+    r = _get_redis()
+    if r is not None:
+        redis_key = f"login:{key}"
+        count = r.incr(redis_key)
+        if count == 1:
+            r.expire(redis_key, _RATE_LIMIT_WINDOW)
+        if count > _RATE_LIMIT_MAX:
+            raise HTTPException(
+                status_code=429,
+                detail=f"Too many login attempts. Try again in {_RATE_LIMIT_WINDOW} seconds.",
+            )
+        return
+
     now = time.time()
-    # Prune old entries
-    _login_attempts[ip] = [t for t in _login_attempts[ip] if now - t < _RATE_LIMIT_WINDOW]
-    if len(_login_attempts[ip]) >= _RATE_LIMIT_MAX:
+    bucket = [t for t in _login_attempts[key] if now - t < _RATE_LIMIT_WINDOW]
+    if len(bucket) >= _RATE_LIMIT_MAX:
+        _login_attempts[key] = bucket
         raise HTTPException(
             status_code=429,
-            detail=f"Too many login attempts. Try again in {_RATE_LIMIT_WINDOW} seconds."
+            detail=f"Too many login attempts. Try again in {_RATE_LIMIT_WINDOW} seconds.",
         )
-    _login_attempts[ip].append(now)
+    bucket.append(now)
+    _login_attempts[key] = bucket
+    # Bound memory: drop keys whose window has fully expired.
+    if len(_login_attempts) > 10000:
+        for k in [k for k, v in _login_attempts.items() if not v]:
+            _login_attempts.pop(k, None)
+
+
+def _set_refresh_cookie(response: Response, token: str, request: Request):
+    # Secure only over HTTPS so http/LAN deployments still receive the cookie;
+    # behind a TLS proxy with --proxy-headers the scheme is https and it turns on.
+    secure = settings.COOKIE_SECURE and request.url.scheme == "https"
+    response.set_cookie(
+        key=REFRESH_COOKIE,
+        value=token,
+        httponly=True,
+        secure=secure,
+        samesite=settings.COOKIE_SAMESITE,
+        path=REFRESH_COOKIE_PATH,
+        max_age=REFRESH_TOKEN_EXPIRE_DAYS * 24 * 3600,
+    )
 
 
 def verify_password(plain, hashed):
@@ -43,7 +110,7 @@ def get_password_hash(password):
 
 @router.post("/register", response_model=UserOut)
 def register(user_in: UserCreate, request: Request, db: Session = Depends(get_db)):
-    _check_rate_limit(request)
+    _check_rate_limit(request, user_in.username)
     user = db.query(models.User).filter(models.User.username == user_in.username).first()
     if user:
         raise HTTPException(status_code=400, detail="Username already registered")
@@ -61,8 +128,8 @@ def register(user_in: UserCreate, request: Request, db: Session = Depends(get_db
 
 
 @router.post("/login", response_model=Token)
-def login(request: Request, form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
-    _check_rate_limit(request)
+def login(request: Request, response: Response, form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
+    _check_rate_limit(request, form_data.username)
     user = db.query(models.User).filter(models.User.username == form_data.username).first()
     if not user or not verify_password(form_data.password, user.password_hash):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
@@ -76,19 +143,22 @@ def login(request: Request, form_data: OAuth2PasswordRequestForm = Depends(), db
     access_token_expires = timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
     access_token = create_access_token(data={"sub": user.username}, expires_delta=access_token_expires)
     refresh_token = create_refresh_token(data={"sub": user.username})
-    return {"access_token": access_token, "token_type": "bearer", "refresh_token": refresh_token}
+    # Refresh token is delivered only as an HttpOnly cookie, out of reach of page script.
+    _set_refresh_cookie(response, refresh_token, request)
+    return {"access_token": access_token, "token_type": "bearer"}
 
 
 @router.post("/logout")
-def logout(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
+def logout(response: Response, token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
     blacklist_token(token, db)
+    response.delete_cookie(REFRESH_COOKIE, path=REFRESH_COOKIE_PATH)
     return {"ok": True}
 
 
 @router.post("/refresh")
-def refresh_token(body: dict, db: Session = Depends(get_db)):
-    """Exchange a valid refresh token for a new access + refresh token pair (rotation)."""
-    refresh = body.get("refresh_token")
+def refresh_token(request: Request, response: Response, body: dict = Body(default={}), db: Session = Depends(get_db)):
+    """Exchange a valid refresh token (from the HttpOnly cookie) for a new pair (rotation)."""
+    refresh = request.cookies.get(REFRESH_COOKIE) or (body or {}).get("refresh_token")
     if not refresh:
         raise HTTPException(status_code=400, detail="refresh_token required")
     from jose import jwt, JWTError
@@ -109,10 +179,12 @@ def refresh_token(body: dict, db: Session = Depends(get_db)):
         if blacklisted:
             raise HTTPException(status_code=401, detail="Refresh token already used")
 
-    # Verify user still exists
+    # Verify user still exists and is still approved (revoked accounts cannot rotate).
     user = db.query(models.User).filter(models.User.username == username).first()
     if not user:
         raise HTTPException(status_code=401, detail="User not found")
+    if getattr(user, "approval_status", "approved") != "approved":
+        raise HTTPException(status_code=401, detail="Account is not active")
 
     # Blacklist the old refresh token (rotation — each refresh token is single-use)
     if not blacklist_token(refresh, db):
@@ -123,7 +195,8 @@ def refresh_token(body: dict, db: Session = Depends(get_db)):
     access_token_expires = timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
     new_access = create_access_token(data={"sub": username}, expires_delta=access_token_expires)
     new_refresh = create_refresh_token(data={"sub": username})
-    return {"access_token": new_access, "token_type": "bearer", "refresh_token": new_refresh}
+    _set_refresh_cookie(response, new_refresh, request)
+    return {"access_token": new_access, "token_type": "bearer"}
 
 
 @router.get("/me", response_model=UserOut)

@@ -1,4 +1,4 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 from typing import Any, Dict, Optional, List
 
 class Token(BaseModel):
@@ -9,6 +9,16 @@ class Token(BaseModel):
 class UserCreate(BaseModel):
     username: str
     password: str
+
+    @field_validator("password")
+    @classmethod
+    def _password_policy(cls, v: str) -> str:
+        # bcrypt silently truncates beyond 72 bytes, so cap there and require a real minimum.
+        if len(v) < 8:
+            raise ValueError("Password must be at least 8 characters")
+        if len(v.encode("utf-8")) > 72:
+            raise ValueError("Password must be at most 72 bytes")
+        return v
 
 class UserOut(BaseModel):
     id: int

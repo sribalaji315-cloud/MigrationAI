@@ -60,28 +60,8 @@
       cachedApiKey = "";
     }
 
-    if (cachedApiKey !== "")
-      return Promise.resolve(cachedApiKey);
-
-    return fetch("/api/local/config", { cache: "no-cache" }).then(function (response) {
-      return response.json().catch(function () {
-        return {};
-      }).then(function (payload) {
-        cachedApiKey = String(payload.apiKey || "");
-        try
-        {
-          if (cachedApiKey !== "")
-            window.localStorage.setItem("creoGatewayApiKey", cachedApiKey);
-        }
-        catch (persistError)
-        {
-        }
-        return cachedApiKey;
-      });
-    }).catch(function () {
-      cachedApiKey = "";
-      return cachedApiKey;
-    });
+    // The key is entered once in the local control panel; never fetched from the server.
+    return Promise.resolve(cachedApiKey);
   }
 
   function api(path, options)

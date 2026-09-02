@@ -211,33 +211,31 @@ export const dbService = {
     const resp = await fetch(`${SQL_ENDPOINT}/auth/login`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: body.toString()
+      body: body.toString(),
+      credentials: 'include'
     });
     if (!resp.ok) throw new Error('Login failed');
     const data = await resp.json();
     if (data?.access_token) localStorage.setItem(TOKEN_KEY, data.access_token);
-    if (data?.refresh_token) localStorage.setItem(REFRESH_TOKEN_KEY, data.refresh_token);
+    // Refresh token now lives in an HttpOnly cookie, never in localStorage.
     return data;
   },
 
   async refreshAccessToken(): Promise<boolean> {
     if (this._refreshPromise) return this._refreshPromise;
-    const refreshToken = localStorage.getItem(REFRESH_TOKEN_KEY);
-    if (!refreshToken) return false;
     this._refreshPromise = (async () => {
       try {
         const resp = await fetch(`${SQL_ENDPOINT}/auth/refresh`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ refresh_token: refreshToken }),
+          body: '{}',
+          credentials: 'include'
         });
         if (!resp.ok) {
-          localStorage.removeItem(REFRESH_TOKEN_KEY);
           return false;
         }
         const data = await resp.json();
         if (data?.access_token) localStorage.setItem(TOKEN_KEY, data.access_token);
-        if (data?.refresh_token) localStorage.setItem(REFRESH_TOKEN_KEY, data.refresh_token);
         return true;
       } catch {
         return false;
@@ -757,6 +755,7 @@ export const dbService = {
       await fetch(`${SQL_ENDPOINT}/auth/logout`, {
         method: 'POST',
         headers: this._authHeaders(),
+        credentials: 'include'
       });
     } catch {
       // Best-effort; token removal happens client-side regardless

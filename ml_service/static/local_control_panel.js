@@ -43,9 +43,13 @@
   }
 
   function saveConfig(payload) {
+    var headers = { "Content-Type": "application/json" };
+    var key = getStoredKey();
+    if (key !== "")
+      headers.Authorization = "Bearer " + key;
     return fetch("/api/local/config", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: headers,
       body: JSON.stringify(payload)
     }).then(function (response) {
       return response.json().then(function (data) {
@@ -56,15 +60,30 @@
     });
   }
 
+  function getStoredKey() {
+    try {
+      return String(window.localStorage.getItem("creoGatewayApiKey") || "");
+    } catch (storageError) {
+      return "";
+    }
+  }
+
+  function persistKey(value) {
+    try {
+      window.localStorage.setItem("creoGatewayApiKey", String(value || ""));
+    } catch (storageError) {
+    }
+  }
+
   function applyConfig(config) {
     try {
       window.localStorage.setItem("creoGatewayBaseUrl", config.currentBaseUrl || "");
-      window.localStorage.setItem("creoGatewayApiKey", config.apiKey || "");
     } catch (storageError) {
     }
 
     setValue("gatewayUrlInput", config.currentBaseUrl || "");
-    setValue("apiKeyInput", config.apiKey || "");
+    // Server no longer returns the key; show whatever the operator saved locally.
+    setValue("apiKeyInput", getStoredKey());
     setValue("allowedOriginInput", config.allowedOrigin || "");
     setValue("localPortInput", config.configuredPort || config.currentPort || "8000");
     setText("bridgeClientValue", config.bridgeClient || "Waiting for embedded browser");
@@ -90,7 +109,11 @@
   byId("copyApiKeyBtn").addEventListener("click", function () {
     copyText(byId("apiKeyInput").value, "API key");
   });
+  byId("apiKeyInput").addEventListener("change", function () {
+    persistKey(byId("apiKeyInput").value);
+  });
   byId("saveConfigBtn").addEventListener("click", function () {
+    persistKey(byId("apiKeyInput").value);
     var portValue = parseInt(byId("localPortInput").value, 10);
     saveConfig({
       allowedOrigin: byId("allowedOriginInput").value,

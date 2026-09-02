@@ -81,10 +81,15 @@ API_KEY = ENV_CONFIG.get("API_KEY", "") or os.environ.get("API_KEY", "")
 # ---------------------------------------------------------------------------
 app = FastAPI(title="ML Classification Prediction Service", version="1.0.0")
 
+# Auth is via the X-API-Key/Bearer header, not cookies, so credentials are not
+# needed and the origin list is restricted rather than a wildcard.
+ALLOWED_ORIGIN = os.environ.get("ALLOWED_ORIGIN", "http://localhost:5173,http://localhost:3000")
+allow_origins_list = [o.strip() for o in ALLOWED_ORIGIN.split(",") if o.strip()]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=allow_origins_list,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )

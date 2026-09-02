@@ -1,5 +1,5 @@
-fastapi==0.118.0
-starlette==0.48.0
+fastapi==0.141.1
+starlette==1.6.0
 uvicorn==0.34.0
 websockets==15.0.1
 pandas==3.0.1

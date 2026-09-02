@@ -1,0 +1,46 @@
+name: security
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+jobs:
+  npm-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - run: npm ci
+      - name: npm audit (high+)
+        run: npm audit --audit-level=high
+
+  pip-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install pip-audit
+      # ecdsa PYSEC-2026-1325 has no fix and is off the HS256 signing path.
+      - run: pip-audit -r backend/requirements.txt --ignore-vuln PYSEC-2026-1325
+      - run: pip-audit -r ml_service/requirements.txt --ignore-vuln PYSEC-2026-1325
+      - run: pip-audit -r ml_predict_service/requirements.txt --ignore-vuln PYSEC-2026-1325
+
+  backend-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install -r backend/requirements.txt pytest
+      - name: pytest
+        working-directory: backend
+        env:
+          SECRET_KEY: ci-test-secret-key
+        run: python -m pytest -q

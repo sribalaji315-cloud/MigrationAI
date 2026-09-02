@@ -25,6 +25,14 @@ class Settings(BaseSettings):
     # Comma-separated list of API keys that grant external (read-only) access
     # to the public product-mapping API under /api/v1. Leave empty to disable.
     PUBLIC_API_KEYS: str = ""
+    # Refresh-token cookie hardening. Secure must be True in production (HTTPS);
+    # set false only for local http development.
+    COOKIE_SECURE: bool = True
+    COOKIE_SAMESITE: str = "lax"
+    # Shared rate-limit store. Empty falls back to an in-process limiter.
+    REDIS_URL: str = ""
+    # Trusted comma-separated proxy hops are honoured for client IP via X-Forwarded-For.
+    TRUST_PROXY_HEADERS: bool = False
 
     class Config:
         env_file = ".env"
