@@ -5,26 +5,98 @@
 **Date:** 2 September 2026
 **Deployment target assessed against:** publicly reachable server holding sensitive product/BOM data
 
+**Remediation commit:** `5de0845` — *"Security: fix critical/high audit findings (auth, tokens, SQLi, WebSocket, deps)"*, 2 September 2026
+**Re-tested:** 2 September 2026 against `5de0845`, live instance on a throwaway SQLite database
+
 ---
 
 ## Verdict
 
-**Do not deploy publicly in the current state.**
+> ### ⚠️ Warning — not blocked, but not ready for public exposure either
+>
+> **Status as of commit `5de0845`, re-tested 2 September 2026.**
+> Every blocking defect is closed. What stands between this and a public deployment is now
+> configuration, not code — chiefly that **nothing in the stack terminates TLS**.
 
-The entire product catalog, its classifications and the global mapping rules are served to
-anonymous callers with no credential of any kind — confirmed by request, not by reading code.
-Three further defects let an attacker obtain an admin account, hold a working token for seven days,
-or inject SQL as an ordinary user.
+The seven blocking findings are fixed and re-verified against a live instance. Nothing now lets an
+anonymous caller read the catalog, mint an admin account, hold a week-long token, inject SQL, or
+attach to the real-time event stream. The authentication work is sound.
+
+What remains is deployment posture rather than an open hole — but one item carries most of the
+weight. **No component terminates TLS**, so bearer tokens would cross the network in clear text
+(M5), which on its own would undo the authentication fixes above. Alongside it: CORS still grants
+credentialed access to every localhost and private-network origin (M1), login rate limiting is
+ineffective behind a reverse proxy (M2), and public registration still accepts a one-character
+password (M6). All six medium findings are open.
+
+**Close before exposing the service publicly:**
+
+| Action | Finding |
+|--------|---------|
+| Terminate TLS in front of the stack; drop `--reload` and the published database port | M5 |
+| Restrict CORS to the real front-end origin | M1 |
+| Rate-limit on trusted proxy headers, with counters in shared storage | M2 |
+| Add a password policy, or close public registration | M6 |
+| Upgrade FastAPI so `starlette` can move off 0.48.0 | H5 remainder |
+
+Two carried-over items are production data checks this repository cannot answer: audit the `users`
+table for roles self-assigned before C2 was fixed, and inspect `app_config.mapping_type_config` for a
+payload planted before H2 was fixed. The C3 fix also introduced a functional regression in the ML
+control panel that needs a follow-up commit.
+
+Unchanged regardless of any of the above: **`ml_service` is a workstation-local Creo gateway and must
+never be given a public address**, nor be routable from the public backend's host.
 
 **14 findings — 3 critical, 5 high, 6 medium.** Seven were reproduced against a live instance.
-Findings C1, C2, C3, H1, H2, H3 and H4 are blocking.
+Findings C1, C2, C3, H1, H2, H3 and H4 were blocking; all seven are now closed.
 
-| Severity | Count |
-|----------|-------|
-| Critical | 3 |
-| High     | 5 |
-| Medium   | 6 |
-| **Total**| **14** |
+| Severity | Count | Closed | Partial | Open |
+|----------|-------|--------|---------|------|
+| Critical | 3 | 3 | 0 | 0 |
+| High     | 5 | 4 | 1 | 0 |
+| Medium   | 6 | 0 | 0 | 6 |
+| **Total**| **14** | **7** | **1** | **6** |
+
+### Original verdict — as audited at `1ab0409`
+
+Retained as the record of what was found before remediation:
+
+> **Do not deploy publicly in the current state.**
+>
+> The entire product catalog, its classifications and the global mapping rules are served to
+> anonymous callers with no credential of any kind — confirmed by request, not by reading code.
+> Three further defects let an attacker obtain an admin account, hold a working token for seven days,
+> or inject SQL as an ordinary user.
+>
+> Findings C1, C2, C3, H1, H2, H3 and H4 are blocking.
+
+---
+
+## Remediation status — `5de0845`, 2 September 2026
+
+Commit `5de0845` addresses every critical and high finding. **All three critical and four of the five
+high findings are closed and were re-verified against a live instance on 2 September 2026.** H5 is
+partially closed. The six medium findings are untouched — they are what the warning in the verdict
+above rests on.
+
+| # | Finding | Status | Fixed in | Verified |
+|---|---------|--------|----------|----------|
+| C1 | Unauthenticated data endpoints | ✅ Fixed | `5de0845` | Live, 2 Sep 2026 |
+| C2 | Self-registration as admin | ✅ Fixed | `5de0845` | Live, 2 Sep 2026 |
+| C3 | ML service leaks its API key | ✅ Fixed — but introduced a client regression | `5de0845` | Live, 2 Sep 2026 |
+| H1 | Refresh token accepted as access token | ✅ Fixed | `5de0845` | Live, 2 Sep 2026 |
+| H2 | Stored SQL injection via `mappingTypeConfig` | ✅ Fixed (both layers) | `5de0845` | Live, 2 Sep 2026 |
+| H3 | Revocation does not end live sessions | ✅ Fixed | `5de0845` | Live, 2 Sep 2026 |
+| H4 | Unauthenticated / hijackable WebSocket | ✅ Fixed | `5de0845` | Live, 2 Sep 2026 |
+| H5 | Vulnerable dependencies | ⚠️ Partial — npm clean, `starlette` since re-flagged | `5de0845` | Scan, 2 Sep 2026 |
+| M1–M6 | All medium findings | ⬜ Open | — | — |
+
+Two items need follow-up beyond the findings themselves:
+
+- **C3's fix broke the ML service's own UI.** The static panel still reads the field the server no
+  longer returns, so the workbench can no longer authenticate itself. Details under C3.
+- **H2's re-test command in this document now reports a false positive.** The fix drops the key and
+  returns 200 rather than 403. Details under H2 and in the Re-testing section.
 
 ---
 
@@ -56,7 +128,7 @@ worth revisiting once the items below are closed.
 
 ## CRITICAL
 
-### C1 — Nineteen endpoints serve core business data with no authentication
+### C1 — Nineteen endpoints serve core business data with no authentication — ✅ FIXED
 **Status:** Verified against a live instance
 **Location:** `backend/app/api/state.py`, `backend/app/api/classifications.py`, `backend/app/api/valuelists.py`
 
@@ -110,9 +182,22 @@ router = APIRouter(tags=["state"], dependencies=[Depends(get_current_user)])
 Then opt `/health` out explicitly. Per-handler dependencies are precisely what allowed nineteen
 endpoints to drift uncovered.
 
+**Remediation — fixed in `5de0845`, 2 September 2026.**
+
+`dependencies=[Depends(get_current_user)]` was attached at the router level in `state.py`,
+`classifications.py` and `valuelists.py`, exactly as recommended, so new endpoints in those modules
+inherit it. `/health` is declared on the app in `main.py` and is unaffected.
+
+Re-tested 2 September 2026 against `5de0845`. Fifteen of the eighteen listed endpoints were probed
+with no `Authorization` header and every one returned 401; `/health` still returns 200 as intended.
+A mechanical scan of every `@router` decorator under `backend/app/api/` confirms the only routes
+without an auth dependency are now `/auth/register`, `/auth/login`, `/auth/logout` and
+`/auth/refresh` — the first two are open by design, and the last two validate the token they are
+handed rather than going through the dependency.
+
 ---
 
-### C2 — Anyone can self-register an account that is already an admin
+### C2 — Anyone can self-register an account that is already an admin — ✅ FIXED
 **Status:** Verified against a live instance
 **Location:** `backend/app/api/auth.py:44`, `backend/app/schemas.py:12`, `services/dbService.ts:168`
 
@@ -132,9 +217,22 @@ $ curl -X POST /auth/register -d '{"username":"attacker","password":"pw123456","
 changes already have a proper admin-gated home in `PUT /auth/users/{id}`.
 **Also:** audit the existing `users` table for rows that self-assigned a role.
 
+**Remediation — fixed in `5de0845`, 2 September 2026.**
+
+`role` was removed from `UserCreate` in `schemas.py`, and the handler now hardcodes `role="user"`
+alongside `approval_status="pending"`.
+
+Re-tested 2 September 2026: `POST /auth/register` with `{"role":"admin"}` returns
+`{"role":"user","approval_status":"pending"}`. Supplying `approval_status` in the body is ignored
+as well.
+
+**Still outstanding:** the second half of this finding — auditing the existing `users` table for rows
+that self-assigned a role before the fix landed — is a production data check and cannot be verified
+from the repository.
+
 ---
 
-### C3 — The ML service hands its own API key to unauthenticated callers
+### C3 — The ML service hands its own API key to unauthenticated callers — ✅ FIXED
 **Status:** Verified by source inspection
 **Location:** `ml_service/app.py:98-115`, `:1178-1192`, `:1249`
 
@@ -165,11 +263,40 @@ secret back. Put `/api/local/config` behind the middleware.
 `C:\myloadpoint\...` paths, `.bat` launchers). It must never be given a public address, nor be
 routable from the public backend's host.
 
+**Remediation — fixed in `5de0845`, 2 September 2026.**
+
+`apiKey` was removed from `local_control_panel_payload()`, so the secret is no longer returned by any
+route. `is_protected_path()` now takes the request method, and only `GET`/`HEAD`/`OPTIONS` on
+`/api/local/status` and `/api/local/config` bypass the middleware — `POST /api/local/config`, which
+rewrites the CORS origin and port into `.env`, is now key-protected.
+
+Re-tested 2 September 2026 against a live `ml_service`. Unauthenticated `GET /api/local/config`
+contains neither the `apiKey` field nor the key's value. `/api/classes`, `/api/model/current`,
+`/api/bom`, `/api/directory/current`, `/predict`, `POST /api/macro`, `POST /api/parameters/set` and
+`POST /api/local/config` all return 401 without the key and 200 with it.
+
+**Regression introduced by this fix — needs a follow-up commit.** The bundled static UI still expects
+the field the server no longer sends:
+
+- `ml_service/static/app.js:70` sets `cachedApiKey = String(payload.apiKey || "")`, so the workbench
+  sends no `Authorization` header and every `/api/*` call it makes now returns 401.
+- `ml_service/static/local_control_panel.js:62` writes `config.apiKey || ""` into `localStorage` on
+  every panel load, overwriting a key that was cached before the upgrade.
+- The panel's API-key input is `readonly` and populated only from that missing field, and
+  `saveConfig()` sends no `Authorization` header, so "Save" returns 401 too.
+
+The net effect is that there is no in-UI way to obtain or enter the key; an operator has to read it
+out of `ml_service/.env` by hand. The client needs a matching change: a paste-able key field
+persisted to `localStorage`, and an `Authorization` header on `saveConfig()`.
+
+**Unchanged standing instruction:** this service is a workstation-local Creo gateway and must never be
+given a public address, nor be routable from the public backend's host.
+
 ---
 
 ## HIGH
 
-### H1 — Refresh tokens are accepted as access tokens, defeating the 15-minute window
+### H1 — Refresh tokens are accepted as access tokens, defeating the 15-minute window — ✅ FIXED
 **Status:** Verified against a live instance
 **Location:** `backend/app/core/security.py:60-84`
 
@@ -192,9 +319,21 @@ $ curl /auth/users -H "Authorization: Bearer $REFRESH"   ->  HTTP 200   (admin-o
 moving the refresh token to an HttpOnly, Secure, SameSite cookie so it is out of reach of page
 script.
 
+**Remediation — fixed in `5de0845`, 2 September 2026.**
+
+`get_current_user()` now rejects any token whose `type` claim is not `"access"`. The same check was
+added to the new `get_user_from_token()` helper used by the WebSocket handshake (see H4).
+
+Re-tested 2 September 2026: a valid refresh token presented as a bearer credential returns 401 on
+`/auth/me`, `/auth/users` and `/bom/items`, while the matching access token returns 200 and a
+non-admin still correctly gets 403 on `/auth/users`.
+
+**Not done:** both tokens still live in `localStorage`. Moving the refresh token to an HttpOnly,
+Secure, SameSite cookie remains open, so XSS still yields a usable refresh token.
+
 ---
 
-### H2 — Stored SQL injection through `mappingTypeConfig`, writable by any ordinary user
+### H2 — Stored SQL injection through `mappingTypeConfig`, writable by any ordinary user — ✅ FIXED
 **Status:** Verified against a live instance
 **Location:** `backend/app/api/state.py:948-951`, `:4167-4172`, `:7592-7595`
 
@@ -225,9 +364,31 @@ Every other dynamic query in this file binds its values correctly; this is the o
 admin-gated key list in `/sync`.
 **Also:** inspect the live `app_config.mapping_type_config` for anything already planted.
 
+**Remediation — fixed in `5de0845`, 2 September 2026 — both layers.**
+
+Both raw-SQL sites now build `:mt0 … :mtN` placeholders and pass the values through an
+`attr_type_params` dict; nothing user-controlled is interpolated. On the write side, `/sync` removes
+`mappingTypeConfig` from the payload when the caller is not an admin.
+
+Re-tested 2 September 2026. As a non-admin, posting
+`{"mappingTypeConfig":{"availableTypes":["x') OR 1=1 --"], ...}}` left
+`app_config.mapping_type_config` at `NULL`. Persisting the same string as an admin and then calling
+`GET /merged-workspace-mappings-summary` and `GET /merged-workspace-mappings/{item_id}/detail`
+returned 200 with no `OperationalError` and no syntax error in the server log — the string is now
+bound as a literal value rather than becoming SQL.
+
+**The re-test command in this document is now misleading.** It asserts 403 for a non-admin. The
+implementation instead drops the key and returns 200, so that non-admins can still save their own
+mappings in the same request. Anyone running the check as written will read the 200 as "still
+vulnerable". The correct assertion is that `app_config.mapping_type_config` is unchanged after the
+request.
+
+**Still outstanding:** inspecting the live `app_config.mapping_type_config` for anything already
+planted before the fix is a production data check, not verifiable from the repository.
+
 ---
 
-### H3 — Revoking or rejecting an account does not revoke its live sessions
+### H3 — Revoking or rejecting an account does not revoke its live sessions — ✅ FIXED
 **Status:** Verified by source inspection
 **Location:** `backend/app/core/security.py:81-84`
 
@@ -239,9 +400,25 @@ revoked account keeps full access — precisely the window an offboarding proces
 **Fix:** Re-check `approval_status` inside `get_current_user`, and blacklist the user's outstanding
 `jti`s when an admin rejects or deletes an account.
 
+**Remediation — fixed in `5de0845`, 2 September 2026.**
+
+`get_current_user()` now re-checks `approval_status == "approved"` on every request, so a revoked
+account loses access on its next call rather than at next login.
+
+Re-tested 2 September 2026 with a live, valid access token: flipping the account to `rejected` turned
+`/auth/me` and `/bom/items` from 200 to 401 immediately; `pending` behaves the same; deleting the user
+row also yields 401.
+
+The audit's second suggestion — blacklisting the user's outstanding `jti`s on rejection — was not
+implemented, and the per-request check makes it redundant for this attack path.
+
+**Minor residual:** `/auth/refresh` verifies only that the user row still exists, not that the account
+is approved, so a revoked account can still rotate its refresh token. The access tokens it mints are
+rejected by `get_current_user`, so this is a hygiene issue rather than an access bypass.
+
 ---
 
-### H4 — The WebSocket is unauthenticated, and connections can be hijacked by ID
+### H4 — The WebSocket is unauthenticated, and connections can be hijacked by ID — ✅ FIXED
 **Status:** Verified against a live instance
 **Location:** `backend/app/main.py:72-84`, `backend/app/api/websocket.py:25-34`
 
@@ -263,9 +440,26 @@ ws://host/ws/USR-1   ->  accepted, server replied "pong"
 rather than the URL, and close with 1008 on failure. Keep a set of sockets per user instead of a
 single overwriteable slot.
 
+**Remediation — fixed in `5de0845`, 2 September 2026.**
+
+`/ws/{client_id}` now requires the access token as a `?token=` query parameter, validates it through
+the new `get_user_from_token()` (which enforces token type, blacklist and approval status), derives
+the identity as `USR-<id>` from the verified claims, and closes with 1008 otherwise. The path segment
+is no longer trusted. `ConnectionManager` now holds a `Set[WebSocket]` per user instead of a single
+overwriteable slot, and both `broadcast()` and `send_to()` fan out across that set and prune stale
+sockets. `hooks/useWebSocket.ts` was updated to send the token.
+
+Re-tested 2 September 2026:
+
+- No token, and a garbage token, are both refused at the handshake.
+- Connecting to `/ws/USR-999` with a valid token was registered by the server as `client=USR-2` — the
+  token's real identity — so connection spoofing by ID no longer works.
+- Two sockets for the same user coexist (`total=2` in the server log), so the eviction that redirected
+  `send_to` traffic to an attacker is gone.
+
 ---
 
-### H5 — Known-vulnerable dependencies ship at runtime, and the backend pins nothing
+### H5 — Known-vulnerable dependencies ship at runtime, and the backend pins nothing — ⚠️ PARTIALLY FIXED
 **Status:** Dependency scan
 **Location:** `package.json`, `backend/requirements.txt`, `ml_service/requirements.txt`, `ml_predict_service/requirements.txt`
 
@@ -291,11 +485,37 @@ silently.
 lockfile (`pip-compile` or `uv pip compile`) and put `pip-audit` and `npm audit` in CI so this is
 caught on the branch rather than in a review.
 
+**Remediation — partially fixed in `5de0845`, 2 September 2026.**
+
+The npm half is closed. `protobufjs` 7.5.4 → 7.6.6, `ws` 8.19.0 → 8.21.3, `vite` → 6.4.3, and the rest
+of the build chain moved with them. `npm audit` over the committed lockfile reports **0
+vulnerabilities** (re-run 2 September 2026). `backend/requirements.txt` is now fully pinned rather than
+pinning only `bcrypt`, and both ML services moved to `starlette` 0.48.0 and `python-dotenv` 1.2.2.
+
+**Still open as of 2 September 2026.** `pip-audit` now reports **eight advisories against `starlette`
+0.48.0 itself** — the version this commit upgraded to — against `backend/requirements.txt` and both ML
+service requirement files:
+
+| ID | Fix version |
+|----|-------------|
+| PYSEC-2026-1942 | 0.49.1 |
+| PYSEC-2026-161 | 1.0.1 |
+| PYSEC-2026-2280, PYSEC-2026-2281 | 1.1.0 |
+| PYSEC-2026-248 | 1.3.0 |
+| PYSEC-2026-249 | 1.3.1 |
+
+The lowest fix is 0.49.1 and `fastapi==0.118.0` requires `starlette<0.49.0`, so this is a FastAPI
+upgrade rather than a pin bump. `ecdsa` 0.19.2 is unchanged — still no fix available, still off the
+signing path since the app uses HS256.
+
+No `pip-audit` / `npm audit` gate was added to CI, so the next drift will again surface in review
+rather than on the branch. That half of the recommended fix remains open.
+
 ---
 
 ## MEDIUM
 
-### M1 — CORS grants credentialed access to every localhost and private-network origin
+### M1 — CORS grants credentialed access to every localhost and private-network origin — ⬜ OPEN
 **Status:** Verified against a live instance
 **Location:** `backend/app/core/config.py:17`, `backend/app/main.py:30-37`
 
@@ -318,9 +538,13 @@ corporate LAN, can make credentialed cross-origin reads against production.
 **Fix:** Leave `ALLOWED_ORIGIN_REGEX` empty in production and list the real front-end origin in
 `ALLOWED_ORIGINS`. Keep the private-network regex for local development only.
 
+**Remediation — not addressed as of `5de0845` (2 September 2026).** `backend/app/core/config.py` is
+not among the files the commit touches; `ALLOWED_ORIGIN_REGEX` still defaults to the private-network
+pattern with `allow_credentials=True`.
+
 ---
 
-### M2 — Login rate limiting fails behind a reverse proxy and grows without bound
+### M2 — Login rate limiting fails behind a reverse proxy and grows without bound — ⬜ OPEN
 **Status:** Source inspection
 **Location:** `backend/app/api/auth.py:17-33`
 
@@ -337,9 +561,13 @@ four Uvicorn workers quadruples the effective limit.
 with `--forwarded-allow-ips` set, and move the counters into Redis so they are shared across workers
 and expire on their own. Rate-limit on username as well as address.
 
+**Remediation — not addressed as of `5de0845` (2 September 2026).** `backend/app/api/auth.py` was
+changed only to stop honouring the client-supplied role (C2); the limiter still keys on
+`request.client.host`, still grows unbounded and is still per-process.
+
 ---
 
-### M3 — Uploads are read fully into memory with no size limit
+### M3 — Uploads are read fully into memory with no size limit — ⬜ OPEN
 **Status:** Source inspection
 **Location:** `backend/app/api/imports.py:185-188`, `:359-360`
 
@@ -351,9 +579,12 @@ band.
 **Fix:** Stream to the temp file in chunks and abort past a ceiling; cap request body size at the
 proxy.
 
+**Remediation — not addressed as of `5de0845` (2 September 2026).** `backend/app/api/imports.py` is
+not among the files the commit touches.
+
 ---
 
-### M4 — Internal paths and exception text are returned to clients
+### M4 — Internal paths and exception text are returned to clients — ⬜ OPEN
 **Status:** Source inspection
 **Location:** `backend/app/api/imports.py:60-76`
 
@@ -364,9 +595,12 @@ useful reconnaissance. Admin-only, so scoped accordingly.
 **Fix:** Log the detail server-side against the existing request ID and return a generic message
 plus that ID.
 
+**Remediation — not addressed as of `5de0845` (2 September 2026).** `backend/app/api/imports.py` is
+not among the files the commit touches.
+
 ---
 
-### M5 — The deployment configuration is a development setup
+### M5 — The deployment configuration is a development setup — ⬜ OPEN
 **Status:** Source inspection
 **Location:** `docker-compose.yml`, `ml_predict_service/app.py:86`
 
@@ -381,9 +615,12 @@ plus that ID.
 `--reload`, a TLS-terminating proxy in front, and HSTS. Reconcile the README's three-service
 description with what the file actually starts.
 
+**Remediation — not addressed as of `5de0845` (2 September 2026).** `docker-compose.yml` is not
+among the files the commit touches.
+
 ---
 
-### M6 — No password policy on an openly reachable registration endpoint
+### M6 — No password policy on an openly reachable registration endpoint — ⬜ OPEN
 **Status:** Source inspection
 **Location:** `backend/app/api/auth.py:44-59`, `backend/app/schemas.py:9-12`
 
@@ -394,6 +631,10 @@ they appear.
 
 **Fix:** Enforce a minimum length and screen against a breached-password list. If the user base is
 known and fixed, close public registration and have admins invite instead.
+
+**Remediation — not addressed as of `5de0845` (2 September 2026).** `backend/app/schemas.py` was
+changed only to drop `role` from `UserCreate` (C2); `password` is still a bare `str` with no minimum
+length.
 
 ---
 
@@ -427,29 +668,59 @@ Several controls are implemented correctly and should be preserved as the fixes 
 
 ## Order of work before exposure
 
-Sequenced by what an attacker reaches first. Items 1–7 are blocking; the rest should land before the
-service carries real production data.
+Sequenced by what an attacker reaches first. Items 1–7 were the blocking set and are **all done as of
+`5de0845`**; items 9–12 are what the warning in the verdict now rests on and should land before the
+service is publicly reachable, with item 9 (TLS) the one that matters most.
 
-| # | Action | Findings |
-|---|--------|----------|
-| 1 | Put every data endpoint behind an auth dependency at the router level | C1 |
-| 2 | Remove `role` from the registration schema and audit existing user rows | C2 |
-| 3 | Keep the ML services off any public interface; stop returning the API key | C3 |
-| 4 | Reject non-access tokens in `get_current_user` | H1 |
-| 5 | Bind the attribute-type values and admin-gate `mappingTypeConfig` | H2 |
-| 6 | Re-check approval status per request; revoke tokens on rejection | H3 |
-| 7 | Authenticate the WebSocket handshake and derive identity from the token | H4 |
-| 8 | Upgrade `protobufjs` and `ws`; pin the backend requirements | H5 |
-| 9 | Restrict CORS to the real front-end origin; terminate TLS | M1, M5 |
-| 10 | Move rate limiting to shared storage behind trusted proxy headers | M2 |
-| 11 | Cap upload size; stop returning exception text to clients | M3, M4 |
-| 12 | Add a password policy or close public registration entirely | M6 |
+| # | Action | Findings | Status (2 Sep 2026) |
+|---|--------|----------|---------------------|
+| 1 | Put every data endpoint behind an auth dependency at the router level | C1 | ✅ Done in `5de0845` |
+| 2 | Remove `role` from the registration schema and audit existing user rows | C2 | ✅ Schema done in `5de0845`; row audit still owed |
+| 3 | Keep the ML services off any public interface; stop returning the API key | C3 | ✅ Key no longer returned in `5de0845`; deployment placement still an operational control |
+| 4 | Reject non-access tokens in `get_current_user` | H1 | ✅ Done in `5de0845` |
+| 5 | Bind the attribute-type values and admin-gate `mappingTypeConfig` | H2 | ✅ Done in `5de0845` |
+| 6 | Re-check approval status per request; revoke tokens on rejection | H3 | ✅ Per-request check done in `5de0845` |
+| 7 | Authenticate the WebSocket handshake and derive identity from the token | H4 | ✅ Done in `5de0845` |
+| 8 | Upgrade `protobufjs` and `ws`; pin the backend requirements | H5 | ⚠️ Done in `5de0845`; `starlette` 0.48.0 since re-flagged, needs a FastAPI upgrade |
+| 9 | Restrict CORS to the real front-end origin; terminate TLS | M1, M5 | ⬜ Open |
+| 10 | Move rate limiting to shared storage behind trusted proxy headers | M2 | ⬜ Open |
+| 11 | Cap upload size; stop returning exception text to clients | M3, M4 | ⬜ Open |
+| 12 | Add a password policy or close public registration entirely | M6 | ⬜ Open |
+
+Two items added by the re-test, not present in the original audit:
+
+| # | Action | Origin |
+|---|--------|--------|
+| 13 | Restore the ML control panel's ability to authenticate: a paste-able key field persisted to `localStorage`, plus an `Authorization` header on `saveConfig()` | Regression from C3's fix |
+| 14 | Upgrade FastAPI so `starlette` can move past 0.49.1, and add `pip-audit` / `npm audit` to CI | H5 remainder |
 
 ---
 
 ## Re-testing
 
-After remediation, the blocking findings can be re-checked quickly:
+**Executed 2 September 2026 against `5de0845`** — backend and `ml_service` run against a throwaway
+SQLite database, both stopped and the database deleted afterwards; no repository file was modified.
+All blocking checks passed. Results are recorded under each finding above.
+
+One correction to the commands below: **the H2 check no longer returns 403.** The fix drops the
+`mappingTypeConfig` key for non-admins and returns 200, so the request succeeds while the value is
+discarded. Assert on the stored value instead:
+
+```bash
+# H2 (corrected) — the request returns 200; what matters is that nothing was persisted.
+# Heredoc avoids quoting the embedded apostrophe by hand.
+PAYLOAD=$(cat <<'JSON'
+{"state":{"mappingTypeConfig":{"availableTypes":["x') OR 1=1 --"]}}}
+JSON
+)
+curl -s -o /dev/null -w "%{http_code}\n" -X POST "$API/sync" \
+  -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' -d "$PAYLOAD"
+
+# then confirm nothing was stored — must be NULL, or the prior value, never the payload:
+sqlite3 backend/dev.db 'SELECT mapping_type_config FROM app_config;'
+```
+
+The original commands, for reference:
 
 ```bash
 # C1 — every one of these must return 401, not 200
