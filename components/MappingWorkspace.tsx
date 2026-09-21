@@ -526,15 +526,18 @@ const ValueSelector = ({
   disabled,
   onChange,
   tone = 'mapped',
+  attributeId,
 }: {
   value: string;
   options: string[];
   disabled?: boolean;
   onChange: (val: string) => void;
   tone?: Tone;
+  attributeId?: string;
 }) => {
   const [isOpen, setIsOpen] = useState(false);
   const [search, setSearch] = useState('');
+  const [remoteOptions, setRemoteOptions] = useState<string[]>([]);
   const wrapperRef = useRef<HTMLDivElement | null>(null);
   const palette = toneTheme[tone];
 
@@ -548,12 +551,33 @@ const ValueSelector = ({
     return () => document.removeEventListener('mousedown', handleClickOutside);
   }, []);
 
+  // The pre-fetched option list is capped by the backend (alphabetical slice),
+  // so values late in the alphabet can be missing. Query the backend as the user
+  // types so every allowed value for the attribute stays findable.
+  useEffect(() => {
+    if (!isOpen || !attributeId) return;
+    const term = search.trim();
+    if (!term) { setRemoteOptions([]); return; }
+    let cancelled = false;
+    const handle = setTimeout(() => {
+      dbService.fetchGroupFeatureAttributeValues(attributeId, term, 50)
+        .then(result => {
+          if (cancelled) return;
+          setRemoteOptions((result.items || []).map(i => i.value).filter(Boolean));
+        })
+        .catch(() => { if (!cancelled) setRemoteOptions([]); });
+    }, 250);
+    return () => { cancelled = true; clearTimeout(handle); };
+  }, [search, isOpen, attributeId]);
+
   const filteredOptions = useMemo(() => {
     const q = search.toLowerCase();
-    return options
+    const merged = [...options];
+    remoteOptions.forEach(v => { if (!merged.includes(v)) merged.push(v); });
+    return merged
       .filter(opt => opt.toLowerCase().includes(q))
       .slice(0, 20);
-  }, [options, search]);
+  }, [options, remoteOptions, search]);
 
   return (
     <div ref={wrapperRef} className="relative">
@@ -2433,6 +2457,7 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
                                     tone={valueTone}
                                     value={mappedValue}
                                     options={candidateValuesForAttribute}
+                                    attributeId={!usingClassScope && selectedAttribute && selectedAttribute !== 'UNMAPPED' && selectedAttribute !== 'NOT REQUIRED' ? selectedAttribute : undefined}
                                     disabled={isReadOnly || isGroupLocked}
                                     onChange={(newVal) => handleUpdateValue(f.featureId, v, newVal)}
                                   />
@@ -2637,6 +2662,7 @@ const MappingWorkspace: React.FC<MappingWorkspaceProps> = ({
                                       const withNotRequired = base.includes('NOT REQUIRED') ? base : [...base, 'NOT REQUIRED'];
                                       return withNotRequired;
                                     })()}
+                                    attributeId={!(useNewClassTargetMapping && attr.allowedValues && attr.allowedValues.length > 0) && attr.attributeId && attr.attributeId !== 'UNMAPPED' && attr.attributeId !== 'NOT REQUIRED' ? attr.attributeId : undefined}
                                     disabled={isReadOnly}
                                     onChange={(val) => handleManualInputChange(manualKey, val)}
                                   />

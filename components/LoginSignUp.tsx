@@ -119,6 +119,7 @@ const LoginSignUp: React.FC<LoginSignUpProps> = ({ onLogin }) => {
             <input
               type="password"
               required
+              minLength={isLogin ? undefined : 8}
               value={password}
               onChange={(e) => setPassword(e.target.value)}
               className="w-full px-5 py-4 bg-slate-50 border border-slate-200 rounded-2xl focus:outline-none focus:ring-4 focus:ring-blue-500/10 focus:border-blue-500 text-sm font-bold transition-all"

@@ -173,7 +173,16 @@ export const dbService = {
     });
     if (!resp.ok) {
       const errorText = await resp.text();
-      throw new Error(JSON.parse(errorText)?.detail || 'Registration failed');
+      let detail = 'Registration failed';
+      try {
+        const parsed = JSON.parse(errorText);
+        detail = Array.isArray(parsed?.detail)
+          ? parsed.detail.map((item: any) => item?.msg).filter(Boolean).join(', ')
+          : parsed?.detail || detail;
+      } catch {
+        if (errorText.trim()) detail = errorText.trim();
+      }
+      throw new Error(detail);
     }
     return resp.json();
   },
