@@ -31,11 +31,16 @@ from pydantic import BaseModel
 SERVICE_DIR = Path(__file__).resolve().parent
 ENV_PATH = SERVICE_DIR / ".env"
 
-# Shared model artifacts live in the sibling ml_service directory
+# Shared model artifacts normally live in the sibling ml_service directory; in a
+# container they are mounted elsewhere, so both locations are overridable.
 ML_SERVICE_DIR = SERVICE_DIR.parent / "ml_service"
-MODEL_PATH = ML_SERVICE_DIR / "model" / "model.joblib"
-METADATA_PATH = ML_SERVICE_DIR / "model" / "metadata.json"
-TRAINING_DATA_PATH = ML_SERVICE_DIR / "training_data_template.csv"
+MODEL_DIR = Path(os.environ.get("ML_MODEL_DIR") or ML_SERVICE_DIR / "model")
+MODEL_PATH = MODEL_DIR / "model.joblib"
+METADATA_PATH = MODEL_DIR / "metadata.json"
+TRAINING_DATA_PATH = Path(
+    os.environ.get("ML_TRAINING_DATA_PATH")
+    or ML_SERVICE_DIR / "training_data_template.csv"
+)
 
 # ---------------------------------------------------------------------------
 # .env helpers (auto-generate API_KEY on first run)
@@ -72,9 +77,12 @@ def ensure_env_file() -> Dict[str, str]:
     return values
 
 
-ENV_CONFIG = ensure_env_file()
-load_dotenv(ENV_PATH)
-API_KEY = ENV_CONFIG.get("API_KEY", "") or os.environ.get("API_KEY", "")
+# An API_KEY supplied by the environment wins, so a container never writes a
+# randomly generated key that the backend would not know about.
+API_KEY = os.environ.get("API_KEY", "").strip()
+if not API_KEY:
+    API_KEY = ensure_env_file().get("API_KEY", "")
+    load_dotenv(ENV_PATH)
 
 # ---------------------------------------------------------------------------
 # FastAPI app

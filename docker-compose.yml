@@ -1,7 +1,30 @@
+# Development stack: backend + Redis + the ML prediction service.
+#
+# The Vite dev server (npm run dev on :5173) and ml_service -- the Creo gateway,
+# which needs a Windows host and a local Creo install -- stay outside Docker.
 version: '3.8'
 services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+  ml-predict:
+    build: ./ml_predict_service
+    environment:
+      API_KEY: ${ML_SERVICE_API_KEY:?set ML_SERVICE_API_KEY}
+      ALLOWED_ORIGIN: ${ALLOWED_ORIGINS:-http://localhost:5173}
+    volumes:
+      - ./ml_service/model:/models:ro
+      - ./ml_service/training_data_template.csv:/data/training_data_template.csv:ro
+    ports:
+      - "8014:8000"
+
   backend:
     build: ./backend
+    depends_on:
+      - redis
+      - ml-predict
     env_file: .env
     environment:
       # Four slashes: sqlite:/// + the absolute container path of the db file.
@@ -9,6 +32,9 @@ services:
       SECRET_KEY: ${SECRET_KEY}
       ACCESS_TOKEN_EXPIRE_MINUTES: '15'
       ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-http://localhost:5173}
+      REDIS_URL: redis://redis:6379/0
+      ML_SERVICE_URL: http://ml-predict:8000
+      ML_SERVICE_API_KEY: ${ML_SERVICE_API_KEY:?set ML_SERVICE_API_KEY}
       ADMIN_EMAIL: ${ADMIN_EMAIL:-}
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
     volumes:

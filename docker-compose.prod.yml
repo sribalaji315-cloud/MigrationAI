@@ -6,8 +6,12 @@
 #
 # The database is SQLite, stored on the db_data volume at /app/data/app.db.
 #
+# ml_service (the Creo gateway) is deliberately absent: it needs a Windows host
+# with Creo installed and must never be reachable from the internet. Only the
+# inference-only ml_predict_service is containerised, on the internal network.
+#
 # Required env (e.g. in a root .env, never committed):
-#   SECRET_KEY, ADMIN_EMAIL, ADMIN_PASSWORD,
+#   SECRET_KEY, ADMIN_EMAIL, ADMIN_PASSWORD, ML_SERVICE_API_KEY,
 #   PUBLIC_APP_ORIGIN (e.g. https://app.example.com), PUBLIC_API_ORIGIN
 version: '3.8'
 services:
@@ -15,10 +19,25 @@ services:
     image: redis:7-alpine
     restart: unless-stopped
 
+  ml-predict:
+    build: ./ml_predict_service
+    environment:
+      API_KEY: ${ML_SERVICE_API_KEY:?set ML_SERVICE_API_KEY}
+      ALLOWED_ORIGIN: ${PUBLIC_APP_ORIGIN:?set PUBLIC_APP_ORIGIN}
+    volumes:
+      - ./ml_service/model:/models:ro
+      - ./ml_service/training_data_template.csv:/data/training_data_template.csv:ro
+    # Reachable only from the backend; never published through the proxy.
+    expose:
+      - "8000"
+    restart: unless-stopped
+
   backend:
     build: ./backend
     depends_on:
       redis:
+        condition: service_started
+      ml-predict:
         condition: service_started
     environment:
       # Four slashes: sqlite:/// + the absolute container path of the db file.
@@ -31,6 +50,8 @@ services:
       COOKIE_SAMESITE: 'lax'
       TRUST_PROXY_HEADERS: 'true'
       REDIS_URL: redis://redis:6379/0
+      ML_SERVICE_URL: http://ml-predict:8000
+      ML_SERVICE_API_KEY: ${ML_SERVICE_API_KEY:?set ML_SERVICE_API_KEY}
       ADMIN_EMAIL: ${ADMIN_EMAIL:-}
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
     # No --reload; trust the proxy's forwarded client IP for rate limiting.
@@ -50,6 +71,7 @@ services:
       dockerfile: Dockerfile.frontend
       args:
         VITE_SQL_API_ENDPOINT: ${PUBLIC_API_ORIGIN:?set PUBLIC_API_ORIGIN}
+        VITE_USE_NEW_CLASS_TARGET_MAPPING: ${VITE_USE_NEW_CLASS_TARGET_MAPPING:-false}
     expose:
       - "80"
     restart: unless-stopped
