@@ -1,8 +1,12 @@
 # Production stack. Differs from docker-compose.yml (development) in that:
 #  - the backend runs without --reload and honours proxy headers
 #  - credentials come from the environment with no insecure defaults
-#  - Caddy terminates TLS in front of everything (HSTS enabled)
 #  - Redis backs the login rate limiter across workers
+#
+# TLS and routing are handled by the nginx already running on the host, not by
+# a container. The backend and frontend are published on loopback only, so the
+# host proxy can reach them but the internet cannot: see
+# deploy/nginx-host.conf.example for the two server blocks this stack needs.
 #
 # The database is SQLite, stored on the db_data volume at /app/data/app.db.
 #
@@ -61,8 +65,11 @@ services:
              --proxy-headers --forwarded-allow-ips='*'"
     volumes:
       - db_data:/app/data
-    expose:
-      - "8000"
+    # Loopback only -- the host nginx proxies to this. A bare "8001:8000" would
+    # publish the API to the internet through Docker's own iptables chain and
+    # let clients spoof X-Forwarded-For past the login rate limiter.
+    ports:
+      - "127.0.0.1:8001:8000"
     restart: unless-stopped
 
   frontend:
@@ -72,25 +79,10 @@ services:
       args:
         VITE_SQL_API_ENDPOINT: ${PUBLIC_API_ORIGIN:?set PUBLIC_API_ORIGIN}
         VITE_USE_NEW_CLASS_TARGET_MAPPING: ${VITE_USE_NEW_CLASS_TARGET_MAPPING:-false}
-    expose:
-      - "80"
-    restart: unless-stopped
-
-  proxy:
-    image: caddy:2-alpine
-    depends_on:
-      - backend
-      - frontend
+    # Static bundle served by the container's nginx; the host nginx proxies here.
     ports:
-      - "80:80"
-      - "443:443"
-    volumes:
-      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
-      - caddy_data:/data
-      - caddy_config:/config
+      - "127.0.0.1:8081:80"
     restart: unless-stopped
 
 volumes:
   db_data:
-  caddy_data:
-  caddy_config:
