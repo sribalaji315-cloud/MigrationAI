@@ -1,0 +1,38 @@
+# Build context for Dockerfile.frontend (context = repo root).
+# Only the SPA sources are needed; everything else just inflates the context
+# and the builder's temp space.
+
+.git
+.gitignore
+.github
+node_modules
+dist
+dist-ssr
+
+# Secrets and local state must never enter a build context.
+.env
+.env.*
+!.env.example
+.pids
+seed
+*.db
+*.db-shm
+*.db-wal
+
+# Python side of the repo: not part of the SPA build.
+.venv
+backend
+ml_service
+ml_predict_service
+**/__pycache__
+*.pyc
+
+# Docs, deploy config and data files.
+docs
+deploy
+*.md
+Class.csv
+docker-compose*.yml
+Dockerfile*
+start-app.ps1
+restart-services.sh
