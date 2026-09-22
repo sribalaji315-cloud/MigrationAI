@@ -1,30 +1,16 @@
 # Production stack. Differs from docker-compose.yml (development) in that:
-#  - the database port is NOT published to the host
-#  - credentials come from the environment with no insecure defaults
 #  - the backend runs without --reload and honours proxy headers
+#  - credentials come from the environment with no insecure defaults
 #  - Caddy terminates TLS in front of everything (HSTS enabled)
 #  - Redis backs the login rate limiter across workers
 #
+# The database is SQLite, stored on the db_data volume at /app/data/app.db.
+#
 # Required env (e.g. in a root .env, never committed):
-#   POSTGRES_USER, POSTGRES_PASSWORD, POSTGRES_DB, SECRET_KEY,
-#   ADMIN_EMAIL, ADMIN_PASSWORD, PUBLIC_APP_ORIGIN (e.g. https://app.example.com)
+#   SECRET_KEY, ADMIN_EMAIL, ADMIN_PASSWORD,
+#   PUBLIC_APP_ORIGIN (e.g. https://app.example.com), PUBLIC_API_ORIGIN
 version: '3.8'
 services:
-  db:
-    image: postgres:15
-    environment:
-      POSTGRES_USER: ${POSTGRES_USER:?set POSTGRES_USER}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
-      POSTGRES_DB: ${POSTGRES_DB:?set POSTGRES_DB}
-    volumes:
-      - db_data:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
-      interval: 5s
-      timeout: 5s
-      retries: 5
-    restart: unless-stopped
-
   redis:
     image: redis:7-alpine
     restart: unless-stopped
@@ -32,12 +18,11 @@ services:
   backend:
     build: ./backend
     depends_on:
-      db:
-        condition: service_healthy
       redis:
         condition: service_started
     environment:
-      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+      # Four slashes: sqlite:/// + the absolute container path of the db file.
+      DATABASE_URL: sqlite:////app/data/app.db
       SECRET_KEY: ${SECRET_KEY:?set SECRET_KEY}
       ACCESS_TOKEN_EXPIRE_MINUTES: '15'
       ALLOWED_ORIGINS: ${PUBLIC_APP_ORIGIN:?set PUBLIC_APP_ORIGIN}
@@ -53,6 +38,8 @@ services:
       sh -c "alembic upgrade head &&
              uvicorn app.main:app --host 0.0.0.0 --port 8000
              --proxy-headers --forwarded-allow-ips='*'"
+    volumes:
+      - db_data:/app/data
     expose:
       - "8000"
     restart: unless-stopped

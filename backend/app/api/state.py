@@ -1,7 +1,7 @@
 from fastapi import APIRouter, BackgroundTasks, Body, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session, selectinload
-from sqlalchemy import func, or_, cast, case, String, literal_column, text as sa_text, tuple_
+from sqlalchemy import func, or_, cast, case, String, literal_column, text as sa_text
 from sqlalchemy.exc import IntegrityError, OperationalError
 from typing import Dict, List, Any, Optional, Set, Tuple
 import io, csv, re, time, hashlib, asyncio, logging, json
@@ -522,20 +522,29 @@ def _run_mapping_generation_job(job_id: int):
         approved_item_ids, approved_pairs = _load_approved_protection(db)
         # Group-applied rows are preserved like local overrides (managed by the
         # apply-group-features job, not global regeneration).
-        _del_q = db.query(models.WorkspaceMapping).filter(
-            models.WorkspaceMapping.mapped_from.notin_(["local", "group"])
+        # Approved rows are excluded via correlated EXISTS subqueries; inlining the
+        # approved id/pair sets as bind parameters blows past SQLite's variable limit.
+        _approved_item_exists = (
+            db.query(models.BomItem.id)
+            .filter(
+                models.BomItem.approved_for_migration == 1,
+                models.BomItem.item_id == models.WorkspaceMapping.legacy_item_id,
+            )
+            .exists()
         )
-        if approved_item_ids:
-            _del_q = _del_q.filter(
-                models.WorkspaceMapping.legacy_item_id.notin_(approved_item_ids)
+        _approved_feature_exists = (
+            db.query(models.ItemFeatureApproval.id)
+            .filter(
+                models.ItemFeatureApproval.item_id == models.WorkspaceMapping.legacy_item_id,
+                models.ItemFeatureApproval.feature_id == models.WorkspaceMapping.legacy_feature_id,
             )
-        if approved_pairs:
-            _del_q = _del_q.filter(
-                tuple_(
-                    models.WorkspaceMapping.legacy_item_id,
-                    models.WorkspaceMapping.legacy_feature_id,
-                ).notin_(list(approved_pairs))
-            )
+            .exists()
+        )
+        _del_q = db.query(models.WorkspaceMapping).filter(
+            models.WorkspaceMapping.mapped_from.notin_(["local", "group"]),
+            ~_approved_item_exists,
+            ~_approved_feature_exists,
+        )
         _del_q.delete(synchronize_session=False)
         db.commit()
 
