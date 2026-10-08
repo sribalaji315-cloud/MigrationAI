@@ -83,6 +83,9 @@ const BOMHierarchy: React.FC<BOMHierarchyProps> = ({ currentUser, mappingTypeCon
   const [selectedAttributeTypes, setSelectedAttributeTypes] = useState<string[]>([]);
   const [showTypeDropdown, setShowTypeDropdown] = useState(false);
   const typeDropdownRef = useRef<HTMLDivElement>(null);
+  const [statusFilter, setStatusFilter] = useState<ItemMappingStatusDetail['status'][]>([]);
+  const [showStatusDropdown, setShowStatusDropdown] = useState(false);
+  const statusDropdownRef = useRef<HTMLDivElement>(null);
 
   // Searchable BOM item selector
   const [bomSearch, setBomSearch] = useState('');
@@ -117,6 +120,17 @@ const BOMHierarchy: React.FC<BOMHierarchyProps> = ({ currentUser, mappingTypeCon
     document.addEventListener('mousedown', handler);
     return () => document.removeEventListener('mousedown', handler);
   }, [showTypeDropdown]);
+
+  useEffect(() => {
+    if (!showStatusDropdown) return;
+    const handler = (e: MouseEvent) => {
+      if (statusDropdownRef.current && !statusDropdownRef.current.contains(e.target as Node)) {
+        setShowStatusDropdown(false);
+      }
+    };
+    document.addEventListener('mousedown', handler);
+    return () => document.removeEventListener('mousedown', handler);
+  }, [showStatusDropdown]);
 
   const checkBomExistence = useCallback(async (items: BomHierarchyItem[]) => {
     setIsCheckingBom(true);
@@ -446,12 +460,53 @@ const BOMHierarchy: React.FC<BOMHierarchyProps> = ({ currentUser, mappingTypeCon
     setExpandedNodes(defaultExpanded);
   }, [rootNodeIds.join('|')]);
 
-  const treeRows = useMemo(() => {
+  const isStatusFiltered = statusFilter.length > 0;
+
+  const matchesStatusFilter = useCallback((itemId: string) => {
+    const status = mappingStatuses[itemId]?.status;
+    return !!status && statusFilter.includes(status);
+  }, [mappingStatuses, statusFilter]);
+
+  // Filtering flattens the tree: only matching items are listed, ancestors are dropped.
+  const filteredRows = useMemo(() => {
+    if (!isStatusFiltered) return [] as TreeRow[];
+    const rows: TreeRow[] = [];
+    const seen = new Set<string>();
+
+    const walk = (parentId: string, depth: number, ancestors: Set<string>) => {
+      if (ancestors.has(parentId)) return;
+      ancestors.add(parentId);
+      (childrenByParent.get(parentId) || []).forEach(item => {
+        const dedupeKey = `${parentId}|${item.itemId}`;
+        if (matchesStatusFilter(item.itemId) && !seen.has(dedupeKey)) {
+          seen.add(dedupeKey);
+          rows.push({
+            key: dedupeKey,
+            depth,
+            kind: 'item',
+            label: item.itemId,
+            item,
+            expandable: false,
+            expanded: false,
+            childCount: (childrenByParent.get(item.itemId) || []).length,
+            variantCount: variantCounts.get(dedupeKey) || 1,
+          });
+        }
+        walk(item.itemId, depth + 1, ancestors);
+      });
+      ancestors.delete(parentId);
+    };
+
+    rootNodeIds.forEach(rootId => walk(rootId, 1, new Set()));
+    return rows;
+  }, [isStatusFiltered, childrenByParent, rootNodeIds, matchesStatusFilter, variantCounts]);
+
+  const fullTreeRows = useMemo(() => {
     const rows: TreeRow[] = [];
 
     const appendChildren = (parentId: string, depth: number, path: string) => {
       const children = childrenByParent.get(parentId) || [];
-      children.forEach((item, index) => {
+      children.forEach((item) => {
         const rowKey = `${path}>${item.itemId}`;
         const childCount = (childrenByParent.get(item.itemId) || []).length;
         const expandable = childCount > 0;
@@ -494,7 +549,9 @@ const BOMHierarchy: React.FC<BOMHierarchyProps> = ({ currentUser, mappingTypeCon
     });
 
     return rows;
-  }, [childrenByParent, expandedNodes, rootNodeIds]);
+  }, [childrenByParent, expandedNodes, rootNodeIds, variantCounts]);
+
+  const treeRows = isStatusFiltered ? filteredRows : fullTreeRows;
 
   const toggleNode = useCallback((rowKey: string) => {
     setExpandedNodes(prev => {
@@ -766,6 +823,61 @@ const BOMHierarchy: React.FC<BOMHierarchyProps> = ({ currentUser, mappingTypeCon
             </div>
           )}
 
+          <div ref={statusDropdownRef} className="relative">
+            <div className="flex items-center gap-2">
+              <label className="text-[9px] font-black text-slate-400 uppercase tracking-widest whitespace-nowrap">Mapping Status</label>
+              <button
+                type="button"
+                onClick={() => setShowStatusDropdown(v => !v)}
+                className={`flex items-center gap-1.5 px-3 py-1.5 border rounded-lg text-[10px] font-bold normal-case tracking-normal transition-colors min-w-[9rem] justify-between ${
+                  isStatusFiltered
+                    ? 'bg-violet-50 border-violet-200 text-violet-700 hover:bg-violet-100'
+                    : 'bg-white border-slate-200 text-slate-700 hover:bg-slate-50'
+                }`}
+              >
+                <span className="truncate">
+                  {isStatusFiltered
+                    ? statusFilter.map(s => STATUS_STYLES[s].label).join(', ')
+                    : 'All statuses'}
+                </span>
+                <svg className="w-3 h-3 shrink-0 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M19 9l-7 7-7-7" />
+                </svg>
+              </button>
+              {isStatusFiltered && (
+                <button
+                  type="button"
+                  onClick={() => setStatusFilter([])}
+                  className="text-[9px] font-black uppercase tracking-widest text-slate-400 hover:text-slate-700 transition-colors"
+                >
+                  Clear
+                </button>
+              )}
+            </div>
+            {showStatusDropdown && (
+              <div className="absolute top-full left-0 mt-1 w-56 bg-white border border-slate-200 rounded-lg shadow-lg z-50 py-1">
+                {(Object.keys(STATUS_STYLES) as ItemMappingStatusDetail['status'][]).map(status => (
+                  <label
+                    key={status}
+                    className="flex items-center gap-2 px-3 py-1.5 hover:bg-violet-50 cursor-pointer normal-case tracking-normal"
+                  >
+                    <input
+                      type="checkbox"
+                      className="accent-violet-600 w-3 h-3"
+                      checked={statusFilter.includes(status)}
+                      onChange={() => setStatusFilter(prev => (
+                        prev.includes(status) ? prev.filter(s => s !== status) : [...prev, status]
+                      ))}
+                    />
+                    <span className={`px-2 py-0.5 rounded-full text-[7px] font-black uppercase tracking-widest ${STATUS_STYLES[status].tone}`}>
+                      {STATUS_STYLES[status].label}
+                    </span>
+                  </label>
+                ))}
+              </div>
+            )}
+          </div>
+
           {selectedBomItem && (
             <>
               <span>{totalCount} total imported rows</span>
@@ -793,8 +905,14 @@ const BOMHierarchy: React.FC<BOMHierarchyProps> = ({ currentUser, mappingTypeCon
             <svg className="w-12 h-12 text-slate-200" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M4 6h16M4 10h16M4 14h16M4 18h16" />
             </svg>
-            <p className="text-slate-400 text-[10px] font-black uppercase tracking-widest">No hierarchy rows</p>
-            <p className="text-slate-300 text-[9px]">Search and select a BOM item above to view its hierarchy</p>
+            <p className="text-slate-400 text-[10px] font-black uppercase tracking-widest">
+              {isStatusFiltered && allHierarchyItems.length ? 'No matching rows' : 'No hierarchy rows'}
+            </p>
+            <p className="text-slate-300 text-[9px]">
+              {isStatusFiltered && allHierarchyItems.length
+                ? 'No items match the selected mapping status'
+                : 'Search and select a BOM item above to view its hierarchy'}
+            </p>
           </div>
         ) : (
           <table className="w-full text-left">
@@ -869,7 +987,7 @@ const BOMHierarchy: React.FC<BOMHierarchyProps> = ({ currentUser, mappingTypeCon
                     }}
                   >
                     <td className="px-4 py-2.5">
-                      <div className="flex items-center gap-2" style={{ paddingLeft: `${Math.max(0, row.depth - 1) * 20}px` }}>
+                      <div className="flex items-center gap-2" style={{ paddingLeft: isStatusFiltered ? 0 : `${Math.max(0, row.depth - 1) * 20}px` }}>
                         {row.expandable ? (
                           <button
                             type="button"
@@ -959,6 +1077,8 @@ const BOMHierarchy: React.FC<BOMHierarchyProps> = ({ currentUser, mappingTypeCon
                         <span className="text-[8px] font-black uppercase tracking-widest text-violet-600">
                           {row.expanded ? 'Expanded' : 'Collapsed'}
                         </span>
+                      ) : row.childCount > 0 ? (
+                        <span className="text-[8px] font-black uppercase tracking-widest text-violet-600">Node</span>
                       ) : (
                         <span className="text-[8px] font-black uppercase tracking-widest text-slate-300">Leaf</span>
                       )}
