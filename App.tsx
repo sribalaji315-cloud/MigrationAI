@@ -18,6 +18,7 @@ const FeatureCombinations = lazy(() => import('./components/FeatureCombinations'
 const AttributeCombinations = lazy(() => import('./components/AttributeCombinations'));
 const MigrationManifest = lazy(() => import('./components/MigrationManifest'));
 const GroupFeatures = lazy(() => import('./components/GroupFeatures'));
+const WhereUsed = lazy(() => import('./components/WhereUsed'));
 const ProductViewer = lazy(() => import('./components/ProductViewer'));
 
 const LazyFallback = () => (
@@ -63,6 +64,7 @@ const App: React.FC = () => {
   const [showAttributeCombinations, setShowAttributeCombinations] = useState(false);
   const [showMigrationManifest, setShowMigrationManifest] = useState(false);
   const [showGroupFeatures, setShowGroupFeatures] = useState(false);
+  const [showWhereUsed, setShowWhereUsed] = useState(false);
   const [showProductViewer, setShowProductViewer] = useState(false);
   const [showUnmappedOnlyInSidebar, setShowUnmappedOnlyInSidebar] = useState(false);
   const [featureFlags, setFeatureFlags] = useState<FeatureFlags>(() => ({
@@ -794,6 +796,9 @@ const App: React.FC = () => {
         onOpenGroupFeatures={() => {
           setShowGroupFeatures(true);
         }}
+        onOpenWhereUsed={() => {
+          setShowWhereUsed(true);
+        }}
         onOpenProductViewer={() => {
           setShowProductViewer(true);
         }}
@@ -966,6 +971,15 @@ const App: React.FC = () => {
             <GroupFeatures
               currentUser={currentUser}
               onClose={() => setShowGroupFeatures(false)}
+            />
+          </Suspense>
+        )}
+
+        {showWhereUsed && (
+          <Suspense fallback={<LazyFallback />}>
+            <WhereUsed
+              currentUser={currentUser}
+              onClose={() => setShowWhereUsed(false)}
             />
           </Suspense>
         )}

@@ -6,7 +6,7 @@ import uuid
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.gzip import GZipMiddleware
-from .api import auth, state, classifications, valuelists, ml, imports
+from .api import auth, state, classifications, valuelists, ml, imports, where_used
 from .api import public
 from .api.websocket import manager
 from .db.session import engine, Base, SessionLocal
@@ -42,6 +42,7 @@ app.include_router(classifications.router)
 app.include_router(valuelists.router)
 app.include_router(ml.router)
 app.include_router(imports.router)
+app.include_router(where_used.router)
 app.include_router(public.router)
 
 

@@ -1,5 +1,5 @@
 
-import { GlobalMapping, DatabaseState, User, ConnectionMode, NewAttribute, WorkspaceMappingRow, MappingGenerationProgress, ValueListGroup, ValueListRow, NewClassification, BomHierarchyItem, MLPrediction, MLSettings, FeatureCombinationJobProgress, FeatureCombinationRow, FeatureCombinationItem, ConsolidationAnalysis, SubsetMergeDetail, AttributeCombinationJobProgress, AttributeCombinationRow, AttributeCombinationItem, AttrComboConsolidationAnalysis, MigrationManifestRow, MigrationManifestFilters, MigrationManifestItemSummary, MigrationManifestAttributeGroup, MigrationManifestValueDetail, MergedWorkspaceMappingRow, MergeJob, ValuelistStrategyJob, TargetAttributeProfile, ValuelistDedupGroup, ValuelistMergeProposal, ValuelistApplyResult, GroupFeatureRow, GroupFeatureMappingJobProgress, GroupFeatureWhereUsedItem, GroupFeatureFilters, ApplyGroupFeatureProgress, ItemApprovalState } from '../types';
+import { GlobalMapping, DatabaseState, User, ConnectionMode, NewAttribute, WorkspaceMappingRow, MappingGenerationProgress, ValueListGroup, ValueListRow, NewClassification, BomHierarchyItem, MLPrediction, MLSettings, FeatureCombinationJobProgress, FeatureCombinationRow, FeatureCombinationItem, ConsolidationAnalysis, SubsetMergeDetail, AttributeCombinationJobProgress, AttributeCombinationRow, AttributeCombinationItem, AttrComboConsolidationAnalysis, MigrationManifestRow, MigrationManifestFilters, MigrationManifestItemSummary, MigrationManifestAttributeGroup, MigrationManifestValueDetail, MergedWorkspaceMappingRow, MergeJob, ValuelistStrategyJob, TargetAttributeProfile, ValuelistDedupGroup, ValuelistMergeProposal, ValuelistApplyResult, GroupFeatureRow, GroupFeatureMappingJobProgress, GroupFeatureWhereUsedItem, GroupFeatureFilters, ApplyGroupFeatureProgress, ItemApprovalState, WhereUsedPage, WhereUsedQuery, WhereUsedSide, WhereUsedItem, WhereUsedCounterpart, WhereUsedOption, WhereUsedOptionScope, WhereUsedTargetAttributeRow, WhereUsedTargetValueRow, WhereUsedLegacyFeatureRow, WhereUsedLegacyValueRow } from '../types';
 
 export interface SaveAllResult {
   mode: ConnectionMode;
@@ -1942,6 +1942,90 @@ export const dbService = {
     if (search) params.set('search', search);
     params.set('limit', String(limit));
     return this._cachedFetch(`${SQL_ENDPOINT}/group-features/attribute-values?${params}`, { headers: this._authHeaders(), _ttlMs: 10_000 });
+  },
+
+  // --- Where Used -----------------------------------------------------------
+  // Aggregates scan millions of rows on first call, so allow a longer timeout
+  // than the default; the server memoises each result for 2 minutes.
+  _whereUsedParams(query: WhereUsedQuery = {}, extra: Record<string, string | undefined> = {}): string {
+    const sp = new URLSearchParams();
+    Object.entries(extra).forEach(([k, v]) => { if (v) sp.set(k, v); });
+    if (query.search) sp.set('search', query.search);
+    if (query.keys) sp.set('keys', query.keys);
+    if (query.attributeType) sp.set('attributeType', query.attributeType);
+    if (query.minCount != null) sp.set('minCount', String(query.minCount));
+    if (query.maxCount != null) sp.set('maxCount', String(query.maxCount));
+    if (query.sortBy) sp.set('sortBy', query.sortBy);
+    if (query.sortDir) sp.set('sortDir', query.sortDir);
+    sp.set('limit', String(query.limit ?? 50));
+    sp.set('offset', String(query.offset ?? 0));
+    return sp.toString();
+  },
+
+  async fetchWhereUsedFilters(): Promise<{ attributeTypes: string[] }> {
+    return this._cachedFetch(`${SQL_ENDPOINT}/where-used/filters`, { headers: this._authHeaders(), _ttlMs: 60_000 });
+  },
+
+  async fetchWhereUsedOptions(params: { scope: WhereUsedOptionScope; search?: string; parent?: string; limit?: number }): Promise<{ items: WhereUsedOption[]; hasMore: boolean; total: number }> {
+    const sp = new URLSearchParams();
+    sp.set('scope', params.scope);
+    if (params.search) sp.set('search', params.search);
+    if (params.parent) sp.set('parent', params.parent);
+    sp.set('limit', String(params.limit ?? 50));
+    return this._cachedFetch(`${SQL_ENDPOINT}/where-used/options?${sp}`, {
+      headers: this._authHeaders(), _ttlMs: 60_000, _timeoutMs: 60_000,
+    });
+  },
+
+  async fetchWhereUsedTargetAttributes(query: WhereUsedQuery = {}): Promise<WhereUsedPage<WhereUsedTargetAttributeRow>> {
+    return this._cachedFetch(`${SQL_ENDPOINT}/where-used/target-attributes?${this._whereUsedParams(query)}`, {
+      headers: this._authHeaders(), _ttlMs: 30_000, _timeoutMs: 60_000,
+    });
+  },
+
+  async fetchWhereUsedTargetValues(attributeId: string | undefined, query: WhereUsedQuery = {}): Promise<WhereUsedPage<WhereUsedTargetValueRow>> {
+    const qs = this._whereUsedParams(query, { attributeId });
+    return this._cachedFetch(`${SQL_ENDPOINT}/where-used/target-values?${qs}`, {
+      headers: this._authHeaders(), _ttlMs: 30_000, _timeoutMs: 60_000,
+    });
+  },
+
+  async fetchWhereUsedLegacyFeatures(query: WhereUsedQuery = {}): Promise<WhereUsedPage<WhereUsedLegacyFeatureRow>> {
+    return this._cachedFetch(`${SQL_ENDPOINT}/where-used/legacy-features?${this._whereUsedParams(query)}`, {
+      headers: this._authHeaders(), _ttlMs: 30_000, _timeoutMs: 60_000,
+    });
+  },
+
+  async fetchWhereUsedLegacyValues(featureId: string | undefined, query: WhereUsedQuery = {}): Promise<WhereUsedPage<WhereUsedLegacyValueRow>> {
+    const qs = this._whereUsedParams(query, { featureId });
+    return this._cachedFetch(`${SQL_ENDPOINT}/where-used/legacy-values?${qs}`, {
+      headers: this._authHeaders(), _ttlMs: 30_000, _timeoutMs: 60_000,
+    });
+  },
+
+  async fetchWhereUsedItems(params: { side: WhereUsedSide; key: string; value?: string; attributeType?: string; limit?: number; offset?: number }): Promise<WhereUsedPage<WhereUsedItem>> {
+    const sp = new URLSearchParams();
+    sp.set('side', params.side);
+    sp.set('key', params.key);
+    if (params.value) sp.set('value', params.value);
+    if (params.attributeType) sp.set('attributeType', params.attributeType);
+    sp.set('limit', String(params.limit ?? 50));
+    sp.set('offset', String(params.offset ?? 0));
+    return this._cachedFetch(`${SQL_ENDPOINT}/where-used/items?${sp}`, {
+      headers: this._authHeaders(), _ttlMs: 30_000, _timeoutMs: 60_000,
+    });
+  },
+
+  async fetchWhereUsedCounterparts(params: { side: WhereUsedSide; key: string; value?: string; attributeType?: string; limit?: number }): Promise<{ side: WhereUsedSide; items: WhereUsedCounterpart[] }> {
+    const sp = new URLSearchParams();
+    sp.set('side', params.side);
+    sp.set('key', params.key);
+    if (params.value) sp.set('value', params.value);
+    if (params.attributeType) sp.set('attributeType', params.attributeType);
+    sp.set('limit', String(params.limit ?? 200));
+    return this._cachedFetch(`${SQL_ENDPOINT}/where-used/counterparts?${sp}`, {
+      headers: this._authHeaders(), _ttlMs: 30_000, _timeoutMs: 60_000,
+    });
   },
 
   async generateGroupFeatureValuelist(featureGroup: string): Promise<{ ok: boolean; valuelistsCreated: number; valuelistRowsCreated: number; skippedFeatures: string[]; createdValuelistIds: string[] }> {

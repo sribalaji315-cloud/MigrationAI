@@ -18,6 +18,7 @@ interface BOMHeaderProps {
   onOpenAttributeCombinations: () => void;
   onOpenMigrationManifest: () => void;
   onOpenGroupFeatures: () => void;
+  onOpenWhereUsed: () => void;
   onOpenProductViewer: () => void;
   mappingGenerationProgress?: MappingGenerationProgress | null;
   onRetriggerGeneration?: () => void;
@@ -30,7 +31,7 @@ interface BOMHeaderProps {
   mlPredictionProgress?: { status: string; progress: number; total: number; processed: number } | null;
 }
 
-const BOMHeader: React.FC<BOMHeaderProps> = ({ onRegenerate, isRefreshing, onInspectData, onCommit, currentUser, onLogout, onClearCache, onExportBomCsv, onOpenDashboard, onOpenHierarchy, onOpenFeatureCombinations, onOpenAttributeCombinations, onOpenMigrationManifest, onOpenGroupFeatures, onOpenProductViewer, mappingGenerationProgress, onRetriggerGeneration, onRevertAllToGlobal, isMappingGenerationActive, applyGroupFeatureProgress, onApplyGroupFeatures, isApplyGroupFeatureActive, onPredictAll, mlPredictionProgress }) => {
+const BOMHeader: React.FC<BOMHeaderProps> = ({ onRegenerate, isRefreshing, onInspectData, onCommit, currentUser, onLogout, onClearCache, onExportBomCsv, onOpenDashboard, onOpenHierarchy, onOpenFeatureCombinations, onOpenAttributeCombinations, onOpenMigrationManifest, onOpenGroupFeatures, onOpenWhereUsed, onOpenProductViewer, mappingGenerationProgress, onRetriggerGeneration, onRevertAllToGlobal, isMappingGenerationActive, applyGroupFeatureProgress, onApplyGroupFeatures, isApplyGroupFeatureActive, onPredictAll, mlPredictionProgress }) => {
   const uploadOptions: { label: string; id: DataCategory; icon: string; adminOnly?: boolean }[] = [
     { label: 'Global Mapping', id: 'mapping', icon: 'M8 7v8a2 2 0 002 2h6M8 7V5a2 2 0 012-2h4.586a1 1 0 01.707.293l4.414 4.414a1 1 0 01.293.707V15a2 2 0 01-2 2h-2' },
     { label: 'Classifications', id: 'classification', icon: 'M4 6h16M4 10h16M4 14h16M4 18h16' },
@@ -363,6 +364,16 @@ const BOMHeader: React.FC<BOMHeaderProps> = ({ onRegenerate, isRefreshing, onIns
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10" />
             </svg>
             Group Features
+          </button>
+          <button
+            type="button"
+            onClick={onOpenWhereUsed}
+            className="flex items-center gap-1.5 px-2.5 py-1.5 bg-rose-50 text-rose-700 border border-rose-100 hover:bg-rose-100 rounded-md text-[9px] font-black transition-all whitespace-nowrap uppercase tracking-wider"
+          >
+            <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z" />
+            </svg>
+            Where Used
           </button>
           <button
             type="button"

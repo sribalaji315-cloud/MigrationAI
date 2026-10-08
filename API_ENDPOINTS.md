@@ -361,6 +361,30 @@ This file documents the backend HTTP API implemented under `backend/app`.
 | POST | /group-features/suggest | `trigger_group_feature_suggest` | JSON suggestion job payload | JSON queued-job payload |
 | GET | /group-features/suggest-progress | `get_group_feature_suggest_progress` | none | JSON job status |
 
+## Where Used
+
+Usage counts are derived live from `workspace_mappings`. Rows with zero usage come from the
+catalogues instead — `classifications` on the target side, `bom_features` on the legacy side —
+so definitions nothing maps to stay visible. Empty ids/values use the `__blank__` key and are
+labelled `(blank)`; `UNMAPPED` / `NOT REQUIRED` are returned as their own rows and flagged
+`isSentinel`. List responses page with `hasMore` instead of an exact total.
+
+The `keys` parameter restricts a list to an explicit selection (csv, exact, case-insensitive)
+and is applied after the cached aggregate, so changing the selection reuses the cached scan.
+Dropdown options come from `/where-used/options`, which is sourced **only** from the
+catalogues — values that exist solely in `workspace_mappings` are deliberately not offered.
+
+| Method | Path | Function | Request | Response |
+| --- | --- | --- | --- | --- |
+| GET | /where-used/filters | `get_where_used_filters` | none | JSON `{"attributeTypes": [...]}` |
+| GET | /where-used/options | `list_where_used_options` | query `scope` (`targetAttributes`\|`targetValues`\|`legacyFeatures`\|`legacyValues`), `search`, `parent`, `limit` | JSON `{"items": [{"value": "...", "description": "..."}], "hasMore": false, "total": 0}` |
+| GET | /where-used/target-attributes | `list_target_attribute_usage` | query `search`, `keys`, `attributeType`, `minCount`, `maxCount`, `sortBy`, `sortDir`, `limit`, `offset` | JSON `{"items": [...], "hasMore": false, "offset": 0, "limit": 50}` |
+| GET | /where-used/target-values | `list_target_value_usage` | query `attributeId`, plus the shared list filters | JSON paged value usage |
+| GET | /where-used/legacy-features | `list_legacy_feature_usage` | query shared list filters | JSON paged feature usage |
+| GET | /where-used/legacy-values | `list_legacy_value_usage` | query `featureId`, plus the shared list filters | JSON paged value usage |
+| GET | /where-used/items | `list_where_used_items` | query `side` (`target`\|`legacy`), `key`, `value`, `attributeType`, `limit`, `offset` | JSON paged BOM items |
+| GET | /where-used/counterparts | `list_where_used_counterparts` | query `side`, `key`, `value`, `attributeType`, `limit` | JSON `{"side": "...", "items": [...]}` |
+
 ## Notes
 
 - Many state endpoints are analytics or export endpoints backed by large dynamic payloads; this reference intentionally captures the stable contract shape, not every nested field.

@@ -655,3 +655,94 @@ export interface GroupFeatureFilters {
   targetAttributes: string[];
   targetValues: string[];
 }
+
+// Where Used
+// `key` fields are the raw identifiers to send back to the API ('__blank__' for
+// empty ids/values); the sibling label fields are display-only.
+export interface WhereUsedPage<T> {
+  items: T[];
+  hasMore: boolean;
+  offset: number;
+  limit: number;
+}
+
+export interface WhereUsedTargetAttributeRow {
+  key: string;
+  attributeId: string;
+  description: string;
+  itemCount: number;
+  legacyFeatureCount: number;
+  valueCount: number;
+  legacyValueCount: number;
+  isSentinel: boolean;
+  inClassifications: boolean;
+}
+
+export interface WhereUsedTargetValueRow {
+  attributeKey: string;
+  attributeId: string;
+  valueKey: string;
+  value: string;
+  itemCount: number;
+  legacyFeatureCount: number;
+  legacyValueCount: number;
+  isSentinel: boolean;
+  inClassifications: boolean;
+}
+
+export interface WhereUsedLegacyFeatureRow {
+  key: string;
+  featureId: string;
+  description: string;
+  itemCount: number;
+  targetAttributeCount: number;
+  targetValueCount: number;
+  legacyValueCount: number;
+  inBom: boolean;
+}
+
+export interface WhereUsedLegacyValueRow {
+  featureKey: string;
+  featureId: string;
+  valueKey: string;
+  value: string;
+  itemCount: number;
+  targetAttributeCount: number;
+  targetValueCount: number;
+  inBom: boolean;
+}
+
+export interface WhereUsedItem {
+  itemId: string;
+  description: string;
+  category: string;
+  productType: string;
+  priority?: number | null;
+}
+
+export interface WhereUsedCounterpart {
+  key: string;
+  value: string;
+  itemCount: number;
+}
+
+export type WhereUsedSide = 'target' | 'legacy';
+
+export type WhereUsedOptionScope = 'targetAttributes' | 'targetValues' | 'legacyFeatures' | 'legacyValues';
+
+export interface WhereUsedOption {
+  value: string;
+  description: string;
+}
+
+export interface WhereUsedQuery {
+  search?: string;
+  keys?: string;
+  attributeType?: string;
+  minCount?: number;
+  maxCount?: number;
+  sortBy?: string;
+  sortDir?: 'asc' | 'desc';
+  limit?: number;
+  offset?: number;
+}
