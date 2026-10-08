@@ -934,6 +934,7 @@ const App: React.FC = () => {
           <Suspense fallback={<LazyFallback />}>
             <BOMHierarchy
               currentUser={currentUser}
+              mappingTypeConfig={dbState.mappingTypeConfig}
               onClose={() => setShowHierarchy(false)}
             />
           </Suspense>

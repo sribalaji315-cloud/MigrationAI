@@ -227,6 +227,13 @@ export interface BomHierarchyItem {
   createdBy?: string;
 }
 
+export interface ItemMappingStatusDetail {
+  status: 'mapped' | 'partial' | 'unmapped' | 'notRequired';
+  mapped: number;
+  notRequired: number;
+  total: number;
+}
+
 export interface FeatureCombinationJobProgress {
   id?: number;
   status: 'idle' | 'queued' | 'running' | 'completed' | 'failed';

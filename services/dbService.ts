@@ -1,5 +1,5 @@
 
-import { GlobalMapping, DatabaseState, User, ConnectionMode, NewAttribute, WorkspaceMappingRow, MappingGenerationProgress, ValueListGroup, ValueListRow, NewClassification, BomHierarchyItem, MLPrediction, MLSettings, FeatureCombinationJobProgress, FeatureCombinationRow, FeatureCombinationItem, ConsolidationAnalysis, SubsetMergeDetail, AttributeCombinationJobProgress, AttributeCombinationRow, AttributeCombinationItem, AttrComboConsolidationAnalysis, MigrationManifestRow, MigrationManifestFilters, MigrationManifestItemSummary, MigrationManifestAttributeGroup, MigrationManifestValueDetail, MergedWorkspaceMappingRow, MergeJob, ValuelistStrategyJob, TargetAttributeProfile, ValuelistDedupGroup, ValuelistMergeProposal, ValuelistApplyResult, GroupFeatureRow, GroupFeatureMappingJobProgress, GroupFeatureWhereUsedItem, GroupFeatureFilters, ApplyGroupFeatureProgress, ItemApprovalState, WhereUsedPage, WhereUsedQuery, WhereUsedSide, WhereUsedItem, WhereUsedCounterpart, WhereUsedOption, WhereUsedOptionScope, WhereUsedTargetAttributeRow, WhereUsedTargetValueRow, WhereUsedLegacyFeatureRow, WhereUsedLegacyValueRow } from '../types';
+import { GlobalMapping, DatabaseState, User, ConnectionMode, NewAttribute, WorkspaceMappingRow, MappingGenerationProgress, ValueListGroup, ValueListRow, NewClassification, BomHierarchyItem, ItemMappingStatusDetail, MLPrediction, MLSettings, FeatureCombinationJobProgress, FeatureCombinationRow, FeatureCombinationItem, ConsolidationAnalysis, SubsetMergeDetail, AttributeCombinationJobProgress, AttributeCombinationRow, AttributeCombinationItem, AttrComboConsolidationAnalysis, MigrationManifestRow, MigrationManifestFilters, MigrationManifestItemSummary, MigrationManifestAttributeGroup, MigrationManifestValueDetail, MergedWorkspaceMappingRow, MergeJob, ValuelistStrategyJob, TargetAttributeProfile, ValuelistDedupGroup, ValuelistMergeProposal, ValuelistApplyResult, GroupFeatureRow, GroupFeatureMappingJobProgress, GroupFeatureWhereUsedItem, GroupFeatureFilters, ApplyGroupFeatureProgress, ItemApprovalState, WhereUsedPage, WhereUsedQuery, WhereUsedSide, WhereUsedItem, WhereUsedCounterpart, WhereUsedOption, WhereUsedOptionScope, WhereUsedTargetAttributeRow, WhereUsedTargetValueRow, WhereUsedLegacyFeatureRow, WhereUsedLegacyValueRow } from '../types';
 
 export interface SaveAllResult {
   mode: ConnectionMode;
@@ -1294,6 +1294,59 @@ export const dbService = {
       `${SQL_ENDPOINT}/bom/hierarchy/children/${encodeURIComponent(parentId)}`,
       { headers: this._authHeaders(), _ttlMs: 15000 },
     );
+  },
+
+  async fetchHierarchyChildrenBatch(parentIds: string[]): Promise<{ items: BomHierarchyItem[]; total: number }> {
+    if (!SQL_ENDPOINT) throw new Error('Database connection not available.');
+    if (!parentIds.length) return { items: [], total: 0 };
+    // Server caps a batch at 2000 parents.
+    const CHUNK = 1000;
+    const chunks: string[][] = [];
+    for (let i = 0; i < parentIds.length; i += CHUNK) chunks.push(parentIds.slice(i, i + CHUNK));
+
+    const responses = await Promise.all(chunks.map(async chunk => {
+      const resp = await this._fetchWithRefresh(`${SQL_ENDPOINT}/bom/hierarchy/children/batch`, {
+        method: 'POST',
+        headers: { ...this._authHeaders(), 'Content-Type': 'application/json' },
+        body: JSON.stringify({ parentIds: chunk }),
+      });
+      if (!resp.ok) {
+        const errText = await resp.text();
+        throw new Error(`Failed to fetch BOM hierarchy children: ${resp.status} ${errText}`);
+      }
+      return resp.json() as Promise<{ items: BomHierarchyItem[]; total: number }>;
+    }));
+
+    const items = responses.flatMap(r => r.items || []);
+    return { items, total: items.length };
+  },
+
+  async fetchItemMappingStatusDetail(
+    itemIds: string[],
+    attributeTypes?: string[],
+  ): Promise<Record<string, ItemMappingStatusDetail>> {
+    if (!SQL_ENDPOINT) throw new Error('Database connection not available.');
+    if (!itemIds.length) return {};
+    // Server caps a request at 5000 item ids.
+    const CHUNK = 2000;
+    const chunks: string[][] = [];
+    for (let i = 0; i < itemIds.length; i += CHUNK) chunks.push(itemIds.slice(i, i + CHUNK));
+
+    const responses = await Promise.all(chunks.map(async chunk => {
+      const resp = await this._fetchWithRefresh(`${SQL_ENDPOINT}/item-statuses/detail`, {
+        method: 'POST',
+        headers: { ...this._authHeaders(), 'Content-Type': 'application/json' },
+        body: JSON.stringify({ itemIds: chunk, attributeTypes: attributeTypes || [] }),
+      });
+      if (!resp.ok) {
+        const errText = await resp.text();
+        throw new Error(`Failed to fetch item mapping statuses: ${resp.status} ${errText}`);
+      }
+      const data = await resp.json();
+      return (data?.statuses || {}) as Record<string, ItemMappingStatusDetail>;
+    }));
+
+    return Object.assign({}, ...responses);
   },
 
   async searchBomHierarchyItems(query: string, limit = 30): Promise<{ items: { itemId: string; description: string }[]; total: number }> {

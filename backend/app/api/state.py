@@ -4651,6 +4651,110 @@ def get_item_statuses(
         return {"statuses": statuses}
 
 
+MAX_STATUS_DETAIL_ITEMS = 5000
+
+
+@router.post("/item-statuses/detail")
+def get_item_statuses_detail(
+    payload: Dict[str, Any] = Body(...),
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """Per-item mapping status with counts, optionally scoped to attribute types.
+
+    POST (not GET) because callers pass hundreds of item ids, which overflow URL limits.
+    """
+    raw_ids = payload.get("itemIds") or []
+    if not isinstance(raw_ids, list):
+        raise HTTPException(status_code=400, detail="itemIds must be a list")
+    item_ids = sorted({str(iid).strip() for iid in raw_ids if str(iid or "").strip()})
+    if len(item_ids) > MAX_STATUS_DETAIL_ITEMS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"too many itemIds (max {MAX_STATUS_DETAIL_ITEMS})",
+        )
+    if not item_ids:
+        return {"statuses": {}}
+
+    raw_types = payload.get("attributeTypes") or []
+    if not isinstance(raw_types, list):
+        raise HTTPException(status_code=400, detail="attributeTypes must be a list")
+    selected_types = {
+        str(t).strip().lower() for t in raw_types if str(t or "").strip()
+    }
+    # No explicit selection falls back to the globally configured included types.
+    type_filter = selected_types or _get_included_type_set(db)
+
+    from sqlalchemy import func, case, literal_column
+
+    WM = models.WorkspaceMapping
+    has_empty_val = func.sum(
+        case(
+            (WM.value_status.isnot(None), 0),
+            (func.trim(func.coalesce(WM.legacy_value, literal_column("''"))) == literal_column("''"), 0),
+            (func.trim(func.coalesce(WM.new_value, literal_column("''"))) == literal_column("''"), 1),
+            else_=0,
+        )
+    ).label("empty_count")
+
+    feature_rows = (
+        db.query(
+            WM.legacy_item_id,
+            WM.legacy_feature_id,
+            func.max(WM.new_attribute_id).label("new_attribute_id"),
+            func.max(WM.attribute_type).label("attribute_type"),
+            has_empty_val,
+        )
+        .filter(WM.legacy_item_id.in_(item_ids))
+        .group_by(WM.legacy_item_id, WM.legacy_feature_id)
+        .all()
+    )
+
+    stats: Dict[str, Dict[str, int]] = {
+        item_id: {"mapped": 0, "notRequired": 0, "total": 0} for item_id in item_ids
+    }
+
+    for row in feature_rows:
+        bucket = stats.get(row.legacy_item_id)
+        if bucket is None:
+            continue
+        attr_type = (row.attribute_type or "").strip().lower()
+        if type_filter and attr_type and attr_type not in type_filter:
+            continue
+        target = (row.new_attribute_id or "").strip().upper()
+        bucket["total"] += 1
+        if target == "NOT REQUIRED":
+            bucket["notRequired"] += 1
+        elif target and target != "UNMAPPED" and row.empty_count == 0:
+            bucket["mapped"] += 1
+
+    statuses: Dict[str, Dict[str, Any]] = {}
+    for item_id, bucket in stats.items():
+        total = bucket["total"]
+        mapped = bucket["mapped"]
+        not_required = bucket["notRequired"]
+
+        if total == 0:
+            status = "notRequired"
+        elif mapped > 0 and mapped + not_required >= total:
+            status = "mapped"
+        elif mapped == 0 and not_required >= total:
+            status = "notRequired"
+        elif mapped > 0:
+            status = "partial"
+        else:
+            status = "unmapped"
+
+        statuses[item_id] = {
+            "status": status,
+            "mapped": mapped,
+            "notRequired": not_required,
+            "total": total,
+        }
+
+    return {"statuses": statuses}
+
+
 @router.get("/export/bom-csv")
 def export_bom_csv(
         category: Optional[str] = None,
@@ -5282,6 +5386,53 @@ def get_bom_hierarchy_children(
     rows = (
         db.query(models.BomHierarchy)
         .filter(models.BomHierarchy.parent_bom == parent_id.strip())
+        .order_by(models.BomHierarchy.id)
+        .all()
+    )
+    items = [
+        {
+            "id": row.id,
+            "level": row.level,
+            "parentBom": row.parent_bom,
+            "itemId": row.item_id,
+            "description": row.description,
+            "qty": row.qty,
+            "unit": row.unit,
+            "condition": row.condition,
+            "formula": row.formula,
+            "conversion": row.conversion,
+        }
+        for row in rows
+    ]
+    return {"items": items, "total": len(items)}
+
+
+MAX_HIERARCHY_BATCH_PARENTS = 2000
+
+
+@router.post("/bom/hierarchy/children/batch")
+def get_bom_hierarchy_children_batch(
+    payload: Dict[str, Any] = Body(...),
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """Return hierarchy rows for many parents at once (one query per tree level)."""
+    raw_ids = payload.get("parentIds") or []
+    if not isinstance(raw_ids, list):
+        raise HTTPException(status_code=400, detail="parentIds must be a list")
+
+    parent_ids = sorted({str(pid).strip() for pid in raw_ids if str(pid or "").strip()})
+    if len(parent_ids) > MAX_HIERARCHY_BATCH_PARENTS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"too many parentIds (max {MAX_HIERARCHY_BATCH_PARENTS})",
+        )
+    if not parent_ids:
+        return {"items": [], "total": 0}
+
+    rows = (
+        db.query(models.BomHierarchy)
+        .filter(models.BomHierarchy.parent_bom.in_(parent_ids))
         .order_by(models.BomHierarchy.id)
         .all()
     )

@@ -1,10 +1,11 @@
 import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
-import { BomHierarchyItem, WorkspaceMappingRow, User } from '../types';
+import { BomHierarchyItem, WorkspaceMappingRow, User, MappingTypeConfig, ItemMappingStatusDetail } from '../types';
 import { dbService } from '../services/dbService';
 import { useCsvWorker } from '../hooks/useCsvWorker';
 
 interface BOMHierarchyProps {
   currentUser: User;
+  mappingTypeConfig?: MappingTypeConfig;
   onClose: () => void;
 }
 
@@ -20,7 +21,48 @@ interface TreeRow {
   variantCount: number;
 }
 
-const BOMHierarchy: React.FC<BOMHierarchyProps> = ({ currentUser, onClose }) => {
+type LoadPhase = 'structure' | 'bom';
+
+const PHASE_LABELS: Record<LoadPhase, string> = {
+  structure: 'Fetching structure',
+  bom: 'Checking BOM',
+};
+
+// Guards against cycles in uploaded hierarchy data.
+const MAX_TREE_DEPTH = 50;
+
+const normalizeType = (value?: string | null) => (value || '').trim().toLowerCase();
+
+const STATUS_STYLES: Record<ItemMappingStatusDetail['status'], { label: string; tone: string }> = {
+  mapped: { label: 'Mapped', tone: 'bg-emerald-100 text-emerald-700' },
+  partial: { label: 'Partial', tone: 'bg-amber-100 text-amber-700' },
+  unmapped: { label: 'Unmapped', tone: 'bg-rose-100 text-rose-700' },
+  notRequired: { label: 'N/R', tone: 'bg-slate-200 text-slate-600' },
+};
+
+const MappingStatusCell: React.FC<{
+  exists: boolean;
+  detail?: ItemMappingStatusDetail;
+  isLoading: boolean;
+}> = ({ exists, detail, isLoading }) => {
+  if (!exists) return <span className="text-[9px] text-slate-400">—</span>;
+  if (!detail) {
+    return <span className="text-[9px] text-slate-400">{isLoading ? '…' : '—'}</span>;
+  }
+  const style = STATUS_STYLES[detail.status];
+  return (
+    <div className="inline-flex items-center gap-1.5">
+      <span className={`px-2 py-0.5 rounded-full text-[7px] font-black uppercase tracking-widest ${style.tone}`}>
+        {style.label}
+      </span>
+      <span className="text-[9px] font-bold text-slate-500 tabular-nums">
+        {detail.mapped + detail.notRequired}/{detail.total}
+      </span>
+    </div>
+  );
+};
+
+const BOMHierarchy: React.FC<BOMHierarchyProps> = ({ currentUser, mappingTypeConfig, onClose }) => {
   const [allHierarchyItems, setAllHierarchyItems] = useState<BomHierarchyItem[]>([]);
   const [totalCount, setTotalCount] = useState(0);
   const [isLoading, setIsLoading] = useState(false);
@@ -35,6 +77,12 @@ const BOMHierarchy: React.FC<BOMHierarchyProps> = ({ currentUser, onClose }) => 
   const [featureMappings, setFeatureMappings] = useState<WorkspaceMappingRow[]>([]);
   const [isLoadingFeatures, setIsLoadingFeatures] = useState(false);
   const [showFeatures, setShowFeatures] = useState(false);
+  const [loadProgress, setLoadProgress] = useState<{ phase: LoadPhase; percent?: number } | null>(null);
+  const [mappingStatuses, setMappingStatuses] = useState<Record<string, ItemMappingStatusDetail>>({});
+  const [isLoadingStatuses, setIsLoadingStatuses] = useState(false);
+  const [selectedAttributeTypes, setSelectedAttributeTypes] = useState<string[]>([]);
+  const [showTypeDropdown, setShowTypeDropdown] = useState(false);
+  const typeDropdownRef = useRef<HTMLDivElement>(null);
 
   // Searchable BOM item selector
   const [bomSearch, setBomSearch] = useState('');
@@ -49,20 +97,60 @@ const BOMHierarchy: React.FC<BOMHierarchyProps> = ({ currentUser, onClose }) => 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const isAdmin = currentUser.role === 'admin';
 
+  const availableAttributeTypes = useMemo(
+    () => Array.from(new Set((mappingTypeConfig?.availableTypes || []).map(normalizeType).filter(Boolean))),
+    [mappingTypeConfig],
+  );
+
+  useEffect(() => {
+    const included = (mappingTypeConfig?.includedTypes || []).map(normalizeType).filter(Boolean);
+    setSelectedAttributeTypes(included.length ? included : availableAttributeTypes);
+  }, [mappingTypeConfig, availableAttributeTypes]);
+
+  useEffect(() => {
+    if (!showTypeDropdown) return;
+    const handler = (e: MouseEvent) => {
+      if (typeDropdownRef.current && !typeDropdownRef.current.contains(e.target as Node)) {
+        setShowTypeDropdown(false);
+      }
+    };
+    document.addEventListener('mousedown', handler);
+    return () => document.removeEventListener('mousedown', handler);
+  }, [showTypeDropdown]);
+
   const checkBomExistence = useCallback(async (items: BomHierarchyItem[]) => {
     setIsCheckingBom(true);
     try {
       const uniqueIds = Array.from(new Set(items.map(item => item.itemId).filter(Boolean)));
       if (!uniqueIds.length) {
         setExistingBomIds(new Set());
-        return;
+        return new Set<string>();
       }
       const bomItems = await dbService.fetchBomItemsByIds(uniqueIds);
-      setExistingBomIds(new Set(bomItems.map(item => item.itemId)));
+      const found = new Set(bomItems.map(item => item.itemId));
+      setExistingBomIds(found);
+      return found;
     } catch {
       setExistingBomIds(new Set());
+      return new Set<string>();
     } finally {
       setIsCheckingBom(false);
+    }
+  }, []);
+
+  const loadMappingStatuses = useCallback(async (itemIds: string[], attributeTypes: string[]) => {
+    if (!itemIds.length) {
+      setMappingStatuses({});
+      return;
+    }
+    setIsLoadingStatuses(true);
+    try {
+      const statuses = await dbService.fetchItemMappingStatusDetail(itemIds, attributeTypes);
+      setMappingStatuses(statuses);
+    } catch {
+      setMappingStatuses({});
+    } finally {
+      setIsLoadingStatuses(false);
     }
   }, []);
 
@@ -86,29 +174,43 @@ const BOMHierarchy: React.FC<BOMHierarchyProps> = ({ currentUser, onClose }) => 
     }
   }, [checkBomExistence]);
 
-  // Load hierarchy for a specific BOM item by fetching its children recursively
+  // Load hierarchy for a specific BOM item by walking the tree one level at a time.
   const loadHierarchyForItem = useCallback(async (itemId: string) => {
     setIsLoading(true);
     setStatusMessage(null);
     setSelectedBomItem(itemId);
     setBomSearch(itemId);
     setShowBomDropdown(false);
+    setMappingStatuses({});
+    setLoadProgress({ phase: 'structure', percent: 0 });
     try {
-      // Fetch direct children and all descendants by walking the tree
+      // One request per depth level instead of one per node.
       const allItems: BomHierarchyItem[] = [];
-      const queue = [itemId];
       const visited = new Set<string>();
-      while (queue.length > 0) {
-        const parentId = queue.shift()!;
-        if (visited.has(parentId)) continue;
-        visited.add(parentId);
-        const result = await dbService.fetchHierarchyChildren(parentId);
+      let frontier = [itemId];
+      let depth = 0;
+
+      while (frontier.length > 0 && depth < MAX_TREE_DEPTH) {
+        const pending = frontier.filter(id => id && !visited.has(id));
+        if (!pending.length) break;
+        pending.forEach(id => visited.add(id));
+
+        const result = await dbService.fetchHierarchyChildrenBatch(pending);
+        const nextFrontier = new Set<string>();
         for (const item of result.items) {
           allItems.push(item);
-          // If this child is also a parent node, queue it for expansion
-          queue.push(item.itemId);
+          if (item.itemId && !visited.has(item.itemId)) nextFrontier.add(item.itemId);
         }
+        frontier = Array.from(nextFrontier);
+        depth += 1;
+
+        const resolved = visited.size;
+        setLoadProgress({
+          phase: 'structure',
+          percent: Math.round((resolved / (resolved + frontier.length)) * 100),
+        });
       }
+
       setAllHierarchyItems(allItems);
       setTotalCount(allItems.length);
       setHasPendingUpload(false);
@@ -116,13 +218,27 @@ const BOMHierarchy: React.FC<BOMHierarchyProps> = ({ currentUser, onClose }) => 
       setSelectedRowKey(null);
       setShowFeatures(false);
       setFeatureMappings([]);
+
+      setLoadProgress({ phase: 'bom' });
       await checkBomExistence(allItems);
     } catch (err: any) {
       setStatusMessage({ type: 'error', text: `Failed to load hierarchy for ${itemId}: ${err.message}` });
     } finally {
+      setLoadProgress(null);
       setIsLoading(false);
     }
   }, [checkBomExistence]);
+
+  const hierarchyItemIdsKey = useMemo(
+    () => Array.from(new Set(allHierarchyItems.map(item => item.itemId).filter(Boolean))).sort().join(','),
+    [allHierarchyItems],
+  );
+
+  // Mapping status is refetched when the structure changes or the attribute type filter changes.
+  useEffect(() => {
+    const ids = hierarchyItemIdsKey ? hierarchyItemIdsKey.split(',') : [];
+    loadMappingStatuses(ids, selectedAttributeTypes);
+  }, [hierarchyItemIdsKey, selectedAttributeTypes, loadMappingStatuses]);
 
   // Debounced search for BOM items
   useEffect(() => {
@@ -434,6 +550,7 @@ const BOMHierarchy: React.FC<BOMHierarchyProps> = ({ currentUser, onClose }) => 
               {rootNodeIds.length ? ` · ${rootNodeIds.length} root node${rootNodeIds.length !== 1 ? 's' : ''}` : ''}
               {hasPendingUpload && ' · Unsaved upload'}
               {isCheckingBom && ' · Checking BOM…'}
+              {loadProgress && ` · ${PHASE_LABELS[loadProgress.phase]}${loadProgress.percent != null ? ` ${loadProgress.percent}%` : '…'}`}
             </p>
           </div>
         </div>
@@ -604,6 +721,51 @@ const BOMHierarchy: React.FC<BOMHierarchyProps> = ({ currentUser, onClose }) => 
               </div>
             )}
           </div>
+
+          {availableAttributeTypes.length > 0 && (
+            <div ref={typeDropdownRef} className="relative">
+              <div className="flex items-center gap-2">
+                <label className="text-[9px] font-black text-slate-400 uppercase tracking-widest whitespace-nowrap">Attribute Type</label>
+                <button
+                  type="button"
+                  onClick={() => setShowTypeDropdown(v => !v)}
+                  className="flex items-center gap-1.5 px-3 py-1.5 bg-white border border-slate-200 rounded-lg text-[10px] font-bold text-slate-700 normal-case tracking-normal hover:bg-slate-50 transition-colors min-w-[9rem] justify-between"
+                >
+                  <span className="truncate">
+                    {selectedAttributeTypes.length === 0
+                      ? 'None'
+                      : selectedAttributeTypes.length === availableAttributeTypes.length
+                        ? 'All types'
+                        : selectedAttributeTypes.join(', ')}
+                  </span>
+                  <svg className="w-3 h-3 shrink-0 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M19 9l-7 7-7-7" />
+                  </svg>
+                </button>
+              </div>
+              {showTypeDropdown && (
+                <div className="absolute top-full left-0 mt-1 w-56 bg-white border border-slate-200 rounded-lg shadow-lg z-50 py-1">
+                  {availableAttributeTypes.map(type => (
+                    <label
+                      key={type}
+                      className="flex items-center gap-2 px-3 py-1.5 hover:bg-violet-50 cursor-pointer normal-case tracking-normal"
+                    >
+                      <input
+                        type="checkbox"
+                        className="accent-violet-600 w-3 h-3"
+                        checked={selectedAttributeTypes.includes(type)}
+                        onChange={() => setSelectedAttributeTypes(prev => (
+                          prev.includes(type) ? prev.filter(t => t !== type) : [...prev, type]
+                        ))}
+                      />
+                      <span className="text-[10px] font-bold text-slate-700">{type}</span>
+                    </label>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+
           {selectedBomItem && (
             <>
               <span>{totalCount} total imported rows</span>
@@ -617,8 +779,14 @@ const BOMHierarchy: React.FC<BOMHierarchyProps> = ({ currentUser, onClose }) => 
 
       <div className="flex-1 overflow-auto">
         {isLoading ? (
-          <div className="flex items-center justify-center h-64">
+          <div className="flex flex-col items-center justify-center h-64 gap-3">
             <div className="w-6 h-6 border-2 border-violet-600 border-t-transparent rounded-full animate-spin" />
+            {loadProgress && (
+              <p className="text-[10px] font-black uppercase tracking-widest text-slate-400">
+                {PHASE_LABELS[loadProgress.phase]}
+                {loadProgress.percent != null ? ` ${loadProgress.percent}%` : '…'}
+              </p>
+            )}
           </div>
         ) : !treeRows.length ? (
           <div className="flex flex-col items-center justify-center h-64 gap-3">
@@ -633,6 +801,7 @@ const BOMHierarchy: React.FC<BOMHierarchyProps> = ({ currentUser, onClose }) => 
             <thead className="sticky top-0 z-10 bg-slate-50 border-b border-slate-200">
               <tr>
                 <th className="px-4 py-3 text-[9px] font-black text-slate-400 uppercase tracking-widest w-[34rem]">BOM Tree</th>
+                <th className="px-4 py-3 text-[9px] font-black text-slate-400 uppercase tracking-widest w-40 text-center">Mapping Status</th>
                 <th className="px-4 py-3 text-[9px] font-black text-slate-400 uppercase tracking-widest w-16 text-center">Level</th>
                 <th className="px-4 py-3 text-[9px] font-black text-slate-400 uppercase tracking-widest">Description</th>
                 <th className="px-4 py-3 text-[9px] font-black text-slate-400 uppercase tracking-widest w-20 text-center">Qty</th>
@@ -665,6 +834,7 @@ const BOMHierarchy: React.FC<BOMHierarchyProps> = ({ currentUser, onClose }) => 
                           </span>
                         </div>
                       </td>
+                      <td className="px-4 py-2.5 text-center"><span className="text-[9px] text-slate-400">—</span></td>
                       <td className="px-4 py-2.5 text-center"><span className="text-[10px] font-black text-slate-500">ROOT</span></td>
                       <td className="px-4 py-2.5"><span className="text-[9px] text-slate-400">Top-level BOM assembly</span></td>
                       <td className="px-4 py-2.5 text-center"><span className="text-[10px] text-slate-400">—</span></td>
@@ -740,6 +910,13 @@ const BOMHierarchy: React.FC<BOMHierarchyProps> = ({ currentUser, onClose }) => 
                           </div>
                         </div>
                       </div>
+                    </td>
+                    <td className="px-4 py-2.5 text-center">
+                      <MappingStatusCell
+                        exists={exists}
+                        detail={mappingStatuses[item.itemId]}
+                        isLoading={isLoadingStatuses}
+                      />
                     </td>
                     <td className="px-4 py-2.5 text-center">
                       <span className="text-[10px] font-black text-slate-600">{row.depth}</span>
