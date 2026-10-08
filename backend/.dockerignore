@@ -1,0 +1,13 @@
+# Build context for backend/Dockerfile. The image intentionally keeps the
+# top-level admin/data-repair scripts and import_config*.json, but must never
+# carry secrets or a local database.
+
+.env
+.env.*
+!.env.example
+*.db
+*.db-shm
+*.db-wal
+**/__pycache__
+*.pyc
+*.md

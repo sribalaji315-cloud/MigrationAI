@@ -1,0 +1,128 @@
+# Host nginx config for ERP Data Migrator Pro (docker-compose.prod.yml).
+#
+# The compose stack terminates nothing: it publishes the API on
+# 127.0.0.1:8001 and the SPA bundle on 127.0.0.1:8081, and this file is what
+# puts them on the internet. Drop it in as
+# /etc/nginx/sites-available/erp-migrator (symlink into sites-enabled) or
+# /etc/nginx/conf.d/erp-migrator.conf, check the certificate paths match what
+# certbot issued, then `nginx -t && systemctl reload nginx`.
+#
+# The two hostnames must share a registrable domain -- here hwds.svartalfheim.io
+# (SPA) and hwds-dev.svartalfheim.io (API), both under svartalfheim.io. The
+# refresh-token cookie is SameSite=Lax, so splitting the SPA and the API across
+# different domains silently breaks token refresh and logs users out every
+# 15 minutes.
+#
+# Serving the API under a path prefix on the app hostname does NOT work:
+# hooks/useWebSocket.ts builds the socket URL from the API origin's host and
+# discards any path, so the WebSocket would miss the prefix.
+
+# WebSocket upgrade mapping. This belongs in the http context; if another site
+# on this server already defines $connection_upgrade, delete this block --
+# redefining a map is a startup error.
+map $http_upgrade $connection_upgrade {
+    default upgrade;
+    ''      close;
+}
+
+# --- SPA -------------------------------------------------------------------
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    http2 on;                    # nginx < 1.25.1: drop this, use "listen 443 ssl http2;"
+    server_name hwds.svartalfheim.io;
+
+    ssl_certificate     /etc/letsencrypt/live/hwds.svartalfheim.io/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/hwds.svartalfheim.io/privkey.pem;
+
+    # Enable only once HTTPS is confirmed working on this hostname.
+    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+
+    # The bundle is proxied, so gzip_proxied is required for compression to apply.
+    gzip on;
+    gzip_proxied any;
+    gzip_min_length 1024;
+    gzip_types text/css application/javascript application/json image/svg+xml;
+
+    # Vite emits content-hashed filenames under /assets/, so they can be
+    # cached forever. index.html must not be, or clients pin a stale build.
+    location /assets/ {
+        proxy_pass http://127.0.0.1:8081;
+        proxy_set_header Host $host;
+        add_header Cache-Control "public, max-age=31536000, immutable";
+        add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+    }
+
+    location / {
+        proxy_pass http://127.0.0.1:8081;
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}
+
+# --- API + WebSocket -------------------------------------------------------
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    http2 on;
+    server_name hwds-dev.svartalfheim.io;
+
+    ssl_certificate     /etc/letsencrypt/live/hwds-dev.svartalfheim.io/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/hwds-dev.svartalfheim.io/privkey.pem;
+
+    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+
+    # Matches MAX_UPLOAD_BYTES (50 MB) in backend/app/api/imports.py. nginx
+    # defaults to 1 MB, which would 413 every BOM / swing / CSV import.
+    client_max_body_size 50m;
+
+    # No gzip here on purpose: the backend already applies GZipMiddleware.
+
+    # Must come before location / so the upgrade headers are actually set.
+    location /ws/ {
+        proxy_pass http://127.0.0.1:8001;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade    $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        # The client pings every 30s (hooks/useWebSocket.ts); nginx's 60s
+        # default is uncomfortably tight for collaboration events.
+        proxy_read_timeout 300s;
+        proxy_send_timeout 300s;
+    }
+
+    location / {
+        proxy_pass http://127.0.0.1:8001;
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        # X-Forwarded-Proto is load-bearing: the refresh cookie's Secure flag
+        # and the login rate limiter's client IP are both derived from it.
+        proxy_set_header X-Forwarded-Proto $scheme;
+        # CSV exports stream up to 100k rows; buffering defeats that.
+        proxy_buffering off;
+        proxy_read_timeout 300s;
+        proxy_send_timeout 300s;
+    }
+}
+
+# --- HTTP -> HTTPS ---------------------------------------------------------
+server {
+    listen 80;
+    listen [::]:80;
+    server_name hwds.svartalfheim.io hwds-dev.svartalfheim.io;
+
+    # Keep if certbot renews over HTTP-01 with the webroot plugin.
+    location /.well-known/acme-challenge/ {
+        root /var/www/certbot;
+    }
+
+    location / {
+        return 301 https://$host$request_uri;
+    }
+}
